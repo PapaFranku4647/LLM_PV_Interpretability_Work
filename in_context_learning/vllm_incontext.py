@@ -120,7 +120,7 @@ def build_user_prompt(
     prompt = f"{problem_statement}\n\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
     prompt += "**Test Input:**\n```\n" + test_input + "\n```\n\n"
-    prompt += 'Based on the examples, what is the label for the test input? You must output ONLY a single JSON object in the format: {"label": "<your predicted label>"}.'
+    prompt += 'Based on the examples, what is the label for the test input? You must output ONLY a single JSON object in the format: {"label": "<your predicted label>"}. Do not write any code, explanations, solutions, or additional text. Output only the JSON object with no other content.'
     return prompt
 
 
@@ -282,10 +282,6 @@ class VLLMRunner:
 # Evaluation & Artifacts
 # =========================
 def parse_and_evaluate(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, Any]], Dict[str, float]]:
-    """
-    Parses model outputs, evaluates correctness, and computes summary stats.
-    This version uses regex to robustly find JSON within extraneous text.
-    """
     task_stats = {}
     for res in results:
         task_key = (res['fn'], res['length'])
@@ -295,32 +291,21 @@ def parse_and_evaluate(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, An
         pred_label = None
         model_output = res['model_output']
 
-        try:
-            # 1. Find a JSON object within the model's output string.
-            #    This handles cases where the model adds introductory/concluding text.
-            #    re.DOTALL makes '.' match newlines, in case the JSON is multi-line.
-            match = re.search(r'\{.*\}', model_output, re.DOTALL)
-            if match:
-                json_str = match.group(0)
-                data = json.loads(json_str)
-                if isinstance(data, dict) and 'label' in data:
-                    pred_label = str(data['label']).strip()
-        except (json.JSONDecodeError, TypeError):
-            # This block is reached if regex found something that looked like JSON
-            # (e.g., "{...}") but it wasn't valid. We'll let it fall through
-            # to the next fallback method.
-            pass
-
-        # 2. If JSON parsing failed, try a simpler fallback for raw "0" or "1".
-        if pred_label is None:
-            clean_output = model_output.strip()
-            # Check if the very last non-whitespace character is a 0 or 1
-            if clean_output and clean_output[-1] in ["0", "1"]:
-                # To be safer, check if the whole string is just "0" or "1"
-                # after cleaning quotes. This was the original logic.
-                simple_clean = clean_output.replace("'", "").replace('"', '')
-                if simple_clean in ["0", "1"]:
-                    pred_label = simple_clean
+        json_match = re.search(r'\{"label":\s*["\']?([01])["\']?\}', model_output)
+        if json_match:
+            pred_label = json_match.group(1)
+        else:
+            json_objects = re.findall(r'\{[^{}]*"label"[^{}]*\}', model_output, re.DOTALL)
+            for json_str in reversed(json_objects):
+                try:
+                    data = json.loads(json_str)
+                    if isinstance(data, dict) and 'label' in data:
+                        label_val = str(data['label']).strip()
+                        if label_val in ['0', '1']:
+                            pred_label = label_val
+                            break
+                except:
+                    continue
 
         res['predicted_label'] = pred_label
         res['is_correct'] = (pred_label is not None and pred_label == res['true_label'])
@@ -331,7 +316,6 @@ def parse_and_evaluate(results: List[Dict[str, Any]]) -> Tuple[List[Dict[str, An
         if pred_label is None:
             task_stats[task_key]['failed_parses'] += 1
 
-    # Calculate accuracy, ignoring tasks with no successful parses if desired
     accuracies = {}
     for (fn, L), stats in task_stats.items():
         total_valid = stats['total']

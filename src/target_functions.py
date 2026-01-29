@@ -6,7 +6,10 @@ Each function takes a PyTorch tensor and a device string, returning a tensor of 
 import torch
 import torch.nn.functional as F
 import hashlib
-from typing import Callable, Dict, Any
+import math
+import random
+from itertools import combinations
+from typing import Callable, Dict, Any, Tuple
 from sympy import isprime
 
 # --- Core Implementations ---
@@ -58,14 +61,16 @@ def dyck2(v: torch.Tensor, device: str) -> torch.Tensor:
 
 def parity_rand_3(v: torch.Tensor, device: str) -> torch.Tensor:
     """Parity of 3 random but fixed coordinates."""
-    torch.manual_seed(42)
-    idx = torch.randperm(v.shape[1])[:3]
+    generator = torch.Generator(device=device)
+    generator.manual_seed(42)
+    idx = torch.randperm(v.shape[1], generator=generator, device=device)[:3]
     return (v[:, idx].sum(dim=1) % 2).long()
 
 def parity_rand_10(v: torch.Tensor, device: str) -> torch.Tensor:
     """Parity of 10 random but fixed coordinates."""
-    torch.manual_seed(42)
-    idx = torch.randperm(v.shape[1])[:10]
+    generator = torch.Generator(device=device)
+    generator.manual_seed(42)
+    idx = torch.randperm(v.shape[1], generator=generator, device=device)[:10]
     return (v[:, idx].sum(dim=1) % 2).long()
 
 def patternmatch1(v: torch.Tensor, device: str) -> torch.Tensor:
@@ -87,13 +92,307 @@ def prime_decimal_tf_check(v: torch.Tensor, device: str) -> torch.Tensor:
     """Checks if a decimal number is prime (identical to prime_decimal, used for different generator)."""
     return prime_decimal(v, device)
 
+def two_primes(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if two numbers have the same primality status.
+    Input format: concatenated decimal digits of two numbers, each of length seq_len.
+    Returns 1 if both are prime OR both are non-prime, 0 otherwise."""
+    results = []
+    for row in v:
+        digits = ''.join(map(str, row.int().tolist()))
+        seq_len = len(digits) // 2
+        n1_str = digits[:seq_len]
+        n2_str = digits[seq_len:]
+        n1 = int(n1_str) if n1_str else 0
+        n2 = int(n2_str) if n2_str else 0
+        if n1 < 2 or n2 < 2:
+            results.append(0)
+            continue
+        n1_prime = isprime(n1)
+        n2_prime = isprime(n2)
+        results.append(1 if n1_prime == n2_prime else 0)
+    return torch.tensor(results, device=device, dtype=torch.long)
 
-# --- Canonical Mapping ---
+def prime_minus_5(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if n-5 is prime for each number n."""
+    results = []
+    for row in v:
+        n = int("".join(map(str, row.tolist())))
+        if n - 5 < 2:
+            results.append(0)
+            continue
+        results.append(1 if isprime(n - 5) else 0)
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def prime_plus_47(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if n-47 is prime for each number n."""
+    results = []
+    for row in v:
+        n = int("".join(map(str, row.tolist())))
+        if n - 47 < 2:
+            results.append(0)
+            continue
+        results.append(1 if isprime(n - 47) else 0)
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def gcd_range(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if GCD(n1, n2) is in [20, 51].
+    Input format: concatenated decimal digits of two numbers, each of length seq_len."""
+    results = []
+    for row in v:
+        digits = ''.join(map(str, row.int().tolist()))
+        seq_len = len(digits) // 2
+        n1_str = digits[:seq_len]
+        n2_str = digits[seq_len:]
+        n1 = int(n1_str) if n1_str else 0
+        n2 = int(n2_str) if n2_str else 0
+        if n1 == 0 or n2 == 0:
+            results.append(0)
+            continue
+        g = math.gcd(n1, n2)
+        if 20 <= g <= 51:
+            results.append(1)
+        else:
+            results.append(0)
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def collatz_steps_parity(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Returns 1 if the number of Collatz steps to reach 1 is odd, 0 if even.
+    Collatz sequence: if n is even, n -> n/2; if n is odd, n -> 3n+1.
+    Count steps until n == 1, return steps % 2."""
+    results = []
+    for row in v:
+        n = int("".join(map(str, row.tolist())))
+        if n <= 0:
+            results.append(0)
+            continue
+        
+        steps = 0
+        current = n
+        max_steps = 10000  # Safety limit
+        while current != 1 and steps < max_steps:
+            if current % 2 == 0:
+                current = current // 2
+            else:
+                current = 3 * current + 1
+            steps += 1
+        
+        results.append(steps % 2)
+    
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+_poly_cache = {}
+
+def _generate_monomials(n: int, k: int, d: int, T: int, seed: int) -> Tuple[Tuple[Tuple[int, ...], ...], Tuple[int, ...]]:
+    rng = random.Random(seed)
+    relevant = tuple(sorted(rng.sample(range(n), k)))
+    
+    all_possible = []
+    for deg in range(1, d + 1):
+        for combo in combinations(relevant, deg):
+            all_possible.append(combo)
+    
+    if len(all_possible) < T:
+        T = len(all_possible)
+    
+    monomials = tuple(sorted(rng.sample(all_possible, T)))
+    return monomials, relevant
+
+def poly_f2_deg3(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Evaluates a random 3rd degree polynomial over GF(2) on binary inputs."""
+    n = v.shape[1]
+    
+    if n not in _poly_cache:
+        seed = hash(f"poly_deg3_n{n}") % (2**31)
+        k = min(10, max(5, n // 10))
+        T = 3
+        monomials, relevant = _generate_monomials(n, k, 3, T, seed)
+        _poly_cache[n] = (monomials, relevant)
+    
+    monomials, relevant = _poly_cache[n]
+    
+    results = []
+    for row in v:
+        x = row.int().tolist()
+        result = 0
+        for mono in monomials:
+            term = 1
+            for idx in mono:
+                term &= x[idx]
+                if term == 0:
+                    break
+            result ^= term
+        results.append(result)
+    
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def graph_has_cycle(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if graph has high cycle density (cycle count > threshold).
+    Input format: u12v23 style (6 chars per edge: 'u' + 2-digit src + 'v' + 2-digit dst).
+    Accepts both character format (for data generation) and numeric token format (for LLM training).
+    Numeric tokens: 'u'=10, 'v'=11, digits 0-9=themselves.
+    Cycle count = E - V + C (cyclomatic complexity).
+    Returns 1 if cycle_count > threshold, 0 otherwise."""
+    results = []
+    for row in v:
+        tokens = row.int().tolist()
+        
+        # Decode based on format:
+        # - Numeric tokens (LLM training): 10='u', 11='v', 0-9=digits
+        # - ASCII codes (data generation): 117='u', 118='v', 48-57='0'-'9'
+        # - Direct digits: 0-9 as-is
+        decoded = []
+        for t in tokens:
+            if t == 10:  # Numeric token for 'u'
+                decoded.append('u')
+            elif t == 11:  # Numeric token for 'v'
+                decoded.append('v')
+            elif t == 117:  # ASCII 'u'
+                decoded.append('u')
+            elif t == 118:  # ASCII 'v'
+                decoded.append('v')
+            elif 0 <= t <= 9:  # Direct digit
+                decoded.append(str(t))
+            elif 48 <= t <= 57:  # ASCII digit '0'-'9'
+                decoded.append(chr(t))
+            # Skip other values (padding, etc.)
+        raw = ''.join(decoded)
+        
+        edges = []
+        vertices = set()
+        # Parse u12v23 format: each edge is 6 chars
+        import re
+        edge_pattern = re.compile(r'u(\d{2})v(\d{2})')
+        for match in edge_pattern.finditer(raw):
+            v1, v2 = int(match.group(1)), int(match.group(2))
+            if v1 == 0 and v2 == 0:
+                continue
+            edges.append((v1, v2))
+            vertices.add(v1)
+            vertices.add(v2)
+        
+        if not edges or not vertices:
+            results.append(0)
+            continue
+        
+        E = len(edges)
+        V = len(vertices)
+        
+        # Count connected components using Union-Find
+        parent = {v: v for v in vertices}
+        
+        def find(x):
+            if parent[x] != x:
+                parent[x] = find(parent[x])
+            return parent[x]
+        
+        for u, w in edges:
+            pu, pw = find(u), find(w)
+            if pu != pw:
+                parent[pu] = pw
+        
+        C = len(set(find(v) for v in vertices))
+        
+        # Cyclomatic complexity = E - V + C
+        cycle_count = E - V + C
+        
+        # Threshold based on number of edges
+        threshold = max(1, E // 6)
+        
+        results.append(1 if cycle_count > threshold else 0)
+    
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def graph_triangle_rich(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Checks if the graph has many triangles (>= threshold).
+    A triangle is a 3-clique: 3 vertices all connected to each other.
+    Threshold is dynamic: max(2, num_edges // 3).
+    Input format: u12v23 style (6 chars per edge: 'u' + 2-digit src + 'v' + 2-digit dst).
+    Accepts both character format (for data generation) and numeric token format (for LLM training).
+    Numeric tokens: 'u'=10, 'v'=11, digits 0-9=themselves.
+    Returns 1 if triangle_count >= threshold, 0 otherwise."""
+    import re
+    results = []
+    
+    for row in v:
+        tokens = row.int().tolist()
+        
+        # Decode based on format
+        decoded = []
+        for t in tokens:
+            if t == 10:  # Numeric token for 'u'
+                decoded.append('u')
+            elif t == 11:  # Numeric token for 'v'
+                decoded.append('v')
+            elif t == 117:  # ASCII 'u'
+                decoded.append('u')
+            elif t == 118:  # ASCII 'v'
+                decoded.append('v')
+            elif 0 <= t <= 9:  # Direct digit
+                decoded.append(str(t))
+            elif 48 <= t <= 57:  # ASCII digit '0'-'9'
+                decoded.append(chr(t))
+        raw = ''.join(decoded)
+        
+        # Build edge set for O(1) lookup
+        edge_set = set()
+        vertices = set()
+        
+        # Parse u12v23 format
+        edge_pattern = re.compile(r'u(\d{2})v(\d{2})')
+        for match in edge_pattern.finditer(raw):
+            v1, v2 = int(match.group(1)), int(match.group(2))
+            if v1 == 0 and v2 == 0:
+                continue
+            edge_set.add((min(v1, v2), max(v1, v2)))
+            vertices.add(v1)
+            vertices.add(v2)
+        
+        if len(vertices) < 3:
+            results.append(0)
+            continue
+        
+        # Dynamic threshold based on edge count
+        num_edges = len(edge_set)
+        threshold = max(2, num_edges // 3)
+        
+        # Count triangles: for each triple of vertices, check if all 3 edges exist
+        triangle_count = 0
+        vertex_list = sorted(vertices)
+        n = len(vertex_list)
+        
+        for i in range(n - 2):
+            vi = vertex_list[i]
+            for j in range(i + 1, n - 1):
+                vj = vertex_list[j]
+                # Early exit: check if edge (i,j) exists
+                if (min(vi, vj), max(vi, vj)) not in edge_set:
+                    continue
+                for k in range(j + 1, n):
+                    vk = vertex_list[k]
+                    # Check if edges (i,k) and (j,k) exist
+                    if ((min(vi, vk), max(vi, vk)) in edge_set and
+                        (min(vj, vk), max(vj, vk)) in edge_set):
+                        triangle_count += 1
+                        if triangle_count >= threshold:
+                            break
+                if triangle_count >= threshold:
+                    break
+            if triangle_count >= threshold:
+                break
+        
+        results.append(1 if triangle_count >= threshold else 0)
+    
+    return torch.tensor(results, device=device, dtype=torch.long)
+
+def tabular_dummy(v: torch.Tensor, device: str) -> torch.Tensor:
+    """Dummy function for tabular datasets (labels come from data generators)."""
+    return torch.zeros(v.size(0), dtype=torch.long, device=device)
+
 TARGET_FUNCTIONS: Dict[str, Callable[[torch.Tensor, str], torch.Tensor]] = {
     'parity_all': parity_all,
     'parity_first_half': parity_first_half,
-    'patternmatch1': patternmatch1,          # '10101010'
-    'patternmatch2': patternmatch2,          # '00111111'
+    'patternmatch1': patternmatch1,
+    'patternmatch2': patternmatch2,
     'parity_rand_3': parity_rand_3,
     'parity_rand_10': parity_rand_10,
     'palindrome': palindrome,
@@ -102,6 +401,22 @@ TARGET_FUNCTIONS: Dict[str, Callable[[torch.Tensor, str], torch.Tensor]] = {
     'automata_parity': automata_parity,
     'prime_decimal_tf_check': prime_decimal_tf_check,
     'sha256_parity': sha256_parity,
+    'two_primes': two_primes,
+    'prime_minus_5': prime_minus_5,
+    'prime_plus_47': prime_plus_47,
+    'gcd_range': gcd_range,
+    'collatz_steps_parity': collatz_steps_parity,
+    'poly_f2_deg3': poly_f2_deg3,
+    'graph_has_cycle': graph_has_cycle,
+    'graph_triangle_rich': graph_triangle_rich,
+    'adult_income': tabular_dummy,
+    'mushroom': tabular_dummy,
+    'cdc_diabetes': tabular_dummy,
+    'breast_cancer': tabular_dummy,
+    'spambase': tabular_dummy,
+    'htru2': tabular_dummy,
+    'chess': tabular_dummy,
+    'magic': tabular_dummy,
 }
 
 EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
@@ -117,10 +432,50 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_j": "automata_parity",
     "fn_k": "prime_decimal_tf_check",
     "fn_l": "sha256_parity",
+    "fn_v": "prime_plus_47",
+    # "fn_t": "collatz_steps_parity",
+    "fn_aa": "graph_has_cycle",
+    "fn_ab": "graph_triangle_rich",
+    # Tabular datasets
+    "fn_m": "adult_income",
+    "fn_n": "mushroom",
+    "fn_o": "cdc_diabetes",
+    "fn_w": "spambase",
+    "fn_x": "htru2",
+    "fn_y": "chess",
+    "fn_z": "magic",
 }
 
 EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
     "fn_h": {
         "lengths": [100, 80, 60, 40, 20]
-    }
+    },
+    "fn_m": {
+        "lengths": [14],
+        "tabular": True
+    },
+    "fn_n": {
+        "lengths": [20],
+        "tabular": True
+    },
+    "fn_o": {
+        "lengths": [21],
+        "tabular": True
+    },
+    "fn_w": {
+        "lengths": [57],
+        "tabular": True
+    },
+    "fn_x": {
+        "lengths": [8],
+        "tabular": True
+    },
+    "fn_y": {
+        "lengths": [35],
+        "tabular": True
+    },
+    "fn_z": {
+        "lengths": [10],
+        "tabular": True
+    },
 }

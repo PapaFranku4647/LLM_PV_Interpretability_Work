@@ -17,3 +17,7 @@ openai
 tqdm
 pyyaml
 sympy>=1.12
+
+# --- Baseline ML models ---
+scikit-learn
+xgboost

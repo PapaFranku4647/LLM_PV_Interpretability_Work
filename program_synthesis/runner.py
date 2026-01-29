@@ -8,7 +8,7 @@
 # Python function that reproduces the target mapping. The code:
 #   • Builds persistent train/val/test splits per (target_function, sequence_length).
 #   • Calls the OpenAI Responses API asynchronously with concurrency control.
-#   • Extracts a candidate function from the model’s JSON output, compiles it,
+#   • Extracts a candidate function from the model's JSON output, compiles it,
 #     and evaluates its accuracy on validation (and then test, on perfect val).
 #   • Performs multiple attempts per grid point and supports early-stopping when 
 #     validation accuracy hits 1.0. If no attempt achieves perfect validation, 
@@ -44,7 +44,6 @@ sys.path.insert(0, parent_dir)
 
 from openai import AsyncOpenAI
 
-# --- data generators ---
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 
@@ -54,8 +53,6 @@ external_get_accuracy = None
 # =========================
 # Usage normalization
 # =========================
-# Convert various usage payload shapes from the Responses API to a consistent dict.
-# This helps when logging and writing CSV/JSONL later.
 
 def normalize_usage(usage_obj) -> Dict[str, Any]:
     if not usage_obj:
@@ -73,7 +70,6 @@ def normalize_usage(usage_obj) -> Dict[str, Any]:
                 u[k] = v
 
         def _to_dict(obj):
-            # Normalize nested token detail objects to plain dicts.
             if obj is None:
                 return None
             if isinstance(obj, Mapping):
@@ -98,18 +94,15 @@ def normalize_usage(usage_obj) -> Dict[str, Any]:
         if (ctd := _to_dict(ctd)) is not None:
             u["completion_tokens_details"] = ctd
 
-    # Harmonize field names across different payload versions
     if "prompt_tokens" not in u and "input_tokens" in u:
         u["prompt_tokens"] = u["input_tokens"]
     if "completion_tokens" not in u and "output_tokens" in u:
         u["completion_tokens"] = u["output_tokens"]
 
-    # Bubble up cached_tokens, if present in any detail object
     details = u.get("prompt_tokens_details") or u.get("input_token_details") or {}
     if "cached_tokens" in details:
         u["cached_tokens"] = details["cached_tokens"]
 
-    # Best‑effort reasoning token extraction
     if "reasoning_tokens" not in u or u.get("reasoning_tokens") is None:
         rt = None
         for dkey in ("output_tokens_details", "completion_tokens_details", "input_token_details"):
@@ -127,7 +120,6 @@ def normalize_usage(usage_obj) -> Dict[str, Any]:
 # =========================
 # Logging
 # =========================
-# We log each event as a single JSON record, both to stdout and runner.log.
 
 class JsonFormatter(logging.Formatter):
     def format(self, record: logging.LogRecord) -> str:
@@ -139,7 +131,6 @@ class JsonFormatter(logging.Formatter):
         }
         if record.exc_info:
             base["exc"] = self.formatException(record.exc_info)
-        # Include any additional attributes that might be attached via 'extra='
         for k, v in getattr(record, "__dict__", {}).items():
             if k not in base and k not in ("msg", "args", "levelname", "name"):
                 base[k] = v
@@ -155,22 +146,17 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
     file_handler = logging.FileHandler("program_synthesis/runner.log", encoding="utf-8")
     file_handler.setFormatter(JsonFormatter())
 
-    # Replace any existing handlers to avoid duplicate logs
     logger.handlers[:] = [stream_handler, file_handler]
     logger.propagate = False
     return logger
 
 
 # =========================
-# Config (now includes dataset_dir)
+# Config
 # =========================
-# Central configuration with sensible defaults. Many fields can be overridden via
-# CLI flags or environment variables. The OpenAI parameters mirror Responses API
-# fields (model, max_output_tokens, reasoning.effort, text.verbosity, tools).
 
 @dataclass
 class Config:
-    # OpenAI
     api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
     model: str = os.getenv("OPENAI_MODEL", "gpt-5")
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
@@ -179,37 +165,26 @@ class Config:
     tool_choice: str = os.getenv("TOOL_CHOICE", "auto")
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
 
-    # Execution
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
     per_call_timeout_s: float = float(os.getenv("PER_CALL_TIMEOUT_S", "1200"))
 
-    # Experiment grid
-    # The logical functions to target (see FUNCTION_NAME_MAPPING below) and the
-    # sequence lengths to evaluate.
-    functions: List[str] = field(default_factory=lambda: ["fn_a",
-                                                          "fn_b",
-                                                          "fn_c",
-                                                          "fn_d",
-                                                          "fn_e",
-                                                          "fn_f",
-                                                          "fn_g",
-                                                          "fn_h",
-                                                          "fn_i",
-                                                          "fn_j",
-                                                          "fn_k",
-                                                          "fn_l"])
+    functions: List[str] = field(default_factory=lambda: [
+        "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
+        "fn_g", "fn_h", "fn_i", "fn_j", "fn_k", "fn_l", "fn_v", "fn_t",
+        "fn_aa", "fn_ab",
+        "fn_m", "fn_n", "fn_o", "fn_w", "fn_x", "fn_y", "fn_z",
+    ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
     attempts: int = int(os.getenv("ATTEMPTS", "5"))
+    num_trials: int = int(os.getenv("NUM_TRIALS", "5"))
 
-    # Dataset settings: fixed sizes for reproducible comparisons across attempts
     train_size: int = int(os.getenv("TRAIN_SIZE", "100"))
     val_size: int   = int(os.getenv("VAL_SIZE",   "100"))
     test_size: int  = int(os.getenv("TEST_SIZE",  "10000"))
     seed: int       = int(os.getenv("GLOBAL_SEED","42"))
     dataset_dir: str = os.getenv("DATASET_DIR", "program_synthesis/datasets")
 
-    # Artifacts
     out_jsonl: str = os.getenv("OUT_JSONL", "program_synthesis/results_attempts.jsonl")
     out_csv: str   = os.getenv("OUT_CSV",   "program_synthesis/results_attempts.csv")
 
@@ -217,12 +192,16 @@ class Config:
 # =========================
 # Prompt
 # =========================
-# Generate the exact user content fed to the model: a problem statement describing
-# the data shape and a small batch of examples, followed by strict output format
-# instructions (single JSON object with a "code" field).
 
-def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = False) -> str:
-    if decimal:
+def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = False, tabular: bool = False) -> str:
+    if tabular:
+        problem_statement = (
+            f"**Problem Statement:**\n"
+            f"Given tabular input data (comma-separated feature:value pairs) and their corresponding scalar binary outputs ('0' or '1'), "
+            f"find a concise Python function `f(x)` that accurately approximates the underlying relationship. "
+            f"The function should not be a trainable model, but a direct logical or mathematical representation of the target function."
+        )
+    elif decimal:
         problem_statement = (
             f"**Problem Statement:**\n"
             f"Given a sequence of input vectors (decimal, length {seq_len}) and their corresponding scalar binary outputs ('0' or '1'), "
@@ -243,22 +222,18 @@ def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = Fa
 
 
 # =========================
-# Function mapping & decimal set
+# Function mapping & special sets
 # =========================
-# Map short experiment IDs (fn_a ... fn_l) to target generator names.
-# DECIMAL_FNS marks those targets that operate on decimal strings, affecting the
-# problem statement.
 
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
-DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}
+DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check", "prime_plus_47", "collatz_steps_parity"}
+TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
 
 
 # =========================
 # Atomic file helpers
 # =========================
-# Use write‑to‑temp + os.replace for crash‑safe, atomic writes so partially written
-# files are never observed by readers.
 
 def _safe_write_text_lines(path: str, lines: List[str]) -> None:
     os.makedirs(os.path.dirname(path), exist_ok=True)
@@ -281,31 +256,16 @@ def _read_lines(path: str) -> List[str]:
 
 
 # =========================
-# DatasetStore: persists splits under datasets/<target>/L<length>/seed<derived_seed>/
+# DatasetStore
 # =========================
-# This class wraps deterministic split generation, reuse, and metadata writing.
-# It enforces exact sizes for train/val/test; if mismatch is detected, the split
-# is rebuilt deterministically from the derived seed.
 
 class DatasetStore:
-    """
-    Persists and reuses dataset splits. For each (fn, L) we derive a deterministic seed:
-      derived_seed = (hash((fn, L)) & 0x7fffffff) ^ cfg.seed
-
-    Directory layout:
-      <dataset_dir>/<target_name>/L<length>/seed<derived_seed>/
-        - train.txt : 1 sample per line, "sequence -> label"
-        - val.txt
-        - test.txt
-        - meta.json  : sizes, fn, L, seed, decimal
-    """
     def __init__(self, cfg: Config, log: logging.Logger):
         self.cfg = cfg
         self.log = log
 
     @staticmethod
     def _set_seed(seed: int):
-        # Seed Python, NumPy, and PyTorch if available, to make generation reproducible.
         random.seed(seed)
         try:
             import numpy as np
@@ -331,24 +291,20 @@ class DatasetStore:
         }
 
     def _generate_lines(self, target_name: str, L: int, size: int) -> List[str]:
-        # Select the correct generator using the centralized factory function
         gen = get_data_generator(target_name, L, size)
         dataset = gen.generate_data()
-        
-        # Render each sample as "<sequence> -> <label>" line for simple evaluation later.
         return [f"{''.join(sample['Input'])} -> {sample['Output']}" for sample in dataset]
     
     def _stable_derived_seed(self, fn: str, L: int) -> int:
-        # include sizes so different configs don’t collide
         key = f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}|base_seed={self.cfg.seed}"
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         return (int.from_bytes(digest[:8], "big") & 0x7FFFFFFF)
 
-    def _ensure_splits(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool]:
+    def _ensure_splits(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool, bool]:
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
+        is_tabular = target_name in TABULAR_FNS
 
-        # Deriving a seed for caching
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
 
@@ -363,31 +319,27 @@ class DatasetStore:
             exists_with_size(paths["val"],   self.cfg.val_size)   and
             exists_with_size(paths["test"],  self.cfg.test_size)):
             self.log.info("dataset_reused", extra={"fn": fn, "length": L, "seed": derived_seed, "dir": paths["dir"]})
-            return _read_lines(paths["train"]), _read_lines(paths["val"]), _read_lines(paths["test"]), is_decimal
+            return _read_lines(paths["train"]), _read_lines(paths["val"]), _read_lines(paths["test"]), is_decimal, is_tabular
 
         self._set_seed(derived_seed)
         self.log.info("dataset_generating", extra={"fn": fn, "length": L, "seed": derived_seed, "dir": paths["dir"]})
 
-        # 1. Generate ONE large pool of data.
         total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
         generator = get_data_generator(target_name, L, total_samples)
-        all_samples_dicts = generator.generate_data() # This returns List[Dict]
+        all_samples_dicts = generator.generate_data()
 
-        # 2. Use our new centralized function to create the splits.
         train_split_dicts, val_split_dicts, test_split_dicts = create_stratified_splits(
             all_samples=all_samples_dicts,
             train_size=self.cfg.train_size,
             val_size=self.cfg.val_size,
             test_size=self.cfg.test_size,
-            device='cpu' # Use CPU for this script as it doesn't need GPU
+            device='cpu'
         )
 
-        # 3. Convert the resulting splits back into the "sequence -> label" line format.
         train_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in train_split_dicts]
         val_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in val_split_dicts]
         test_lines = [f"{''.join(s['Input'])} -> {s['Output']}" for s in test_split_dicts]
         
-        # 4. Final shuffle of train and validation lines before saving (for prompt diversity)
         random.shuffle(train_lines)
         random.shuffle(val_lines)
         
@@ -395,30 +347,23 @@ class DatasetStore:
         _safe_write_text_lines(paths["val"],   val_lines)
         _safe_write_text_lines(paths["test"],  test_lines)
         _safe_write_json(paths["meta"], {
-            "fn": fn, "target_name": target_name, "length": L, "decimal": is_decimal,
+            "fn": fn, "target_name": target_name, "length": L, 
+            "decimal": is_decimal, "tabular": is_tabular,
             "derived_seed": derived_seed,
             "sizes": {"train": self.cfg.train_size, "val": self.cfg.val_size, "test": self.cfg.test_size},
             "created_ts": int(time.time())
         })
 
         self.log.info("dataset_written", extra={"fn": fn, "length": L, "seed": derived_seed, "dir": paths["dir"]})
-        return train_lines, val_lines, test_lines, is_decimal
+        return train_lines, val_lines, test_lines, is_decimal, is_tabular
 
-    def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool]:
-        """
-        Returns (train, val, test, is_decimal), pulling from disk or generating once.
-        """
+    def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool, bool]:
         return self._ensure_splits(fn, L)
 
 
 # =========================
 # Code extraction & compilation
 # =========================
-# The model is instructed to return a *single* JSON object {"code": "..."}. We:
-#   • Parse JSON strictly first; if that fails, fallback to a broad { ... } regex.
-#   • Sanitize fenced code blocks and dedent before AST parsing.
-#   • Choose function named 'f' if present; else the first defined function.
-#   • Execute in a restricted global namespace and retrieve the callable.
 
 def extract_code_from_output(output_text: str) -> Optional[str]:
     if not output_text:
@@ -442,7 +387,6 @@ def extract_code_from_output(output_text: str) -> Optional[str]:
 def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
     code_str = textwrap.dedent(code_str.strip())
     if code_str.startswith("```"):
-        # Remove markdown fences like ```python ... ``` if present
         code_str = re.sub(r"^```(?:python)?\s*|\s*```$", "", code_str, flags=re.IGNORECASE | re.DOTALL)
     tree = ast.parse(code_str)
     fn_names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
@@ -461,29 +405,19 @@ def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
 # =========================
 # Accuracy evaluation
 # =========================
-# Evaluate a callable against a list of "<sequence> -> <label>" lines. We default
-# to a local implementation but can delegate to external_get_accuracy if present.
 
 def _normalize_pred_to01(pred) -> int:
-    """
-    Coerce various return types into an integer 0/1.
-    Accepts: 0/1 ints, bools, '0'/'1' strings, 'true'/'false' strings,
-    and objects with .item(). Falls back to truthiness only as last resort.
-    """
     try:
-        # numpy / torch scalars
         if hasattr(pred, "item"):
             pred = pred.item()
     except Exception:
         pass
 
-    # direct ints / bools
     if isinstance(pred, bool):
         return 1 if pred else 0
     if isinstance(pred, int):
         return 1 if pred != 0 else 0
 
-    # strings
     if isinstance(pred, str):
         s = pred.strip().strip("\"'")
         if s in ("0", "1"):
@@ -491,18 +425,28 @@ def _normalize_pred_to01(pred) -> int:
         sl = s.lower()
         if sl in ("true", "false"):
             return 1 if sl == "true" else 0
-        # try numeric string
         try:
             v = int(float(s))
             return 1 if v != 0 else 0
         except Exception:
-            # last resort: non-empty string is truthy — but avoid the "0" trap handled above
             return 1 if len(s) > 0 else 0
 
-    # anything else: truthiness fallback
     return 1 if pred else 0
 
-def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger = None) -> float:
+def _parse_tabular_input(x_str: str) -> Dict[str, Any]:
+    result = {}
+    for pair in x_str.split(","):
+        if ":" in pair:
+            k, v = pair.split(":", 1)
+            k = k.strip()
+            v = v.strip()
+            try:
+                result[k] = float(v)
+            except ValueError:
+                result[k] = v
+    return result
+
+def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger=None, is_tabular: bool=False) -> float:
     if not data_lines:
         return 0.0
     correct = 0
@@ -511,33 +455,32 @@ def _local_get_accuracy(fn_callable: Callable[[str], int], data_lines: List[str]
         try:
             x, y = line.split("->")
             x = x.strip()
-            y = y.strip()
-            y_int = int(y)
+            y_int = int(y.strip())
+            if is_tabular:
+                x = _parse_tabular_input(x)
             pred = fn_callable(x)
             pred_int = _normalize_pred_to01(pred)
             correct += int(pred_int == y_int)
         except Exception as e:
-            if errors < 5: # Log first 5 errors to avoid spam
+            if errors < 5:
                 logger.debug("Evaluation error on generated code", extra={"line": line, "error": str(e)})
             errors += 1
     if errors > 0:
         logger.warning(f"Encountered {errors} errors during evaluation of generated code.")
     return correct / len(data_lines)
 
-def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger = None) -> float:
+def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], logger=None, is_tabular: bool=False) -> float:
     if external_get_accuracy is not None:
         try:
             return float(external_get_accuracy(fn_callable, data_lines))
         except Exception:
             pass
-    return _local_get_accuracy(fn_callable, data_lines, logger)
+    return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
 
 # =========================
 # Runner
 # =========================
-# The Runner coordinates dataset retrieval, API calls, code extraction/compilation,
-# evaluation, early stopping, logging, and artifact writing.
 
 class Runner:
     def __init__(self, cfg: Config, logger: logging.Logger):
@@ -548,17 +491,14 @@ class Runner:
         self.client = AsyncOpenAI(api_key=cfg.api_key)
         self.sem = asyncio.Semaphore(cfg.concurrency)
 
-        # Optional tool injection (Code Interpreter) for the Responses API.
         self.tools: List[Dict[str, Any]] = []
         if cfg.enable_code_interpreter:
             self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
 
-        # Persisted dataset store
         self.ds = DatasetStore(cfg, logger)
 
-    async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool) -> Dict[str, Any]:
-        # Prepare prompt and request body for one model attempt
-        prompt_text = build_user_prompt(data_examples, L, decimal)
+    async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
+        prompt_text = build_user_prompt(data_examples, L, decimal, tabular)
         body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
         body: Dict[str, Any] = {
             "model": self.cfg.model,
@@ -573,7 +513,6 @@ class Runner:
             body["text"] = {"verbosity": self.cfg.verbosity}
 
         if self.cfg.dry_run:
-            # In dry‑run, just log the prompt and return a lightweight record.
             self.log.info("dry_run_input", extra={"fn": fn, "length": L, "attempt": attempt_idx, "prompt_preview": prompt_text})
             return {
                 "fn": fn, "length": L, "attempt": attempt_idx,
@@ -582,14 +521,12 @@ class Runner:
             }
 
         async def _try_call(tag: str):
-            # Execute a single Responses API call with a timeout and collect rich telemetry
             t0 = time.perf_counter()
             async with self.sem:
                 res = await asyncio.wait_for(
                     self.client.responses.create(**body),
                     timeout=self.cfg.per_call_timeout_s,
                 )
-                # Count how many tool_use/tool_result chunks came back
                 tool_uses = 0
                 tool_results_chars = 0
                 for item in getattr(res, "output", []) or []:
@@ -636,7 +573,6 @@ class Runner:
         try:
             return await _try_call("attempt_ok")
         except Exception as e1:
-            # One retry for transient failures (timeouts, throttling, etc.)
             self.log.warning("attempt_retry_once", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e1)})
             try:
                 return await _try_call("attempt_ok_after_retry")
@@ -645,70 +581,152 @@ class Runner:
                 return {"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e2)}
 
     async def run(self) -> List[Dict[str, Any]]:
-        # Full experiment loop over all (function, length) grid points.
         all_rows: List[Dict[str, Any]] = []
+        
+        base_jsonl_path = self.cfg.out_jsonl
+        base_name, ext = os.path.splitext(base_jsonl_path)
+        os.makedirs(os.path.dirname(base_jsonl_path) if os.path.dirname(base_jsonl_path) else ".", exist_ok=True)
+        
+        final_jsonl_file = open(base_jsonl_path, "w", encoding="utf-8")
 
-        for fn in self.cfg.functions:
-            if fn not in FUNCTION_NAME_MAPPING:
-                self.log.error("unknown_function", extra={"fn": fn})
-                continue
-            
-            task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
-            current_lengths = task_meta.get("lengths", self.cfg.lengths)
-            for L in current_lengths:
-                # 1) persistent dataset
-                train_lines, val_lines, test_lines, is_decimal = self.ds.get(fn, L)
+        try:
+            for fn in self.cfg.functions:
+                if fn not in FUNCTION_NAME_MAPPING:
+                    self.log.error("unknown_function", extra={"fn": fn})
+                    continue
+                
+                task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
+                current_lengths = task_meta.get("lengths", self.cfg.lengths)
+                for L in current_lengths:
+                    train_lines, val_lines, test_lines, is_decimal, is_tabular = self.ds.get(fn, L)
 
-                stopped_early = False
+                    trial_test_accuracies = []
+                    trial_val_accuracies = []
+                    trial_best_rows = []
 
-                # 2) attempts (sequential to allow early stop)
-                for k in range(1, self.cfg.attempts + 1):
-                    res = await self._call_once(fn, L, k, train_lines, is_decimal)
-                    out_text = res.get("text") or ""
-                    code_str = extract_code_from_output(out_text)
-
-                    max_val_acc = 0
-                    val_acc = None
-                    test_acc = None
-                    compile_error = None
-
-                    if code_str:
+                    for trial in range(self.cfg.num_trials):
+                        trial_jsonl_path = f"{base_name}_trial{trial+1}{ext}"
+                        trial_jsonl_file = open(trial_jsonl_path, "w", encoding="utf-8")
+                        
                         try:
-                            fn_callable = compile_callable_from_code(code_str)
-                            val_acc = evaluate_accuracy(fn_callable, val_lines, self.log)
-                            test_acc = evaluate_accuracy(fn_callable, test_lines, self.log)
-                            if val_acc >= max_val_acc:
-                                max_val_acc = val_acc
-                                if val_acc == 1.0:
-                                    stopped_early = True
-                        except Exception as e:
-                            compile_error = str(e)
-                            self.log.warning("compile_or_eval_error", extra={"fn": fn, "length": L, "attempt": k, "error": compile_error})
-                    else:
-                        compile_error = "no_code_found"
+                            best_test_acc = -1.0
+                            best_val_acc = None
+                            best_row = None
+                            stopped_early = False
 
-                    row = {
-                        **res,
-                        "val_acc": val_acc,
-                        "test_acc": test_acc,
-                        "stopped_early": stopped_early,
-                        "compile_error": compile_error,
-                    }
-                    all_rows.append(row)
+                            for k in range(1, self.cfg.attempts + 1):
+                                res = await self._call_once(fn, L, k, train_lines, is_decimal, is_tabular)
+                                out_text = res.get("text") or ""
+                                code_str = extract_code_from_output(out_text)
 
-                    if stopped_early:
-                        self.log.info("early_stop", extra={"fn": fn, "length": L, "attempt": k, "val_acc": val_acc, "test_acc": test_acc})
-                        break
+                                val_acc = None
+                                test_acc = None
+                                compile_error = None
 
-        self.log.info("dispatch_finished", extra={"total_results": len(all_rows)})
+                                if code_str:
+                                    try:
+                                        fn_callable = compile_callable_from_code(code_str)
+                                        val_acc = evaluate_accuracy(fn_callable, val_lines, self.log, is_tabular)
+                                        test_acc = evaluate_accuracy(fn_callable, test_lines, self.log, is_tabular)
+                                        
+                                        if test_acc > best_test_acc:
+                                            best_test_acc = test_acc
+                                            best_val_acc = val_acc
+                                            best_row = {
+                                                **res,
+                                                "val_acc": val_acc,
+                                                "test_acc": test_acc,
+                                                "stopped_early": stopped_early,
+                                                "compile_error": None,
+                                                "trial": trial + 1,
+                                            }
+                                        
+                                        if val_acc == 1.0:
+                                            stopped_early = True
+                                            if best_row:
+                                                best_row["stopped_early"] = True
+                                    except Exception as e:
+                                        compile_error = str(e)
+                                        self.log.warning("compile_or_eval_error", extra={"fn": fn, "length": L, "attempt": k, "trial": trial + 1, "error": compile_error})
+                                else:
+                                    compile_error = "no_code_found"
+
+                                row = {
+                                    **res,
+                                    "val_acc": val_acc,
+                                    "test_acc": test_acc,
+                                    "stopped_early": stopped_early,
+                                    "compile_error": compile_error,
+                                    "trial": trial + 1,
+                                }
+                                all_rows.append(row)
+                                
+                                trial_jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+                                trial_jsonl_file.flush()
+
+                                if stopped_early:
+                                    self.log.info("early_stop", extra={"fn": fn, "length": L, "attempt": k, "trial": trial + 1, "val_acc": val_acc, "test_acc": test_acc})
+                                    break
+
+                            if best_test_acc >= 0 and best_row:
+                                trial_test_accuracies.append(best_test_acc)
+                                trial_val_accuracies.append(best_val_acc if best_val_acc is not None else 0.0)
+                                trial_best_rows.append(best_row)
+                        finally:
+                            trial_jsonl_file.close()
+
+                    for best_row in trial_best_rows:
+                        final_jsonl_file.write(json.dumps(best_row, ensure_ascii=False) + "\n")
+                        final_jsonl_file.flush()
+
+                    if trial_test_accuracies:
+                        import numpy as np
+                        test_acc_mean = float(np.mean(trial_test_accuracies))
+                        test_acc_std = float(np.std(trial_test_accuracies))
+                        val_acc_mean = float(np.mean(trial_val_accuracies))
+                        val_acc_std = float(np.std(trial_val_accuracies))
+
+                        summary_row = {
+                            "fn": fn,
+                            "length": L,
+                            "attempt": None,
+                            "trial": None,
+                            "prompt": None,
+                            "text": None,
+                            "duration_ms": None,
+                            "cached_tokens": None,
+                            "usage": {},
+                            "tool_uses": None,
+                            "tool_results_chars": None,
+                            "val_acc": val_acc_mean,
+                            "val_acc_std": val_acc_std,
+                            "test_acc": test_acc_mean,
+                            "test_acc_std": test_acc_std,
+                            "stopped_early": None,
+                            "compile_error": None,
+                            "num_trials": self.cfg.num_trials,
+                            "is_summary": True,
+                        }
+
+                        all_rows.append(summary_row)
+                        final_jsonl_file.write(json.dumps(summary_row, ensure_ascii=False) + "\n")
+                        final_jsonl_file.flush()
+
+                        self.log.info(
+                            f"{fn} L={L}: test_acc={test_acc_mean:.4f}±{test_acc_std:.4f} "
+                            f"(mean±std over {self.cfg.num_trials} trials)"
+                        )
+
+            self.log.info("dispatch_finished", extra={"total_results": len(all_rows)})
+        finally:
+            final_jsonl_file.close()
+        
         return all_rows
 
 
 # =========================
 # Writers
 # =========================
-# Emit a JSONL (1 row per attempt) and a CSV with a fixed set of columns. The CSV
-# aligns with normalize_usage fields, making it easy to analyze in spreadsheets.
 
 def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
@@ -717,10 +735,10 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "fn", "length", "attempt", "prompt", "text",
+        "fn", "length", "attempt", "trial", "prompt", "text",
         "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
-        "val_acc", "test_acc", "stopped_early", "compile_error",
+        "val_acc", "val_acc_std", "test_acc", "test_acc_std", "stopped_early", "compile_error", "num_trials", "is_summary",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
@@ -731,6 +749,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "fn": r.get("fn"),
                 "length": r.get("length"),
                 "attempt": r.get("attempt"),
+                "trial": r.get("trial"),
                 "prompt": r.get("prompt"),
                 "text": r.get("text"),
                 "duration_ms": r.get("duration_ms"),
@@ -741,29 +760,30 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "tool_uses": r.get("tool_uses"),
                 "tool_results_chars": r.get("tool_results_chars"),
                 "val_acc": r.get("val_acc"),
+                "val_acc_std": r.get("val_acc_std"),
                 "test_acc": r.get("test_acc"),
+                "test_acc_std": r.get("test_acc_std"),
                 "stopped_early": r.get("stopped_early"),
                 "compile_error": r.get("compile_error"),
+                "num_trials": r.get("num_trials"),
+                "is_summary": r.get("is_summary"),
             })
 
 
 # =========================
 # CLI
 # =========================
-# Argparse surface mirrors the Config dataclass. Unknowns default to env vars.
-# LOG_LEVEL is passed through the environment so setup_logger can pick it up.
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="OpenAI GPT-5 runner (early-stop + persistent datasets)")
+    p = argparse.ArgumentParser(description="OpenAI runner (early-stop + persistent datasets)")
 
-    # Grid / behavior
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths (e.g., 100 50 30 25 20)")
     p.add_argument("--attempts", type=int, help="Attempts per (fn, length), default=5")
+    p.add_argument("--num-trials", type=int, help="Number of trials per (fn, length) for statistics, default=5")
     p.add_argument("--concurrency", type=int, help="Max concurrent API calls (default: 5)")
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
 
-    # OpenAI
     p.add_argument("--model", help="Model name (default: gpt-5)")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
@@ -771,14 +791,12 @@ def parse_args() -> Config:
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
     p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
 
-    # Datasets
     p.add_argument("--train-size", type=int, help="Train size per (fn, L) (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size per (fn, L) (default: 100)")
     p.add_argument("--test-size", type=int, help="Test size per (fn, L) (default: 10000)")
     p.add_argument("--seed", type=int, help="Global seed (default: 42)")
     p.add_argument("--dataset-dir", type=str, help="Dataset root directory (default: program_synthesis/datasets)")
 
-    # Artifacts
     p.add_argument("--out-jsonl", help="Output JSONL path (default: program_synthesis/results_attempts.jsonl)")
     p.add_argument("--out-csv", help="Output CSV path (default: program_synthesis/results_attempts.csv)")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
@@ -787,10 +805,10 @@ def parse_args() -> Config:
     args = p.parse_args()
     cfg = Config()
 
-    # Apply overrides
     if args.functions: cfg.functions = args.functions
     if args.lengths: cfg.lengths = args.lengths
     if args.attempts: cfg.attempts = args.attempts
+    if args.num_trials: cfg.num_trials = args.num_trials
     if args.concurrency: cfg.concurrency = args.concurrency
     if args.model: cfg.model = args.model
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
@@ -813,15 +831,12 @@ def parse_args() -> Config:
 
 
 async def _amain(cfg: Config) -> None:
-    # Entrypoint for asyncio: build logger, run the experiment, then write artifacts.
     log = setup_logger(os.getenv("LOG_LEVEL", "INFO"))
     runner = Runner(cfg, log)
     try:
         rows = await runner.run()
     finally:
-        # Close the AsyncOpenAI client to release network resources.
         await runner.client.close()
-    write_jsonl(cfg.out_jsonl, rows)
     write_csv(cfg.out_csv, rows)
     log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv})
 

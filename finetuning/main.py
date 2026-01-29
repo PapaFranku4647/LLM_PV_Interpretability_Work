@@ -14,9 +14,8 @@ from torch.amp import autocast, GradScaler
 from tqdm import tqdm
 from itertools import islice
 
-import utils
-import models
-from dataloaders import CodeDataset
+from . import utils, models
+from .dataloaders import CodeDataset
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
@@ -36,6 +35,7 @@ def setup_environment(seed):
 
 def setup_logger(log_file_name="job_log.log", log_level=logging.INFO) -> logging.Logger:
     """Sets up a logger that writes to a file and the console."""
+    os.makedirs(os.path.dirname(log_file_name), exist_ok=True)
     logger = logging.getLogger(__name__)
     if logger.hasHandlers():
         logger.handlers.clear()
@@ -195,6 +195,7 @@ def load_data(args, logger):
         online=args.online, device=args.device, logger=logger,
         tokenizer_name=tokenizer_name, global_seed=args.seed,
         fn_id=args.target_func, val_set_size=0,
+        test_sequence_length=getattr(args, 'test_sequence_length', None),
         **task_config
     )
     return dataset.create_dataloaders()
@@ -279,7 +280,8 @@ if __name__ == '__main__':
     
     # --- Dataset Parameters ---
     parser.add_argument('--target_func', type=str, default='func4', help='The target function to learn.')
-    parser.add_argument('--sequence_length', type=int, default=50, help='Length of the input sequences.')
+    parser.add_argument('--sequence_length', type=int, default=50, help='Length of the input sequences for training.')
+    parser.add_argument('--test_sequence_length', type=int, default=None, help='Length of the input sequences for evaluation. Defaults to 100 if not provided.')
     parser.add_argument('--train_set_size', type=int, default=100000, help='Number of samples in the training set.')
     parser.add_argument('--test_set_size', type=int, default=10000, help='Number of samples in the test set.')
     parser.add_argument('--BOS_TOKEN', type=int, default=2, help='Beginning of sequence token.')
