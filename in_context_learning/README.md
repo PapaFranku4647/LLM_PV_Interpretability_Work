@@ -16,7 +16,7 @@
 
 ## Setup
 ```bash
-conda activate llm_erm
+conda activate llm_pv
 # Assuming requirements are installed
 # Ensure CUDA & drivers match your vLLM build.
 ```
