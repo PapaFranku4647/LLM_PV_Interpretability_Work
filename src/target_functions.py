@@ -322,13 +322,14 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_k": "prime_decimal_tf_check",
     "fn_l": "sha256_parity",
     "fn_v": "prime_plus_47",
-    "fn_aa": "graph_has_cycle",
     # Tabular datasets
     "fn_m": "adult_income",
     "fn_n": "mushroom",
     "fn_o": "cdc_diabetes",
-    "fn_x": "htru2",
-    "fn_y": "chess",
+    "fn_p": "htru2",
+    "fn_q": "chess",
+    # Graph problems
+    "fn_r": "graph_has_cycle",
 }
 
 EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
@@ -347,11 +348,11 @@ EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
         "lengths": [21],
         "tabular": True
     },
-    "fn_x": {
+    "fn_p": {
         "lengths": [8],
         "tabular": True
     },
-    "fn_y": {
+    "fn_q": {
         "lengths": [35],
         "tabular": True
     },

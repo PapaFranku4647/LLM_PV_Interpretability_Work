@@ -79,14 +79,14 @@ grid:
 
 ## Task-specific requirements
 
-- **Tabular datasets** (`fn_m`, `fn_n`, `fn_o`, `fn_x`, `fn_y`): `--sequence_length` is auto-detected from metadata. You don't need to specify it, but if provided, it must match the fixed length:
+- **Tabular datasets** (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`): `--sequence_length` is auto-detected from metadata. You don't need to specify it, but if provided, it must match the fixed length:
   - `fn_m` (adult_income): `14`
   - `fn_n` (mushroom): `20`
   - `fn_o` (cdc_diabetes): `21`
-  - `fn_x` (htru2): `8`
-  - `fn_y` (chess): `35`
+  - `fn_p` (htru2): `8`
+  - `fn_q` (chess): `35`
 
-- **`fn_aa` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
+- **`fn_r` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
 
 ---
 
