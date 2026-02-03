@@ -97,7 +97,7 @@ class Config:
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
+TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
 
 
 # =========================

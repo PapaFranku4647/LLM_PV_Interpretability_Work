@@ -164,7 +164,7 @@ class CodeDataset:
         test_generator = get_data_generator(target_name, self.test_sequence_length, self.test_set_size)
         test_samples = test_generator.generate_data()
 
-        is_tabular = target_name in ['adult_income', 'mushroom', 'cdc_diabetes', 'breast_cancer', 'spambase', 'htru2', 'chess', 'magic']
+        is_tabular = target_name in ['adult_income', 'mushroom', 'cdc_diabetes', 'breast_cancer', 'htru2', 'chess']
         is_graph = target_name in ['graph_has_cycle', 'graph_connected']
         
         if is_tabular:

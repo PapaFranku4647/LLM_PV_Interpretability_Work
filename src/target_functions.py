@@ -304,10 +304,8 @@ TARGET_FUNCTIONS: Dict[str, Callable[[torch.Tensor, str], torch.Tensor]] = {
     'mushroom': tabular_dummy,
     'cdc_diabetes': tabular_dummy,
     'breast_cancer': tabular_dummy,
-    'spambase': tabular_dummy,
     'htru2': tabular_dummy,
     'chess': tabular_dummy,
-    'magic': tabular_dummy,
 }
 
 EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
@@ -329,10 +327,8 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_m": "adult_income",
     "fn_n": "mushroom",
     "fn_o": "cdc_diabetes",
-    "fn_w": "spambase",
     "fn_x": "htru2",
     "fn_y": "chess",
-    "fn_z": "magic",
 }
 
 EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
@@ -351,20 +347,12 @@ EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
         "lengths": [21],
         "tabular": True
     },
-    "fn_w": {
-        "lengths": [57],
-        "tabular": True
-    },
     "fn_x": {
         "lengths": [8],
         "tabular": True
     },
     "fn_y": {
         "lengths": [35],
-        "tabular": True
-    },
-    "fn_z": {
-        "lengths": [10],
         "tabular": True
     },
 }

@@ -38,7 +38,7 @@ python in_context_learning/vllm_incontext.py --model <huggingface-model-id>
 ### Notable arguments (subset)
 - Grid: `--functions` (e.g., `fn_a fn_b ...`), `--lengths` (e.g., `100 50 30 25 20`)  
   > Special-case: `fn_h` (Dyck-2) uses lengths `[100, 80, 60, 40, 20]` if provided in metadata.  
-  > Tabular datasets (`fn_m`, `fn_n`, `fn_o`, `fn_w`, `fn_x`, `fn_y`, `fn_z`): `--lengths` is auto-detected from metadata (fixed per dataset: `fn_m`=14, `fn_n`=20, `fn_o`=21, `fn_w`=57, `fn_x`=8, `fn_y`=35, `fn_z`=10).  
+  > Tabular datasets (`fn_m`, `fn_n`, `fn_o`, `fn_x`, `fn_y`): `--lengths` is auto-detected from metadata (fixed per dataset: `fn_m`=14, `fn_n`=20, `fn_o`=21, `fn_x`=8, `fn_y`=35).  
   > `fn_aa` (graph_has_cycle): `--lengths` must be multiples of 4 (e.g., `100 200 300`).
 - Data: `--train-size` (few-shot examples per prompt), `--test-size` (prompts per task), `--seed`
 - Model/vLLM: `--model`, `--tensor-parallel-size`, `--max-model-len`, `--temperature`, `--max-new-tokens`

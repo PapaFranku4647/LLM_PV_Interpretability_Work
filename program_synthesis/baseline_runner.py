@@ -22,12 +22,12 @@ from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
+TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
 BOOLEAN_FNS = {"parity_all", "parity_first_half", "parity_rand_3", "parity_rand_10", 
                "automata_parity", "palindrome", "dyck2", "patternmatch1", "patternmatch2",
                "prime_decimal", "prime_decimal_tf_check", "sha256_parity", "prime_plus_47", "collatz_steps_parity",
                "graph_has_cycle", "graph_connected",
-               "adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
+               "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("baseline_runner")
@@ -295,8 +295,8 @@ class Config:
     functions: List[str] = field(default_factory=lambda: [
         "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
         "fn_g", "fn_h", "fn_i", "fn_j", "fn_k", "fn_l", "fn_v", "fn_t",
-        "fn_aa", "fn_ab",
-        "fn_m", "fn_n", "fn_o", "fn_w", "fn_x", "fn_y", "fn_z",
+        "fn_aa",
+        "fn_m", "fn_n", "fn_o", "fn_x", "fn_y",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
     train_size: int = int(os.getenv("TRAIN_SIZE", "100"))
@@ -396,10 +396,8 @@ class TabularDataParser:
     MUSHROOM_NUMERIC = {'x0', 'x8', 'x9'}
     CDC_DIABETES_NUMERIC = {'x3', 'x13', 'x14', 'x15', 'x18', 'x19', 'x20'}
     BREAST_CANCER_NUMERIC = {f'x{i}' for i in range(30)}
-    SPAMBASE_NUMERIC = {f'x{i}' for i in range(57)}
     HTRU2_NUMERIC = {f'x{i}' for i in range(8)}
     CHESS_NUMERIC = set()
-    MAGIC_NUMERIC = {f'x{i}' for i in range(10)}
     
     def __init__(self, dataset_name: str = 'adult_income'):
         self.feature_names: List[str] = []
@@ -410,14 +408,10 @@ class TabularDataParser:
             self.numeric_features = self.MUSHROOM_NUMERIC
         elif dataset_name == 'cdc_diabetes':
             self.numeric_features = self.CDC_DIABETES_NUMERIC
-        elif dataset_name == 'spambase':
-            self.numeric_features = self.SPAMBASE_NUMERIC
         elif dataset_name == 'htru2':
             self.numeric_features = self.HTRU2_NUMERIC
         elif dataset_name == 'chess':
             self.numeric_features = self.CHESS_NUMERIC
-        elif dataset_name == 'magic':
-            self.numeric_features = self.MAGIC_NUMERIC
         else:
             self.numeric_features = self.ADULT_INCOME_NUMERIC
     

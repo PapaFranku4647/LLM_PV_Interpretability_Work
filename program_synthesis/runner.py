@@ -172,8 +172,8 @@ class Config:
     functions: List[str] = field(default_factory=lambda: [
         "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
         "fn_g", "fn_h", "fn_i", "fn_j", "fn_k", "fn_l", "fn_v", "fn_t",
-        "fn_aa", "fn_ab",
-        "fn_m", "fn_n", "fn_o", "fn_w", "fn_x", "fn_y", "fn_z",
+        "fn_aa",
+        "fn_m", "fn_n", "fn_o", "fn_x", "fn_y",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
     attempts: int = int(os.getenv("ATTEMPTS", "5"))
@@ -228,7 +228,7 @@ def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = Fa
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check", "prime_plus_47", "collatz_steps_parity"}
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
+TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
 
 
 # =========================
