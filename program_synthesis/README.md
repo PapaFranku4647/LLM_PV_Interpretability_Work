@@ -24,6 +24,8 @@ export OPENAI_API_KEY=sk-...   # required
 python program_synthesis/runner.py   --functions fn_a   --lengths 50   --attempts 5   --enable-code-interpreter   --concurrency 1   --timeout 1200
 ```
 
+> **Note:** For tabular tasks, you do not need to provide `--lengths` parameter
+
 ## Replicating Paper (Uses Default Config) (Note: Consumes $$)
 ```bash
 python program_synthesis/runner.py --enable-code-interpreter

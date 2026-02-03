@@ -21,7 +21,7 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from src.target_functions import TARGET_FUNCTIONS, EXPERIMENT_FUNCTION_MAPPING
+from src.target_functions import TARGET_FUNCTIONS, EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 
 # =============================================================================
 # Helper Functions
@@ -188,8 +188,22 @@ def load_data(args, logger):
     """Loads and prepares the dataset and dataloaders based on args."""
     logger.info("Setting up dataset...")
     task_config, python_code, tokenizer_name = _get_task_config_from_args(args)
+    
+    sequence_length = args.sequence_length
+    task_meta = EXPERIMENT_FUNCTION_METADATA.get(args.target_func, {})
+    if "lengths" in task_meta:
+        required_lengths = task_meta["lengths"]
+        if sequence_length not in required_lengths:
+            logger.info(f"Auto-detected sequence_length {required_lengths[0]} for {args.target_func} (metadata specifies: {required_lengths})")
+            sequence_length = required_lengths[0]
+        else:
+            logger.info(f"Using provided sequence_length {sequence_length} for {args.target_func}")
+    elif args.target_func == "fn_aa":
+        if sequence_length % 4 != 0:
+            raise ValueError(f"fn_aa (graph_has_cycle) requires sequence_length to be a multiple of 4, got {sequence_length}")
+    
     dataset = CodeDataset(
-        python_code=python_code, sequence_length=args.sequence_length,
+        python_code=python_code, sequence_length=sequence_length,
         train_set_size=args.train_set_size, test_set_size=args.test_set_size,
         batch_size=args.batch_size, bos_token=args.BOS_TOKEN,
         online=args.online, device=args.device, logger=logger,

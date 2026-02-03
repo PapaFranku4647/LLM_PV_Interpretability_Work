@@ -18,7 +18,7 @@ parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
 from src.data_handler import get_data_generator, create_stratified_splits
-from src.target_functions import TARGET_FUNCTIONS
+from src.target_functions import TARGET_FUNCTIONS, EXPERIMENT_FUNCTION_MAPPING
 
 random.seed(42)
 
@@ -37,6 +37,7 @@ class CodeDataset:
     def __init__(self, python_code: Callable, sequence_length: int, train_set_size: int, test_set_size: int, batch_size: int, p=0.5, bos_token=2, online=False, device='cpu', dyck2=False, palindrome=False, logger=None, prime=None, pattern=None, prime_odd=None, tokenizer_name=None, cache_dir="finetuning/sgd_datasets_cache", global_seed: int = 42, fn_id: Optional[str] = None, val_set_size: int = 0, test_sequence_length: Optional[int] = None):
         
         self.python_code = python_code
+        self.fn_id = fn_id
         self.sequence_length = sequence_length
         # Default test_sequence_length to 100 if not provided (for backward compatibility)
         self.test_sequence_length = test_sequence_length if test_sequence_length is not None else 100
@@ -130,18 +131,22 @@ class CodeDataset:
 
     def generate_datasets_fast(self):
         target_name = None
-        for name, func in TARGET_FUNCTIONS.items():
-            if func == self.python_code:
-                target_name = name
-                break
         
-        if not target_name:
-            if self.palindrome: target_name = "palindrome"
-            elif self.pattern == '10101010': target_name = "patternmatch1"
-            elif self.pattern == '00111111': target_name = "patternmatch2"
-            elif self.dyck2: target_name = "dyck2"
-            elif self.prime: target_name = "prime_decimal"
-            elif self.prime_odd: target_name = "prime_decimal_tf_check"
+        if self.fn_id and self.fn_id in EXPERIMENT_FUNCTION_MAPPING:
+            target_name = EXPERIMENT_FUNCTION_MAPPING[self.fn_id]
+        else:
+            for name, func in TARGET_FUNCTIONS.items():
+                if func == self.python_code:
+                    target_name = name
+                    break
+            
+            if not target_name:
+                if self.palindrome: target_name = "palindrome"
+                elif self.pattern == '10101010': target_name = "patternmatch1"
+                elif self.pattern == '00111111': target_name = "patternmatch2"
+                elif self.dyck2: target_name = "dyck2"
+                elif self.prime: target_name = "prime_decimal"
+                elif self.prime_odd: target_name = "prime_decimal_tf_check"
 
         if not target_name:
             raise ValueError(f"Could not determine a target_name for the provided python_code: {self.python_code.__name__}")

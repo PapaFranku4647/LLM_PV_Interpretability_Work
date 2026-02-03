@@ -97,6 +97,7 @@ class Config:
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check"}
+TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "spambase", "htru2", "chess", "magic"}
 
 
 # =========================
@@ -107,16 +108,26 @@ def build_user_prompt(
     test_input: str,
     seq_len: int,
     decimal: bool = False,
+    tabular: bool = False,
 ) -> str:
     """Creates a structured few-shot prompt for an in-context classification task."""
-    problem_type = "decimal" if decimal else "binary"
-    problem_statement = (
-        f"**Problem Statement:**\n"
-        f"You are given input vectors (type: {problem_type}, length: {seq_len}) and their "
-        f"corresponding binary outputs ('0' or '1'). Your task is to analyze the provided "
-        f"examples to understand the underlying pattern or function. Then, for the final "
-        f"test input, predict its correct label."
-    )
+    if tabular:
+        problem_statement = (
+            f"**Problem Statement:**\n"
+            f"You are given tabular input data (comma-separated feature:value pairs) and their "
+            f"corresponding binary outputs ('0' or '1'). Your task is to analyze the provided "
+            f"examples to understand the underlying pattern or function. Then, for the final "
+            f"test input, predict its correct label."
+        )
+    else:
+        problem_type = "decimal" if decimal else "binary"
+        problem_statement = (
+            f"**Problem Statement:**\n"
+            f"You are given input vectors (type: {problem_type}, length: {seq_len}) and their "
+            f"corresponding binary outputs ('0' or '1'). Your task is to analyze the provided "
+            f"examples to understand the underlying pattern or function. Then, for the final "
+            f"test input, predict its correct label."
+        )
     prompt = f"{problem_statement}\n\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
     prompt += "**Test Input:**\n```\n" + test_input + "\n```\n\n"
@@ -165,6 +176,7 @@ class PromptGenerator:
 
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
+        is_tabular = target_name in TABULAR_FNS
 
         # Use the SAME derived seed scheme as program_synthesis/runner.py
         derived_seed = self._stable_derived_seed(fn, L)
@@ -211,7 +223,7 @@ class PromptGenerator:
         prompts = []
         for test_line in test_lines:
             test_input, true_label = [part.strip() for part in test_line.split("->")]
-            prompt_text = build_user_prompt(train_lines, test_input, L, is_decimal)
+            prompt_text = build_user_prompt(train_lines, test_input, L, is_decimal, is_tabular)
             prompts.append({
                 "prompt": prompt_text,
                 "true_label": true_label,

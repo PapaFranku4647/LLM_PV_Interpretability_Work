@@ -77,6 +77,21 @@ grid:
 
 ---
 
+## Task-specific requirements
+
+- **Tabular datasets** (`fn_m`, `fn_n`, `fn_o`, `fn_w`, `fn_x`, `fn_y`, `fn_z`): `--sequence_length` is auto-detected from metadata. You don't need to specify it, but if provided, it must match the fixed length:
+  - `fn_m` (adult_income): `14`
+  - `fn_n` (mushroom): `20`
+  - `fn_o` (cdc_diabetes): `21`
+  - `fn_w` (spambase): `57`
+  - `fn_x` (htru2): `8`
+  - `fn_y` (chess): `35`
+  - `fn_z` (magic): `10`
+
+- **`fn_aa` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
+
+---
+
 ## Choosing models
 - **From scratch**: `--model qwen1.7B|llama3|deepseek` (tiny configs, fast iterations).
 - **Finetune HF weights**: `--model qwen3_finetune|llama3_finetune|deepseek_finetune`  
