@@ -1,4 +1,4 @@
-# LLM Priors for ERM over Programs: 
+# LLM Priors for ERM over Programs
 
 Our work addresses the following question : 
 > Can we design program-learning methods that are efficient in both samples and computation, avoiding exponential enumeration while requiring fewer samples than gradient-based training?
