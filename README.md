@@ -1,21 +1,19 @@
-# LLM-ERM: 
-
-[GitHub Page](https://github.com/DLFundamentals/LLM_ERM) • [Project Page]() • [Paper Page](https://arxiv.org/abs/2510.14331)
+# LLM Priors for ERM over Programs: 
 
 Our work addresses the following question : 
-> Can we design learning algorithms that combine the sample efficiency of finite-class program search with the computational efficiency of modern optimization methods?
+> Can we design program-learning methods that are efficient in both samples and computation, avoiding exponential enumeration while requiring fewer samples than gradient-based training?
 
 ## Abstract
 
-We seek algorithms for program learning that are both sample-efficient and computationally feasible. Classical results show that targets admitting short program descriptions (e.g., with short python code can be learned with a small number of examples (scaling with the size of the code) via length-first program enumeration, but the search is exponential in description length. Consequently, Gradient-based training avoids this cost yet can require exponentially many samples on certain short-program families.
+We study program-learning methods that are efficient in both samples and computation. Classical learning theory suggests that when the target admits a short program description (for example, a short piece of "Python code"), it can be learned from relatively few examples by performing ERM over the program class. However, this approach relies on enumerating candidate programs, which is typically exponential in the description length. In contrast, gradient-based training avoids explicit search, but for some families of short programs it can require exponentially many samples to succeed.
 
-To address this gap, we introduce LLM-ERM, a propose-and-verify framework that replaces exhaustive enumeration with an LLM-guided search over candidate programs while retaining ERM-style selection on held-out data. Specifically, we draw $k$ candidates with a pretrained reasoning-augmented LLM, compile and check each on the data, and return the best verified hypothesis, with no feedback, adaptivity, or gradients. Theoretically, we show that coordinate-wise online mini-batch SGD requires many samples to learn certain short programs. {\em Empirically, LLM-ERM solves tasks such as parity variants, pattern matching, and primality testing with as few as 200 samples, while SGD-trained transformers overfit even with 100,000 samples}. These results indicate that language-guided program synthesis recovers much of the statistical efficiency of finite-class ERM while remaining computationally tractable, offering a practical route to learning succinct hypotheses beyond the reach of gradient-based training.
+We propose **LLM-PV**, a propose-and-verify recipe that enables ERM-style selection over a discrete program class without exhaustive enumeration. A pretrained LLM induces a proposal distribution over candidate programs; each proposal is executed, scored on a held-out validation set, and the best program is selected. The method uses no gradient updates and does not use validation feedback to adapt the sampling distribution. Across algorithmic tasks including parity variants, pattern matching, and primality testing, LLM-PV often recovers the exact underlying rule from a small labeled set and generalizes far beyond the training sequence lengths. In the same regimes, SGD-trained transformers and standard adaptation baselines (fine-tuning and in-context learning), as well as classical ML baselines, can fit the training data yet fail to generalize reliably. Together, these results suggest that pretrained LLM priors can serve as effective search biases for ERM, narrowing the gap between statistical and computational efficiency.
 
-## LLM-ERM • In-Context • Fine-Tuning
+## LLM-PV • In-Context • Fine-Tuning
 
 The repository contains three types of experiments.
 
-- **llm-erm** — Synthesize a Python function `f(x)` that matches the input-output relationship.
+- **llm-pv** — Synthesize a Python function `f(x)` that matches the input-output relationship.
 - **in_context_learning** — Run local models via **vLLM**; few-shot prompts with hundreds of examples; batched inference and accuracy summaries.
 - **finetuning** — Train from scratch or finetune LMs (e.g., Qwen/Llama/DeepSeek) as **binary classifiers** on the same tasks; YAML sweeps included.
 
@@ -24,13 +22,13 @@ The repository contains three types of experiments.
 ```bash
 # 1) Create environment (Conda)
 conda env create -f environment.yaml
-conda activate llm_erm
+conda activate llm_pv
 
 # 2) (Not Required) Already included in environment.yaml
 pip install -r requirements.txt
 ```
 
-### LLM-ERM (OpenAI)
+### LLM-PV (OpenAI)
 ```bash
 export OPENAI_API_KEY=sk-...
 python program_synthesis/runner.py --functions fn_a --lengths 50 --attempts 3 --enable-code-interpreter
@@ -50,7 +48,7 @@ python finetuning/main.py --results-path ./results_new/0/0 --model qwen1.7B --ta
 ## Repo layout
 ```
 .
-├── program_synthesis/        # LLM-ERM
+├── program_synthesis/        # LLM-PV
 ├── in_context_learning/      # vLLM few-shot ICL runner (batched inference)
 ├── finetuning/               # Training/finetuning code + YAML sweeps
 ├── src/                      # Shared data generators & target functions
@@ -62,19 +60,3 @@ python finetuning/main.py --results-path ./results_new/0/0 --model qwen1.7B --ta
 > - [`program_synthesis/README.md`](program_synthesis/README.md)  
 > - [`in_context_learning/README.md`](in_context_learning/README.md)  
 > - [`finetuning/README.md`](finetuning/README.md)
-
-## Citation
-
-If you find our work useful in your research or applications, please cite us using the following BibTeX:
-
-```bash
-@misc{singhal2025llmermsampleefficientprogramlearning,
-      title={LLM-ERM: Sample-Efficient Program Learning via LLM-Guided Search}, 
-      author={Shivam Singhal and Eran Malach and Tomaso Poggio and Tomer Galanti},
-      year={2025},
-      eprint={2510.14331},
-      archivePrefix={arXiv},
-      primaryClass={cs.LG},
-      url={https://arxiv.org/abs/2510.14331}, 
-}
-```

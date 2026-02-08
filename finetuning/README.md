@@ -17,7 +17,7 @@ Train (or finetune) LMs to **classify sequences** (binary/decimal) using the *sa
 
 ## Setup
 ```bash
-conda activate llm_erm
+conda activate llm_pv
 # Assuming requirements are installed
 ```
 
@@ -74,6 +74,19 @@ grid:
 - Uses `src/data_handler.get_data_generator(...)` for **balanced 50/50** datasets.
 - Builds one pool of size `train+test`, then uses `create_stratified_splits(...)` (validation size is `0` here).
 - **Caching:** tensors saved under `sgd_datasets_cache/seed_<derived>/<hash>/` keyed by a **derived seed** of (func, length, sizes, global seed). Re-runs reuse identical data.
+
+---
+
+## Task-specific requirements
+
+- **Tabular datasets** (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`): `--sequence_length` is auto-detected from metadata. You don't need to specify it, but if provided, it must match the fixed length:
+  - `fn_m` (adult_income): `14`
+  - `fn_n` (mushroom): `20`
+  - `fn_o` (cdc_diabetes): `21`
+  - `fn_p` (htru2): `8`
+  - `fn_q` (chess): `35`
+
+- **`fn_aa` (graph_has_cycle)**: `--sequence_length` must be a multiple of 4 (e.g., 100, 200, 300).
 
 ---
 
