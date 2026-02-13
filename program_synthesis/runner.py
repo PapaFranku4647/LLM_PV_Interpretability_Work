@@ -423,6 +423,25 @@ def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
         raise ValueError(f"Function '{prefer_name}' not found after exec.")
     return fn
 
+def analyze_code_structure(code_str: str) -> Dict[str, Any]:
+    normalized = textwrap.dedent(code_str.strip())
+    if normalized.startswith("```"):
+        normalized = re.sub(r"^```(?:python)?\s*|\s*```$", "", normalized, flags=re.IGNORECASE | re.DOTALL)
+
+    non_empty_lines = [ln for ln in normalized.splitlines() if ln.strip()]
+    out = {
+        "code": normalized,
+        "code_lines": len(non_empty_lines),
+        "num_branches": None,
+        "code_analysis_error": None,
+    }
+    try:
+        tree = ast.parse(normalized)
+        out["num_branches"] = sum(1 for node in ast.walk(tree) if isinstance(node, ast.If))
+    except Exception as e:
+        out["code_analysis_error"] = str(e)
+    return out
+
 
 # =========================
 # Accuracy evaluation
@@ -674,12 +693,19 @@ class Runner:
                                 res = await self._call_once(fn, L, k, train_lines, is_decimal, is_tabular)
                                 out_text = res.get("text") or ""
                                 code_str = extract_code_from_output(out_text)
+                                code_info = {
+                                    "code": None,
+                                    "code_lines": None,
+                                    "num_branches": None,
+                                    "code_analysis_error": None,
+                                }
 
                                 val_acc = None
                                 test_acc = None
                                 compile_error = None
 
                                 if code_str:
+                                    code_info = analyze_code_structure(code_str)
                                     try:
                                         fn_callable = compile_callable_from_code(code_str)
                                         val_acc = evaluate_accuracy(fn_callable, val_lines, self.log, is_tabular)
@@ -690,6 +716,7 @@ class Runner:
                                             best_val_acc = val_acc
                                             best_row = self._attach_meta({
                                                 **res,
+                                                **code_info,
                                                 "val_acc": val_acc,
                                                 "test_acc": test_acc,
                                                 "stopped_early": stopped_early,
@@ -709,6 +736,7 @@ class Runner:
 
                                 row = self._attach_meta({
                                     **res,
+                                    **code_info,
                                     "val_acc": val_acc,
                                     "test_acc": test_acc,
                                     "stopped_early": stopped_early,
@@ -749,6 +777,10 @@ class Runner:
                             "trial": None,
                             "prompt": None,
                             "text": None,
+                            "code": None,
+                            "code_lines": None,
+                            "num_branches": None,
+                            "code_analysis_error": None,
                             "duration_ms": None,
                             "cached_tokens": None,
                             "usage": {},
@@ -795,6 +827,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
         "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
         "fn", "length", "attempt", "trial", "prompt", "text",
+        "code", "code_lines", "num_branches", "code_analysis_error",
         "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std", "stopped_early", "compile_error", "num_trials", "is_summary",
@@ -827,6 +860,10 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "trial": r.get("trial"),
                 "prompt": r.get("prompt"),
                 "text": r.get("text"),
+                "code": r.get("code"),
+                "code_lines": r.get("code_lines"),
+                "num_branches": r.get("num_branches"),
+                "code_analysis_error": r.get("code_analysis_error"),
                 "duration_ms": r.get("duration_ms"),
                 "cached_tokens": r.get("cached_tokens"),
                 "prompt_tokens": usage.get("prompt_tokens"),
