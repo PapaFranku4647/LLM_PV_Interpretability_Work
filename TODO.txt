@@ -1,0 +1,178 @@
+Phase 1 Prompt Variant + Fair Baseline Comparison Runbook
+Date: 2026-02-12
+
+Goal
+- Verify each prompt variant is actually sent to the model backend.
+- Run a fair comparison where LLM runs and baseline runs use identical seeds/splits/sizes.
+
+Shared hyperparameters (for fairness)
+- Functions: fn_m fn_n fn_o fn_p fn_q
+- Seeds: 2201..2212
+- Train/Val/Test: 100 / 100 / 3000
+- Runner attempts: 5
+- Num trials: 5
+- Model: gpt-5-mini
+- Reasoning effort: minimal
+- Tool choice: none
+- Max output tokens: 2400
+- Shared dataset cache dir for BOTH methods:
+  program_synthesis/runs_phase1_prompt_compare_20260212/datasets
+
+------------------------------------------------------------------------------
+0) One-time setup (PowerShell)
+------------------------------------------------------------------------------
+$line = Get-Content .env | Where-Object { $_ -match '^\s*OPENAI_API_KEY\s*=\s*' } | Select-Object -First 1
+if (-not $line) { throw 'OPENAI_API_KEY missing in .env' }
+$env:OPENAI_API_KEY = (($line -replace '^\s*OPENAI_API_KEY\s*=\s*', '').Trim().Trim('"').Trim("'"))
+
+$RUN_ROOT = "program_synthesis/runs_phase1_prompt_compare_20260212"
+$DATASET_DIR = "$RUN_ROOT/datasets"
+New-Item -ItemType Directory -Force -Path $RUN_ROOT | Out-Null
+New-Item -ItemType Directory -Force -Path $DATASET_DIR | Out-Null
+
+------------------------------------------------------------------------------
+1) Verify prompt variants are actually sent (real API calls)
+------------------------------------------------------------------------------
+# Tiny real calls, one per variant, identical settings except --prompt-variant.
+# This should generate HTTP 200 + usage tokens in logs.
+$VERIFY_DIR = "program_synthesis/prompt_verify"
+New-Item -ItemType Directory -Force -Path $VERIFY_DIR | Out-Null
+
+foreach ($v in @("standard","explain","interview","preview")) {
+  & .\.venv-3-11\Scripts\python.exe program_synthesis/runner.py `
+    --functions fn_a `
+    --lengths 20 `
+    --attempts 1 `
+    --num-trials 1 `
+    --train-size 10 `
+    --val-size 10 `
+    --test-size 20 `
+    --seed 42 `
+    --model gpt-5-mini `
+    --reasoning-effort minimal `
+    --tool-choice none `
+    --max-output-tokens 800 `
+    --prompt-variant $v `
+    --run-id "prompt_verify_${v}" `
+    --out-jsonl "$VERIFY_DIR/${v}.jsonl" `
+    --out-csv "$VERIFY_DIR/${v}.csv" `
+    --out-manifest "$VERIFY_DIR/${v}_manifest.json"
+}
+
+# Quick checks:
+# - prompt_variant + prompt_tokens should differ across variants:
+Get-ChildItem $VERIFY_DIR -Filter "*.csv" | ForEach-Object {
+  Import-Csv $_.FullName | Where-Object { $_.attempt -ne "" } | Select-Object -First 1 file,prompt_variant,prompt_tokens,completion_tokens,duration_ms
+}
+
+# - prompt text should include variant-specific instruction in trial JSONL:
+#   explain: "Generate code that is clear and interpretable"
+#   interview: "I ask you to:"
+#   preview: "After generating the function, you will be asked:"
+
+------------------------------------------------------------------------------
+2) Safety-first smoke run before full matrix
+------------------------------------------------------------------------------
+# Run one seed and one function first:
+$seed = 2201
+$variant = "standard"
+
+& .\.venv-3-11\Scripts\python.exe program_synthesis/runner.py `
+  --functions fn_o `
+  --attempts 5 `
+  --num-trials 5 `
+  --train-size 100 `
+  --val-size 100 `
+  --test-size 3000 `
+  --seed $seed `
+  --model gpt-5-mini `
+  --reasoning-effort minimal `
+  --tool-choice none `
+  --max-output-tokens 2400 `
+  --prompt-variant $variant `
+  --dataset-dir $DATASET_DIR `
+  --run-id "smoke_${variant}_seed${seed}" `
+  --out-jsonl "$RUN_ROOT/smoke_${variant}_seed${seed}.jsonl" `
+  --out-csv "$RUN_ROOT/smoke_${variant}_seed${seed}.csv" `
+  --out-manifest "$RUN_ROOT/smoke_${variant}_seed${seed}_manifest.json"
+
+# Baseline smoke with the same seed/sizes/dataset dir:
+$env:DATASET_DIR = $DATASET_DIR
+& .\.venv-3-11\Scripts\python.exe program_synthesis/baseline_runner.py `
+  --functions fn_o `
+  --train-size 100 `
+  --val-size 100 `
+  --test-size 3000 `
+  --num-trials 5 `
+  --seed $seed `
+  --out-jsonl "$RUN_ROOT/smoke_baseline_seed${seed}.jsonl" `
+  --out-csv "$RUN_ROOT/smoke_baseline_seed${seed}.csv"
+
+------------------------------------------------------------------------------
+3) Full LLM matrix: 4 prompt variants x 12 seeds
+------------------------------------------------------------------------------
+$variants = @("standard","explain","interview","preview")
+$seeds = 2201..2212
+
+foreach ($variant in $variants) {
+  foreach ($seed in $seeds) {
+    & .\.venv-3-11\Scripts\python.exe program_synthesis/runner.py `
+      --functions fn_m fn_n fn_o fn_p fn_q `
+      --attempts 5 `
+      --num-trials 5 `
+      --train-size 100 `
+      --val-size 100 `
+      --test-size 3000 `
+      --seed $seed `
+      --model gpt-5-mini `
+      --reasoning-effort minimal `
+      --tool-choice none `
+      --max-output-tokens 2400 `
+      --prompt-variant $variant `
+      --dataset-dir $DATASET_DIR `
+      --run-id "llm_${variant}_seed${seed}" `
+      --out-jsonl "$RUN_ROOT/llm_${variant}_seed${seed}.jsonl" `
+      --out-csv "$RUN_ROOT/llm_${variant}_seed${seed}.csv" `
+      --out-manifest "$RUN_ROOT/llm_${variant}_seed${seed}_manifest.json"
+  }
+}
+
+------------------------------------------------------------------------------
+4) Full baseline matrix: same seeds/functions/sizes/splits
+------------------------------------------------------------------------------
+$env:DATASET_DIR = $DATASET_DIR
+foreach ($seed in 2201..2212) {
+  & .\.venv-3-11\Scripts\python.exe program_synthesis/baseline_runner.py `
+    --functions fn_m fn_n fn_o fn_p fn_q `
+    --train-size 100 `
+    --val-size 100 `
+    --test-size 3000 `
+    --num-trials 5 `
+    --seed $seed `
+    --out-jsonl "$RUN_ROOT/baseline_seed${seed}.jsonl" `
+    --out-csv "$RUN_ROOT/baseline_seed${seed}.csv"
+}
+
+------------------------------------------------------------------------------
+5) Post-run sanity checks
+------------------------------------------------------------------------------
+# Confirm manifests encode the expected prompt variant and shared dataset dir:
+Get-ChildItem $RUN_ROOT -Filter "*_manifest.json" | ForEach-Object {
+  $m = Get-Content $_.FullName | ConvertFrom-Json
+  [PSCustomObject]@{
+    file = $_.Name
+    run_id = $m.run_id
+    prompt_variant = $m.config.prompt_variant
+    dataset_dir = $m.config.dataset_dir
+    train_size = $m.config.train_size
+    val_size = $m.config.val_size
+    test_size = $m.config.test_size
+    num_trials = $m.config.num_trials
+  }
+}
+
+# Spot-check no compile regressions:
+Get-ChildItem $RUN_ROOT -Filter "llm_*.csv" | ForEach-Object {
+  Import-Csv $_.FullName | Where-Object { $_.compile_error -ne "" } | Measure-Object
+}
+

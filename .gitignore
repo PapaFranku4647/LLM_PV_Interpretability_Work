@@ -27,3 +27,6 @@ program_synthesis/analysis_*.html
 
 # Local planning notes
 program_synthesis/*TODO*.md
+
+# Prompt verification artifacts
+program_synthesis/prompt_verify/

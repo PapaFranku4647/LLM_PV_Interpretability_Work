@@ -46,6 +46,7 @@ from openai import AsyncOpenAI
 
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
+from prompt_variants import get_prompt_variant_suffix
 
 external_get_accuracy = None
 
@@ -163,6 +164,7 @@ class Config:
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
     tool_choice: str = os.getenv("TOOL_CHOICE", "auto")
+    prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
 
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
@@ -194,7 +196,13 @@ class Config:
 # Prompt
 # =========================
 
-def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = False, tabular: bool = False) -> str:
+def build_user_prompt(
+    data_examples: List[str],
+    seq_len: int,
+    decimal: bool = False,
+    tabular: bool = False,
+    prompt_variant: str = "standard",
+) -> str:
     if tabular:
         problem_statement = (
             f"**Problem Statement:**\n"
@@ -219,6 +227,9 @@ def build_user_prompt(data_examples: List[str], seq_len: int, decimal: bool = Fa
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
     prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.'
+    variant_suffix = get_prompt_variant_suffix(prompt_variant)
+    if variant_suffix:
+        prompt += "\n\n" + variant_suffix
     return prompt
 
 
@@ -495,6 +506,7 @@ def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
         "reasoning_effort": cfg.reasoning_effort,
         "max_output_tokens": cfg.max_output_tokens,
         "tool_choice": cfg.tool_choice,
+        "prompt_variant": cfg.prompt_variant,
         "enable_code_interpreter": cfg.enable_code_interpreter,
         "global_seed": cfg.seed,
         "train_size": cfg.train_size,
@@ -534,7 +546,13 @@ class Runner:
         return out
 
     async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
-        prompt_text = build_user_prompt(data_examples, L, decimal, tabular)
+        prompt_text = build_user_prompt(
+            data_examples=data_examples,
+            seq_len=L,
+            decimal=decimal,
+            tabular=tabular,
+            prompt_variant=self.cfg.prompt_variant,
+        )
         body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
         body: Dict[str, Any] = {
             "model": self.cfg.model,
@@ -773,7 +791,7 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "run_id", "model", "reasoning_effort", "max_output_tokens", "tool_choice",
+        "run_id", "model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
         "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
         "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
         "fn", "length", "attempt", "trial", "prompt", "text",
@@ -792,6 +810,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "reasoning_effort": r.get("reasoning_effort"),
                 "max_output_tokens": r.get("max_output_tokens"),
                 "tool_choice": r.get("tool_choice"),
+                "prompt_variant": r.get("prompt_variant"),
                 "enable_code_interpreter": r.get("enable_code_interpreter"),
                 "global_seed": r.get("global_seed"),
                 "dataset_seed": r.get("dataset_seed"),
@@ -839,6 +858,7 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
             "reasoning_effort": cfg.reasoning_effort,
             "verbosity": cfg.verbosity,
             "tool_choice": cfg.tool_choice,
+            "prompt_variant": cfg.prompt_variant,
             "enable_code_interpreter": cfg.enable_code_interpreter,
             "dry_run": cfg.dry_run,
             "concurrency": cfg.concurrency,
@@ -887,6 +907,7 @@ def parse_args() -> Config:
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
+    p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview"], help="Prompt variant (default: standard)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
     p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
 
@@ -915,6 +936,7 @@ def parse_args() -> Config:
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
     if args.enable_code_interpreter: cfg.enable_code_interpreter = True
     if args.tool_choice: cfg.tool_choice = args.tool_choice
+    if args.prompt_variant: cfg.prompt_variant = args.prompt_variant
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
     if args.out_manifest: cfg.out_manifest = args.out_manifest
