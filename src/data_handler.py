@@ -2146,8 +2146,10 @@ def create_stratified_splits(
     """
     Creates stratified train, validation, and test splits from a generated dataset.
 
-    This utility ensures that each split maintains a balanced 50/50 class distribution,
-    which is critical for the experiments.
+    This splitter is strict about data leakage:
+    - It keeps all identical inputs in the same split (no input overlap across splits).
+    - It maintains exact requested split sizes.
+    - It maintains exact per-class counts implied by requested split sizes.
 
     Args:
         all_samples: A list of generated data samples, where each sample is a
@@ -2165,53 +2167,112 @@ def create_stratified_splits(
         raise ValueError("train_size must be even for a balanced split.")
     if val_size % 2 != 0:
         raise ValueError("val_size must be even for a balanced split.")
+    if test_size % 2 != 0:
+        raise ValueError("test_size must be even for a balanced split.")
 
-    # Convert the list of dicts to a format that's easier to split
-    original_indices = list(range(len(all_samples)))
-    all_labels = torch.tensor([int(s['Output']) for s in all_samples], device=device)
+    requested_total = train_size + val_size + test_size
+    if len(all_samples) < requested_total:
+        raise ValueError(
+            f"Not enough samples for requested split sizes: have {len(all_samples)}, need {requested_total}."
+        )
 
-    # Separate indices by class
-    indices_0 = torch.where(all_labels == 0)[0]
-    indices_1 = torch.where(all_labels == 1)[0]
+    # Keep canonical input formatting consistent across np arrays and scalar/string forms.
+    def _canonical_input(sample_input: Any) -> str:
+        if isinstance(sample_input, np.ndarray):
+            if sample_input.size == 1:
+                return str(sample_input.item())
+            return "".join(str(x) for x in sample_input.tolist())
+        if isinstance(sample_input, (list, tuple)):
+            return "".join(str(x) for x in sample_input)
+        return str(sample_input)
 
-    # Deterministic shuffle of indices for each class
-    shuffled_indices_0 = indices_0[torch.randperm(len(indices_0), device=device)]
-    shuffled_indices_1 = indices_1[torch.randperm(len(indices_1), device=device)]
+    # Group by canonical input so duplicate inputs cannot cross split boundaries.
+    input_groups: Dict[str, List[Dict[str, Any]]] = {}
+    for sample in all_samples:
+        key = _canonical_input(sample['Input'])
+        input_groups.setdefault(key, []).append(sample)
 
-    # Calculate samples per class for each split
-    train_per_class = train_size // 2
-    val_per_class = val_size // 2
+    groups: List[Dict[str, Any]] = []
+    for key, samples in input_groups.items():
+        count_0 = sum(1 for s in samples if int(s['Output']) == 0)
+        count_1 = len(samples) - count_0
+        groups.append({
+            "key": key,
+            "samples": samples,
+            "counts": {0: count_0, 1: count_1},
+        })
 
-    if len(shuffled_indices_0) < train_per_class + val_per_class:
-        raise ValueError("Not enough samples of class 0 for the requested train/val split size.")
-    if len(shuffled_indices_1) < train_per_class + val_per_class:
-        raise ValueError("Not enough samples of class 1 for the requested train/val split size.")
+    # Deterministic order: larger groups first, then key order.
+    groups.sort(key=lambda g: (-len(g["samples"]), g["key"]))
 
-    # Create train indices
-    train_indices_0 = shuffled_indices_0[:train_per_class]
-    train_indices_1 = shuffled_indices_1[:train_per_class]
-    train_indices = torch.cat([train_indices_0, train_indices_1])
-    # Final shuffle to mix classes within the training set
-    train_indices = train_indices[torch.randperm(len(train_indices), device=device)]
+    targets = {
+        "train": {0: train_size // 2, 1: train_size // 2},
+        "val": {0: val_size // 2, 1: val_size // 2},
+        "test": {0: test_size // 2, 1: test_size // 2},
+    }
+    split_samples: Dict[str, List[Dict[str, Any]]] = {"train": [], "val": [], "test": []}
 
-    # Create validation indices
-    val_indices_0 = shuffled_indices_0[train_per_class : train_per_class + val_per_class]
-    val_indices_1 = shuffled_indices_1[train_per_class : train_per_class + val_per_class]
-    val_indices = torch.cat([val_indices_0, val_indices_1])
+    # Sanity check class availability before assignment.
+    available_0 = sum(1 for s in all_samples if int(s['Output']) == 0)
+    available_1 = len(all_samples) - available_0
+    need_0 = targets["train"][0] + targets["val"][0] + targets["test"][0]
+    need_1 = targets["train"][1] + targets["val"][1] + targets["test"][1]
+    if available_0 < need_0 or available_1 < need_1:
+        raise ValueError(
+            f"Not enough class-balanced samples: need class0={need_0}, class1={need_1}, "
+            f"have class0={available_0}, class1={available_1}."
+        )
 
-    # Create test indices from the remainder
-    test_indices_0 = shuffled_indices_0[train_per_class + val_per_class:]
-    test_indices_1 = shuffled_indices_1[train_per_class + val_per_class:]
-    test_indices = torch.cat([test_indices_0, test_indices_1])
+    # Greedy assignment by remaining capacity while respecting per-class targets.
+    split_priority = {"train": 3, "val": 2, "test": 1}
+    for group in groups:
+        g0 = group["counts"][0]
+        g1 = group["counts"][1]
+        feasible: List[Tuple[int, int, str]] = []
+        for split_name in ("train", "val", "test"):
+            if targets[split_name][0] >= g0 and targets[split_name][1] >= g1:
+                remaining = targets[split_name][0] + targets[split_name][1]
+                feasible.append((remaining, split_priority[split_name], split_name))
 
-    # Reconstruct the splits using the original list and the selected indices
-    train_split = [all_samples[i] for i in train_indices.tolist()]
-    val_split = [all_samples[i] for i in val_indices.tolist()]
-    test_split = [all_samples[i] for i in test_indices.tolist()]
+        if not feasible:
+            raise ValueError(
+                "Unable to create leakage-free splits while preserving exact class counts. "
+                "Try reducing split sizes or regenerating with more samples."
+            )
 
-    # Sanity checks
+        # Prefer split with largest remaining capacity, then fixed priority.
+        feasible.sort(reverse=True)
+        chosen = feasible[0][2]
+        split_samples[chosen].extend(group["samples"])
+        targets[chosen][0] -= g0
+        targets[chosen][1] -= g1
+
+    # Ensure exact class targets were met.
+    for split_name in ("train", "val", "test"):
+        if targets[split_name][0] != 0 or targets[split_name][1] != 0:
+            raise RuntimeError(
+                f"Internal split assignment error for '{split_name}': "
+                f"remaining class0={targets[split_name][0]}, class1={targets[split_name][1]}."
+            )
+
+    # Deterministically shuffle within each split using the globally-seeded random module.
+    train_split = split_samples["train"]
+    val_split = split_samples["val"]
+    test_split = split_samples["test"]
+    random.shuffle(train_split)
+    random.shuffle(val_split)
+    random.shuffle(test_split)
+
+    # Final sanity checks.
     assert len(train_split) == train_size
     assert len(val_split) == val_size
     assert len(test_split) == test_size
+
+    train_inputs = {_canonical_input(s['Input']) for s in train_split}
+    val_inputs = {_canonical_input(s['Input']) for s in val_split}
+    test_inputs = {_canonical_input(s['Input']) for s in test_split}
+    assert len(train_inputs & val_inputs) == 0, "Leakage detected: train and val share inputs."
+    assert len(train_inputs & test_inputs) == 0, "Leakage detected: train and test share inputs."
+    assert len(val_inputs & test_inputs) == 0, "Leakage detected: val and test share inputs."
 
     return train_split, val_split, test_split

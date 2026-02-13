@@ -4,8 +4,8 @@
 # --- LLM Libraries (Hugging Face ecosystem, etc.) ---
 transformers
 accelerate
-vllm
-xformers
+# vllm
+# xformers
 tokenizers
 sentencepiece
 safetensors
@@ -14,9 +14,13 @@ safetensors
 openai
 
 # --- Other useful utilities ---
+numpy
+pandas
+matplotlib
 tqdm
 pyyaml
 sympy>=1.12
+ucimlrepo
 
 # --- Baseline ML models ---
 scikit-learn

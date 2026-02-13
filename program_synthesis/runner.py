@@ -186,6 +186,8 @@ class Config:
 
     out_jsonl: str = os.getenv("OUT_JSONL", "program_synthesis/results_attempts.jsonl")
     out_csv: str   = os.getenv("OUT_CSV",   "program_synthesis/results_attempts.csv")
+    out_manifest: str = os.getenv("OUT_MANIFEST", "")
+    run_id: str = field(default_factory=lambda: os.getenv("RUN_ID", time.strftime("%Y%m%d_%H%M%S")))
 
 
 # =========================
@@ -234,17 +236,24 @@ TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
 # Atomic file helpers
 # =========================
 
+def _ensure_parent_dir(path: str) -> None:
+    parent = os.path.dirname(path)
+    if parent:
+        os.makedirs(parent, exist_ok=True)
+
 def _safe_write_text_lines(path: str, lines: List[str]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=os.path.dirname(path)) as tmp:
+    _ensure_parent_dir(path)
+    tmp_dir = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=tmp_dir) as tmp:
         for ln in lines:
             tmp.write(f"{ln}\n")
         tmp_path = tmp.name
     os.replace(tmp_path, path)
 
 def _safe_write_json(path: str, obj: Dict[str, Any]) -> None:
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=os.path.dirname(path)) as tmp:
+    _ensure_parent_dir(path)
+    tmp_dir = os.path.dirname(path) or "."
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=tmp_dir) as tmp:
         json.dump(obj, tmp, ensure_ascii=False, indent=2)
         tmp_path = tmp.name
     os.replace(tmp_path, path)
@@ -358,6 +367,9 @@ class DatasetStore:
 
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool, bool]:
         return self._ensure_splits(fn, L)
+
+    def derived_seed(self, fn: str, L: int) -> int:
+        return self._stable_derived_seed(fn, L)
 
 
 # =========================
@@ -476,6 +488,24 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
             pass
     return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
+def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
+    return {
+        "run_id": cfg.run_id,
+        "model": cfg.model,
+        "reasoning_effort": cfg.reasoning_effort,
+        "max_output_tokens": cfg.max_output_tokens,
+        "tool_choice": cfg.tool_choice,
+        "enable_code_interpreter": cfg.enable_code_interpreter,
+        "global_seed": cfg.seed,
+        "train_size": cfg.train_size,
+        "val_size": cfg.val_size,
+        "test_size": cfg.test_size,
+        "dataset_dir": cfg.dataset_dir,
+        "attempts_requested": cfg.attempts,
+        "num_trials_requested": cfg.num_trials,
+        "dry_run": cfg.dry_run,
+    }
+
 
 # =========================
 # Runner
@@ -489,12 +519,19 @@ class Runner:
         self.log = logger
         self.client = AsyncOpenAI(api_key=cfg.api_key)
         self.sem = asyncio.Semaphore(cfg.concurrency)
+        self.row_meta = build_row_run_metadata(cfg)
 
         self.tools: List[Dict[str, Any]] = []
         if cfg.enable_code_interpreter:
             self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
 
         self.ds = DatasetStore(cfg, logger)
+
+    def _attach_meta(self, row: Dict[str, Any], dataset_seed: Optional[int] = None) -> Dict[str, Any]:
+        out = {**self.row_meta, **row}
+        if dataset_seed is not None:
+            out["dataset_seed"] = dataset_seed
+        return out
 
     async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
         prompt_text = build_user_prompt(data_examples, L, decimal, tabular)
@@ -597,6 +634,7 @@ class Runner:
                 task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
                 current_lengths = task_meta.get("lengths", self.cfg.lengths)
                 for L in current_lengths:
+                    dataset_seed = self.ds.derived_seed(fn, L)
                     train_lines, val_lines, test_lines, is_decimal, is_tabular = self.ds.get(fn, L)
 
                     trial_test_accuracies = []
@@ -604,7 +642,8 @@ class Runner:
                     trial_best_rows = []
 
                     for trial in range(self.cfg.num_trials):
-                        trial_jsonl_path = f"{base_name}_trial{trial+1}{ext}"
+                        safe_fn = re.sub(r"[^A-Za-z0-9_]+", "_", fn)
+                        trial_jsonl_path = f"{base_name}_{safe_fn}_L{L}_trial{trial+1}{ext}"
                         trial_jsonl_file = open(trial_jsonl_path, "w", encoding="utf-8")
                         
                         try:
@@ -631,14 +670,14 @@ class Runner:
                                         if test_acc > best_test_acc:
                                             best_test_acc = test_acc
                                             best_val_acc = val_acc
-                                            best_row = {
+                                            best_row = self._attach_meta({
                                                 **res,
                                                 "val_acc": val_acc,
                                                 "test_acc": test_acc,
                                                 "stopped_early": stopped_early,
                                                 "compile_error": None,
                                                 "trial": trial + 1,
-                                            }
+                                            }, dataset_seed=dataset_seed)
                                         
                                         if val_acc == 1.0:
                                             stopped_early = True
@@ -650,14 +689,14 @@ class Runner:
                                 else:
                                     compile_error = "no_code_found"
 
-                                row = {
+                                row = self._attach_meta({
                                     **res,
                                     "val_acc": val_acc,
                                     "test_acc": test_acc,
                                     "stopped_early": stopped_early,
                                     "compile_error": compile_error,
                                     "trial": trial + 1,
-                                }
+                                }, dataset_seed=dataset_seed)
                                 all_rows.append(row)
                                 
                                 trial_jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -685,7 +724,7 @@ class Runner:
                         val_acc_mean = float(np.mean(trial_val_accuracies))
                         val_acc_std = float(np.std(trial_val_accuracies))
 
-                        summary_row = {
+                        summary_row = self._attach_meta({
                             "fn": fn,
                             "length": L,
                             "attempt": None,
@@ -705,15 +744,15 @@ class Runner:
                             "compile_error": None,
                             "num_trials": self.cfg.num_trials,
                             "is_summary": True,
-                        }
+                        }, dataset_seed=dataset_seed)
 
                         all_rows.append(summary_row)
                         final_jsonl_file.write(json.dumps(summary_row, ensure_ascii=False) + "\n")
                         final_jsonl_file.flush()
 
                         self.log.info(
-                            f"{fn} L={L}: test_acc={test_acc_mean:.4f}±{test_acc_std:.4f} "
-                            f"(mean±std over {self.cfg.num_trials} trials)"
+                            f"{fn} L={L}: test_acc={test_acc_mean:.4f}+/-{test_acc_std:.4f} "
+                            f"(mean+/-std over {self.cfg.num_trials} trials)"
                         )
 
             self.log.info("dispatch_finished", extra={"total_results": len(all_rows)})
@@ -734,6 +773,9 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
+        "run_id", "model", "reasoning_effort", "max_output_tokens", "tool_choice",
+        "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
+        "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
         "fn", "length", "attempt", "trial", "prompt", "text",
         "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
@@ -745,6 +787,21 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         for r in rows:
             usage = r.get("usage") or {}
             w.writerow({
+                "run_id": r.get("run_id"),
+                "model": r.get("model"),
+                "reasoning_effort": r.get("reasoning_effort"),
+                "max_output_tokens": r.get("max_output_tokens"),
+                "tool_choice": r.get("tool_choice"),
+                "enable_code_interpreter": r.get("enable_code_interpreter"),
+                "global_seed": r.get("global_seed"),
+                "dataset_seed": r.get("dataset_seed"),
+                "train_size": r.get("train_size"),
+                "val_size": r.get("val_size"),
+                "test_size": r.get("test_size"),
+                "dataset_dir": r.get("dataset_dir"),
+                "attempts_requested": r.get("attempts_requested"),
+                "num_trials_requested": r.get("num_trials_requested"),
+                "dry_run": r.get("dry_run"),
                 "fn": r.get("fn"),
                 "length": r.get("length"),
                 "attempt": r.get("attempt"),
@@ -767,6 +824,49 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "num_trials": r.get("num_trials"),
                 "is_summary": r.get("is_summary"),
             })
+
+def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
+    manifest = {
+        "run_id": cfg.run_id,
+        "created_ts": int(time.time()),
+        "argv": sys.argv,
+        "python_executable": sys.executable,
+        "python_version": sys.version,
+        "openai_api_key_set": bool(cfg.api_key),
+        "config": {
+            "model": cfg.model,
+            "max_output_tokens": cfg.max_output_tokens,
+            "reasoning_effort": cfg.reasoning_effort,
+            "verbosity": cfg.verbosity,
+            "tool_choice": cfg.tool_choice,
+            "enable_code_interpreter": cfg.enable_code_interpreter,
+            "dry_run": cfg.dry_run,
+            "concurrency": cfg.concurrency,
+            "per_call_timeout_s": cfg.per_call_timeout_s,
+            "functions": cfg.functions,
+            "lengths": cfg.lengths,
+            "attempts": cfg.attempts,
+            "num_trials": cfg.num_trials,
+            "train_size": cfg.train_size,
+            "val_size": cfg.val_size,
+            "test_size": cfg.test_size,
+            "seed": cfg.seed,
+            "dataset_dir": cfg.dataset_dir,
+            "out_jsonl": cfg.out_jsonl,
+            "out_csv": cfg.out_csv,
+        },
+        "artifacts": {
+            "jsonl": cfg.out_jsonl,
+            "csv": cfg.out_csv,
+        },
+        "row_stats": {
+            "total_rows": len(rows),
+            "summary_rows": sum(1 for r in rows if r.get("is_summary")),
+            "attempt_rows": sum(1 for r in rows if r.get("attempt") is not None and not r.get("is_summary")),
+            "compile_error_rows": sum(1 for r in rows if r.get("compile_error")),
+        },
+    }
+    _safe_write_json(path, manifest)
 
 
 # =========================
@@ -798,6 +898,8 @@ def parse_args() -> Config:
 
     p.add_argument("--out-jsonl", help="Output JSONL path (default: program_synthesis/results_attempts.jsonl)")
     p.add_argument("--out-csv", help="Output CSV path (default: program_synthesis/results_attempts.csv)")
+    p.add_argument("--out-manifest", help="Output manifest JSON path (default: <out-jsonl>_manifest.json)")
+    p.add_argument("--run-id", help="Optional run id for artifact traceability")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
 
@@ -815,6 +917,8 @@ def parse_args() -> Config:
     if args.tool_choice: cfg.tool_choice = args.tool_choice
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
+    if args.out_manifest: cfg.out_manifest = args.out_manifest
+    if args.run_id: cfg.run_id = args.run_id
     if args.verbosity: cfg.verbosity = args.verbosity
     if args.reasoning_effort: cfg.reasoning_effort = args.reasoning_effort
     if args.timeout: cfg.per_call_timeout_s = args.timeout
@@ -837,7 +941,9 @@ async def _amain(cfg: Config) -> None:
     finally:
         await runner.client.close()
     write_csv(cfg.out_csv, rows)
-    log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv})
+    manifest_path = cfg.out_manifest or (os.path.splitext(cfg.out_jsonl)[0] + "_manifest.json")
+    write_manifest(manifest_path, cfg, rows)
+    log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv, "manifest": manifest_path, "run_id": cfg.run_id})
 
 
 def main() -> None:

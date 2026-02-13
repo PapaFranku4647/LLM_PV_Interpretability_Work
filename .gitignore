@@ -1,0 +1,29 @@
+.env
+.venv-3-11
+
+# Python cache / build
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+
+# Local logs and temporary outputs
+*.log
+_precheck_*
+temp_results*
+
+# Program synthesis run artifacts (keep local, do not commit)
+program_synthesis/datasets/
+program_synthesis/runs*/
+program_synthesis/runs_*/
+program_synthesis/results_attempts*.jsonl
+program_synthesis/results_attempts*.csv
+program_synthesis/*_trial*.jsonl
+program_synthesis/*_manifest.json
+program_synthesis/analysis_*.csv
+program_synthesis/analysis_*.png
+program_synthesis/analysis_*.txt
+program_synthesis/analysis_*.html
+
+# Local planning notes
+program_synthesis/*TODO*.md

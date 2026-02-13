@@ -1,57 +1,56 @@
 # LLM-PV (OpenAI Responses API)
 
-**Goal:** Prompt a reasoning-capable model to output **executable Python** that implements a hidden mapping. We compile & evaluate the returned function, track validation/test accuracy, and **early-stop** when validation hits **1.0**. Datasets are **deterministic and persisted** per task.
+Goal: prompt a reasoning-capable model to generate executable Python that implements a hidden mapping. Generated code is compiled and evaluated on validation/test splits with deterministic data generation.
 
----
-
-## Key ideas
-- **Deterministic datasets** per (fn, L, sizes, seed): stored under `datasets/<target>/L<length>/seed<derived>/{train.txt,val.txt,test.txt,meta.json}`.
-- **Strict output contract:** model must return one JSON object: `{"code": "<python function>"}`.
-- **Exec:** code is `exec`’d in a restricted namespace; **not a security sandbox**
-- **Early stop:** perfect validation ⇒ compute test and stop further attempts for that grid point.
-
----
+## Key points
+- Deterministic dataset cache per `(fn, length, sizes, seed)` under `program_synthesis/datasets/<target>/L<length>/seed<derived>/`.
+- Strict output contract: model should return `{"code": "<python function>"}`.
+- Early stop: stop attempts for a trial when validation reaches `1.0`.
+- Reproducibility metadata is written into every row (`run_id`, model settings, seeds, split sizes, dataset path).
 
 ## Setup
 ```bash
+conda env create -f environment.yaml
 conda activate llm_pv
-# Assuming requirements are installed
-export OPENAI_API_KEY=sk-...   # required
+export OPENAI_API_KEY=sk-...
 ```
 
 ## Minimal run
 ```bash
-python program_synthesis/runner.py   --functions fn_a   --lengths 50   --attempts 5   --enable-code-interpreter   --concurrency 1   --timeout 1200
+python program_synthesis/runner.py \
+  --functions fn_a \
+  --lengths 50 \
+  --attempts 5 \
+  --num-trials 3 \
+  --concurrency 1 \
+  --timeout 1200
 ```
 
-> **Note:** For tabular tasks, you do not need to provide `--lengths` parameter
+For tabular tasks (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`) lengths are fixed by task metadata, so `--lengths` is optional.
 
-## Replicating Paper (Uses Default Config) (Note: Consumes $$)
+## Common flags
+- Grid: `--functions`, `--lengths`, `--attempts`, `--num-trials`
+- OpenAI: `--model`, `--max-output-tokens`, `--reasoning-effort`, `--verbosity`, `--tool-choice`, `--enable-code-interpreter`
+- Data: `--train-size`, `--val-size`, `--test-size`, `--seed`, `--dataset-dir`
+- Outputs: `--out-jsonl`, `--out-csv`, `--out-manifest`, `--run-id`
+- Infra: `--concurrency`, `--timeout`
+- Dry run: `--dry-run`
+
+## Output artifacts
+- `results_attempts.jsonl`: best row per trial plus summary rows.
+- `results_attempts.csv`: flattened table with token usage, accuracy, errors, and run metadata.
+- `results_attempts_manifest.json` (or `--out-manifest`): config, environment, argv, and row counts for traceability.
+- Trial-level logs: `<out-jsonl>_<fn>_L<length>_trial<trial>.jsonl`.
+
+## Analysis scripts
+- `program_synthesis/analyze_baseline_run.py`: leakage checks, compile stats, summary tables, plots.
+- `program_synthesis/analyze_run_advanced.py`: run-level summary plots and text readout.
+
+Example:
 ```bash
-python program_synthesis/runner.py --enable-code-interpreter
+python program_synthesis/analyze_baseline_run.py --run-dir program_synthesis/runs/example_run
+python program_synthesis/analyze_run_advanced.py --run-dir program_synthesis/runs/example_run
 ```
-
-### Common flags
-- Grid: `--functions fn_a fn_b ...` • `--lengths 100 50 30 25 20` • `--attempts 5`
-- OpenAI: `--model gpt-5` • `--max-output-tokens 20000`  
-  Reasoning/text: `--reasoning-effort high` • `--verbosity low`  
-  Tools: `--enable-code-interpreter` • `--tool-choice auto|none`
-- Data: `--train-size 100 --val-size 100 --test-size 10000 --seed 42 --dataset-dir datasets`
-- Infra: `--concurrency 5 --timeout 1200`
-- Artifacts: `--out-jsonl results_attempts.jsonl --out-csv results_attempts.csv`
-- Dry run (no API call, print prompt): `--dry-run`
-
-> Function IDs map to targets in `src/target_functions.py` via `EXPERIMENT_FUNCTION_MAPPING` (e.g., `fn_a → parity_all`). Decimal tasks (`prime_decimal*`) receive a decimal problem statement but the line format is the same.
-
----
-
-## Artifacts
-- **`results_attempts.jsonl`** — one record per attempt (prompt, raw text, usage tokens, timings, val/test accuracy, errors).
-- **`results_attempts.csv`** — flat table (prompt/completion/reasoning tokens, `val_acc`, `test_acc`, `stopped_early`, etc.).
-- **`datasets/`** — reused across runs for reproducibility.
-- **`runner.log`** — JSON logs for each step (dataset reuse/generation, attempts, errors, early-stop, artifacts).
-
----
 
 ## Safety note
 `exec()` is not a sandbox.
