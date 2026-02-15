@@ -158,7 +158,9 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
 
 @dataclass
 class Config:
-    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    api_key: str = field(default_factory=lambda: os.getenv("TAMU_API_KEY", os.getenv("OPENAI_API_KEY", "")))
+    api_base_url: str = os.getenv("API_BASE_URL", "").strip()
+    api_mode: str = os.getenv("API_MODE", "responses").strip().lower()
     model: str = os.getenv("OPENAI_MODEL", "gpt-5")
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
@@ -170,6 +172,7 @@ class Config:
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
     per_call_timeout_s: float = float(os.getenv("PER_CALL_TIMEOUT_S", "1200"))
+    retry_delay_s: float = float(os.getenv("RETRY_DELAY_S", "5"))
 
     functions: List[str] = field(default_factory=lambda: [
         "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
@@ -406,6 +409,89 @@ def extract_code_from_output(output_text: str) -> Optional[str]:
             return None
     return None
 
+
+def extract_text_from_chat_completion(res: Any) -> str:
+    if isinstance(res, str):
+        return parse_chat_completion_sse(res).get("text", "")
+
+    choices = getattr(res, "choices", None) or []
+    if not choices:
+        return ""
+    first = choices[0]
+    msg = getattr(first, "message", None)
+    if msg is None and isinstance(first, Mapping):
+        msg = first.get("message")
+    if msg is None:
+        return ""
+
+    content = getattr(msg, "content", None)
+    if content is None and isinstance(msg, Mapping):
+        content = msg.get("content")
+
+    if isinstance(content, str):
+        return content.strip()
+
+    if isinstance(content, list):
+        parts: List[str] = []
+        for part in content:
+            txt = None
+            if isinstance(part, Mapping):
+                txt = part.get("text") or part.get("content")
+            else:
+                txt = getattr(part, "text", None) or getattr(part, "content", None)
+            if isinstance(txt, str) and txt.strip():
+                parts.append(txt.strip())
+        return "\n".join(parts).strip()
+
+    return ""
+
+
+def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
+    text_parts: List[str] = []
+    usage: Dict[str, Any] = {}
+    model_name: Optional[str] = None
+    for ln in (raw or "").splitlines():
+        ln = ln.strip()
+        if not ln.startswith("data:"):
+            continue
+        payload = ln[5:].strip()
+        if not payload or payload == "[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except Exception:
+            continue
+
+        if isinstance(obj, Mapping):
+            m = obj.get("model")
+            if isinstance(m, str) and m:
+                model_name = m
+
+            u = obj.get("usage")
+            if isinstance(u, Mapping):
+                usage = dict(u)
+
+            choices = obj.get("choices")
+            if isinstance(choices, list):
+                for c in choices:
+                    if not isinstance(c, Mapping):
+                        continue
+                    delta = c.get("delta")
+                    if isinstance(delta, Mapping):
+                        content = delta.get("content")
+                        if isinstance(content, str) and content:
+                            text_parts.append(content)
+                    message = c.get("message")
+                    if isinstance(message, Mapping):
+                        content = message.get("content")
+                        if isinstance(content, str) and content:
+                            text_parts.append(content)
+    return {
+        "text": "".join(text_parts).strip(),
+        "usage": usage,
+        "model": model_name,
+    }
+
 def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
     code_str = textwrap.dedent(code_str.strip())
     if code_str.startswith("```"):
@@ -521,6 +607,8 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
 def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
     return {
         "run_id": cfg.run_id,
+        "api_mode": cfg.api_mode,
+        "api_base_url": cfg.api_base_url,
         "model": cfg.model,
         "reasoning_effort": cfg.reasoning_effort,
         "max_output_tokens": cfg.max_output_tokens,
@@ -535,6 +623,7 @@ def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
         "attempts_requested": cfg.attempts,
         "num_trials_requested": cfg.num_trials,
         "dry_run": cfg.dry_run,
+        "retry_delay_s": cfg.retry_delay_s,
     }
 
 
@@ -545,10 +634,15 @@ def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
 class Runner:
     def __init__(self, cfg: Config, logger: logging.Logger):
         if not cfg.api_key:
-            raise SystemExit("OPENAI_API_KEY is required.")
+            raise SystemExit("API key is required. Set TAMU_API_KEY or OPENAI_API_KEY.")
+        if cfg.api_mode not in {"responses", "chat_completions"}:
+            raise SystemExit("API_MODE must be 'responses' or 'chat_completions'.")
         self.cfg = cfg
         self.log = logger
-        self.client = AsyncOpenAI(api_key=cfg.api_key)
+        client_kwargs: Dict[str, Any] = {"api_key": cfg.api_key}
+        if cfg.api_base_url:
+            client_kwargs["base_url"] = cfg.api_base_url
+        self.client = AsyncOpenAI(**client_kwargs)
         self.sem = asyncio.Semaphore(cfg.concurrency)
         self.row_meta = build_row_run_metadata(cfg)
 
@@ -572,18 +666,34 @@ class Runner:
             tabular=tabular,
             prompt_variant=self.cfg.prompt_variant,
         )
-        body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
-        body: Dict[str, Any] = {
-            "model": self.cfg.model,
-            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-            "reasoning": {"effort": self.cfg.reasoning_effort},
-            "max_output_tokens": self.cfg.max_output_tokens,
-            "tool_choice": self.cfg.tool_choice,
-        }
-        if self.tools:
-            body["tools"] = self.tools
-        if self.cfg.verbosity:
-            body["text"] = {"verbosity": self.cfg.verbosity}
+        if self.cfg.api_mode == "chat_completions":
+            msg_payload = [{"role": "user", "content": prompt_text}]
+            body_preview_size = len(json.dumps({"messages": msg_payload}))
+            body: Dict[str, Any] = {
+                "model": self.cfg.model,
+                "messages": msg_payload,
+                "max_tokens": self.cfg.max_output_tokens,
+            }
+            base_url_lower = (self.cfg.api_base_url or "").lower()
+            if ("tamu" in base_url_lower) or ("tamus" in base_url_lower):
+                # TAMU gateway currently returns SSE payloads even via SDK non-stream path.
+                body["stream"] = True
+                body["stream_options"] = {"include_usage": True}
+            if self.cfg.reasoning_effort:
+                body["reasoning_effort"] = self.cfg.reasoning_effort
+        else:
+            body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
+            body = {
+                "model": self.cfg.model,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
+                "reasoning": {"effort": self.cfg.reasoning_effort},
+                "max_output_tokens": self.cfg.max_output_tokens,
+                "tool_choice": self.cfg.tool_choice,
+            }
+            if self.tools:
+                body["tools"] = self.tools
+            if self.cfg.verbosity:
+                body["text"] = {"verbosity": self.cfg.verbosity}
 
         if self.cfg.dry_run:
             self.log.info("dry_run_input", extra={"fn": fn, "length": L, "attempt": attempt_idx, "prompt_preview": prompt_text})
@@ -596,30 +706,79 @@ class Runner:
         async def _try_call(tag: str):
             t0 = time.perf_counter()
             async with self.sem:
-                res = await asyncio.wait_for(
-                    self.client.responses.create(**body),
-                    timeout=self.cfg.per_call_timeout_s,
-                )
                 tool_uses = 0
                 tool_results_chars = 0
-                for item in getattr(res, "output", []) or []:
-                    t = getattr(item, "type", None)
-                    if t == "tool_use":
-                        tool_uses += 1
-                    elif t == "tool_result":
-                        content = getattr(item, "content", None)
-                        if isinstance(content, list):
-                            for part in content:
-                                txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
-                                if isinstance(txt, str):
-                                    tool_results_chars += len(txt)
-                        elif isinstance(content, str):
-                            tool_results_chars += len(content)
+                if self.cfg.api_mode == "chat_completions":
+                    res = await asyncio.wait_for(
+                        self.client.chat.completions.create(**body),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    if hasattr(res, "__aiter__"):
+                        text_parts: List[str] = []
+                        usage_obj: Dict[str, Any] = {}
+                        async for chunk in res:
+                            if hasattr(chunk, "model_dump"):
+                                d = chunk.model_dump()
+                            elif isinstance(chunk, Mapping):
+                                d = dict(chunk)
+                            elif isinstance(chunk, str):
+                                d = parse_chat_completion_sse(chunk)
+                            else:
+                                continue
+
+                            if isinstance(d, Mapping):
+                                chs = d.get("choices")
+                                if isinstance(chs, list):
+                                    for c in chs:
+                                        if not isinstance(c, Mapping):
+                                            continue
+                                        delta = c.get("delta")
+                                        if isinstance(delta, Mapping):
+                                            content = delta.get("content")
+                                            if isinstance(content, str) and content:
+                                                text_parts.append(content)
+                                        message = c.get("message")
+                                        if isinstance(message, Mapping):
+                                            content = message.get("content")
+                                            if isinstance(content, str) and content:
+                                                text_parts.append(content)
+                                u = d.get("usage")
+                                if isinstance(u, Mapping):
+                                    usage_obj = dict(u)
+                                elif "usage" in d and isinstance(d.get("usage"), dict):
+                                    usage_obj = d.get("usage", {})
+                        out_text = "".join(text_parts).strip()
+                        usage = normalize_usage(usage_obj)
+                    elif isinstance(res, str):
+                        parsed = parse_chat_completion_sse(res)
+                        out_text = parsed.get("text", "")
+                        usage = normalize_usage(parsed.get("usage") or {})
+                    else:
+                        out_text = extract_text_from_chat_completion(res)
+                        usage = normalize_usage(getattr(res, "usage", {}))
+                else:
+                    res = await asyncio.wait_for(
+                        self.client.responses.create(**body),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    for item in getattr(res, "output", []) or []:
+                        t = getattr(item, "type", None)
+                        if t == "tool_use":
+                            tool_uses += 1
+                        elif t == "tool_result":
+                            content = getattr(item, "content", None)
+                            if isinstance(content, list):
+                                for part in content:
+                                    txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+                                    if isinstance(txt, str):
+                                        tool_results_chars += len(txt)
+                            elif isinstance(content, str):
+                                tool_results_chars += len(content)
+                    out_text = (getattr(res, "output_text", "") or "").strip()
+                    usage = normalize_usage(getattr(res, "usage", {}))
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
-            usage = normalize_usage(getattr(res, "usage", {}))
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
-            out_text = (getattr(res, "output_text", "") or "").strip()
             self.log.info(tag, extra={
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "duration_ms": dt_ms, "prompt_chars": len(prompt_text),
@@ -647,6 +806,8 @@ class Runner:
             return await _try_call("attempt_ok")
         except Exception as e1:
             self.log.warning("attempt_retry_once", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e1)})
+            if self.cfg.retry_delay_s > 0:
+                await asyncio.sleep(self.cfg.retry_delay_s)
             try:
                 return await _try_call("attempt_ok_after_retry")
             except Exception as e2:
@@ -823,7 +984,7 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "run_id", "model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
+        "run_id", "api_mode", "api_base_url", "model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
         "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
         "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
         "fn", "length", "attempt", "trial", "prompt", "text",
@@ -839,6 +1000,8 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
             usage = r.get("usage") or {}
             w.writerow({
                 "run_id": r.get("run_id"),
+                "api_mode": r.get("api_mode"),
+                "api_base_url": r.get("api_base_url"),
                 "model": r.get("model"),
                 "reasoning_effort": r.get("reasoning_effort"),
                 "max_output_tokens": r.get("max_output_tokens"),
@@ -888,8 +1051,11 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
         "argv": sys.argv,
         "python_executable": sys.executable,
         "python_version": sys.version,
+        "api_key_set": bool(cfg.api_key),
         "openai_api_key_set": bool(cfg.api_key),
         "config": {
+            "api_mode": cfg.api_mode,
+            "api_base_url": cfg.api_base_url,
             "model": cfg.model,
             "max_output_tokens": cfg.max_output_tokens,
             "reasoning_effort": cfg.reasoning_effort,
@@ -900,6 +1066,7 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
             "dry_run": cfg.dry_run,
             "concurrency": cfg.concurrency,
             "per_call_timeout_s": cfg.per_call_timeout_s,
+            "retry_delay_s": cfg.retry_delay_s,
             "functions": cfg.functions,
             "lengths": cfg.lengths,
             "attempts": cfg.attempts,
@@ -933,12 +1100,15 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
 def parse_args() -> Config:
     p = argparse.ArgumentParser(description="OpenAI runner (early-stop + persistent datasets)")
 
+    p.add_argument("--api-mode", choices=["responses", "chat_completions"], help="API mode: Responses API or chat completions")
+    p.add_argument("--api-base-url", help="Override API base URL (e.g., TAMU gateway base URL)")
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths (e.g., 100 50 30 25 20)")
     p.add_argument("--attempts", type=int, help="Attempts per (fn, length), default=5")
     p.add_argument("--num-trials", type=int, help="Number of trials per (fn, length) for statistics, default=5")
     p.add_argument("--concurrency", type=int, help="Max concurrent API calls (default: 5)")
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
+    p.add_argument("--retry-delay", type=float, help="Seconds to wait before retrying a failed call (default: 5)")
 
     p.add_argument("--model", help="Model name (default: gpt-5)")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
@@ -966,6 +1136,8 @@ def parse_args() -> Config:
 
     if args.functions: cfg.functions = args.functions
     if args.lengths: cfg.lengths = args.lengths
+    if args.api_mode: cfg.api_mode = args.api_mode
+    if args.api_base_url: cfg.api_base_url = args.api_base_url
     if args.attempts: cfg.attempts = args.attempts
     if args.num_trials: cfg.num_trials = args.num_trials
     if args.concurrency: cfg.concurrency = args.concurrency
@@ -981,6 +1153,7 @@ def parse_args() -> Config:
     if args.verbosity: cfg.verbosity = args.verbosity
     if args.reasoning_effort: cfg.reasoning_effort = args.reasoning_effort
     if args.timeout: cfg.per_call_timeout_s = args.timeout
+    if args.retry_delay is not None: cfg.retry_delay_s = args.retry_delay
     if args.train_size: cfg.train_size = args.train_size
     if args.val_size: cfg.val_size = args.val_size
     if args.test_size: cfg.test_size = args.test_size
