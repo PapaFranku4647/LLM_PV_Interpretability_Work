@@ -49,6 +49,17 @@ python program_synthesis/runner.py \
   --timeout 1200
 ```
 
+## Important runner choice
+For research runs and any result you plan to report, use:
+
+```bash
+python program_synthesis/runner_val_selection.py ...
+```
+
+Why:
+- `runner_val_selection.py` selects the best attempt per trial by `val_acc`.
+- This avoids test-set leakage from selecting candidates by `test_acc`, which can inflate test results.
+
 For tabular tasks (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`) lengths are fixed by task metadata, so `--lengths` is optional.
 
 ## Common flags

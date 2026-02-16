@@ -219,9 +219,10 @@ def extract_text_from_response(response: Any) -> str:
 
 
 def load_best_row(run_root: Path) -> Tuple[str, Dict[str, Any]]:
+    # Select Code0 by validation accuracy only to avoid test-set selection leakage.
     if not run_root.exists():
         raise ValueError(f"Run root not found: {run_root}")
-    best_key = None
+    best_val_acc: Optional[float] = None
     best_row = None
     best_file = None
 
@@ -236,17 +237,19 @@ def load_best_row(run_root: Path) -> Tuple[str, Dict[str, Any]]:
                 except Exception:
                     continue
                 val_acc = row.get("val_acc")
-                test_acc = row.get("test_acc")
-                if val_acc is None or test_acc is None:
+                if val_acc is None:
                     continue
-                key = (float(test_acc), float(val_acc))
-                if best_key is None or key > best_key:
-                    best_key = key
+                try:
+                    val_acc_f = float(val_acc)
+                except Exception:
+                    continue
+                if best_val_acc is None or val_acc_f > best_val_acc:
+                    best_val_acc = val_acc_f
                     best_row = row
                     best_file = path.name
 
     if best_row is None or best_file is None:
-        raise ValueError("No compile-valid row found with both val_acc and test_acc.")
+        raise ValueError("No compile-valid row found with val_acc.")
     return best_file, best_row
 
 
