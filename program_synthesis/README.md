@@ -117,6 +117,17 @@ Coverage metric implemented:
 Faithfulness metric implemented:
 - `faithfulness = Pr[Code0(x_i) = Code0(x) | x_i in A_S]`
 
+## Step 2.4 Thesis evaluator module
+Step 2.4 extracts equation-metric logic into a shared evaluator:
+- `thesis_evaluator.py` provides `ThesisEvaluator`.
+- `evaluate_thesis(...)` computes per-sample `coverage_ratio`, `coverage_eq`, and `faithfulness`.
+- `summarize(...)` computes aggregate metric summaries across many samples.
+- Both `run_step23_live_matrix.py` and `run_step22_live_once.py` now use this module so metric semantics stay consistent.
+
+Additional Step 2.4 details:
+- `load_split_lines(...)` is the shared split reader for `train.txt`/`test.txt`.
+- `run_step22_live_once.py` includes equation metrics in `summary.json` under `equation_metrics`.
+
 ## Common flags
 - Grid: `--functions`, `--lengths`, `--attempts`, `--num-trials`
 - OpenAI: `--model`, `--max-output-tokens`, `--reasoning-effort`, `--verbosity`, `--tool-choice`, `--enable-code-interpreter`

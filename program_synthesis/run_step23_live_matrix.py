@@ -35,6 +35,7 @@ try:
         build_thesis_generation_prompt,
         format_sample_for_thesis_prompt,
     )
+    from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
 except ModuleNotFoundError:
     from live_eval_common import (  # type: ignore
         TARGET_NAME_BY_FN,
@@ -51,6 +52,7 @@ except ModuleNotFoundError:
     from code_normalizer import sanitize_generated_code  # type: ignore
     from code1_verifier import build_code1_with_verification, compile_code1  # type: ignore
     from prompt_variants import build_thesis_generation_prompt, format_sample_for_thesis_prompt  # type: ignore
+    from thesis_evaluator import ThesisEvaluator, load_split_lines  # type: ignore
 
 
 def has_comment_tokens(code: str) -> bool:
@@ -67,14 +69,7 @@ def has_comment_tokens(code: str) -> bool:
 
 
 def read_split_lines(path: Path) -> list[str]:
-    if not path.exists():
-        raise FileNotFoundError(f"Split file missing: {path}")
-    lines = []
-    for raw in path.read_text(encoding="utf-8").splitlines():
-        line = raw.strip()
-        if line and "->" in line:
-            lines.append(line)
-    return lines
+    return load_split_lines(path)
 
 
 def compute_equation_metrics(
@@ -84,48 +79,18 @@ def compute_equation_metrics(
     pred_label: int,
     train_lines: Sequence[str],
 ) -> dict[str, Any]:
-    s_size = len(train_lines)
-    code1_eval_errors = 0
-    code0_eval_errors = 0
-    try:
-        x_in_a = bool(code1_fn(sample))
-    except Exception:
-        x_in_a = False
-        code1_eval_errors += 1
-    a_s_size = 0
-    agreement_count = 0
-
-    for line in train_lines:
-        x_i, _ = parse_tabular_line(line)
-        try:
-            in_a = bool(code1_fn(x_i))
-        except Exception:
-            in_a = False
-            code1_eval_errors += 1
-        if not in_a:
-            continue
-        a_s_size += 1
-        try:
-            y_i, _ = predict_code0_label(code0_fn, x_i)
-            if y_i == pred_label:
-                agreement_count += 1
-        except Exception:
-            code0_eval_errors += 1
-
-    coverage_ratio = (a_s_size / s_size) if s_size > 0 else 0.0
-    coverage_eq = coverage_ratio if x_in_a else 0.0
-    faithfulness = (agreement_count / a_s_size) if a_s_size > 0 else None
-    return {
-        "S_size": s_size,
-        "A_S_size": a_s_size,
-        "x_in_A": x_in_a,
-        "coverage_ratio": coverage_ratio,
-        "coverage_eq": coverage_eq,
-        "agreement_count": agreement_count,
-        "faithfulness": faithfulness,
-        "code0_eval_errors": code0_eval_errors,
-        "code1_eval_errors": code1_eval_errors,
-    }
+    evaluator = ThesisEvaluator(
+        code0_fn=code0_fn,
+        train_lines=train_lines,
+        parse_line_fn=parse_tabular_line,
+        predict_code0_label_fn=predict_code0_label,
+    )
+    result = evaluator.evaluate_thesis(
+        sample_x=sample,
+        pred_label=pred_label,
+        check_conditions_fn=code1_fn,
+    )
+    return result.to_legacy_dict()
 
 
 def write_json(path: Path, obj: Any) -> None:
@@ -227,42 +192,33 @@ def run_runner_val_selection(
 
 def summarize_group(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
     n = len(rows)
-    if n == 0:
-        return {
-            "n_cases": 0,
-            "accepted_rate": 0.0,
-            "compile_ok_rate": 0.0,
-            "label_match_rate": 0.0,
-            "x_in_A_rate": 0.0,
-            "mean_coverage_eq_all": 0.0,
-            "mean_coverage_ratio_all": 0.0,
-            "mean_faithfulness_defined_only": None,
-            "mean_faithfulness_all_missing_as_zero": 0.0,
+    accepted_rate = (
+        (sum(1 for r in rows if bool(r.get("code1_accepted"))) / n)
+        if n > 0
+        else 0.0
+    )
+    compile_ok_rate = (
+        (sum(1 for r in rows if bool(r.get("code1_compile_ok"))) / n)
+        if n > 0
+        else 0.0
+    )
+    label_match_rate = (
+        (sum(1 for r in rows if bool(r.get("response_label_matches_prediction"))) / n)
+        if n > 0
+        else 0.0
+    )
+
+    metric_results = [ThesisEvaluator.result_from_mapping(r) for r in rows]
+    metric_report = ThesisEvaluator.summarize(metric_results)
+    out = metric_report.to_legacy_dict()
+    out.update(
+        {
+            "accepted_rate": accepted_rate,
+            "compile_ok_rate": compile_ok_rate,
+            "label_match_rate": label_match_rate,
         }
-
-    accepted_rate = sum(1 for r in rows if bool(r.get("code1_accepted"))) / n
-    compile_ok_rate = sum(1 for r in rows if bool(r.get("code1_compile_ok"))) / n
-    label_match_rate = sum(1 for r in rows if bool(r.get("response_label_matches_prediction"))) / n
-    x_in_a_rate = sum(1 for r in rows if bool(r.get("x_in_A"))) / n
-
-    coverage_eq_vals = [float(r.get("coverage_eq") or 0.0) for r in rows]
-    coverage_ratio_vals = [float(r.get("coverage_ratio") or 0.0) for r in rows]
-    faithfulness_defined = [float(r["faithfulness"]) for r in rows if r.get("faithfulness") is not None]
-    faithfulness_all = [float(r.get("faithfulness") or 0.0) for r in rows]
-
-    return {
-        "n_cases": n,
-        "accepted_rate": accepted_rate,
-        "compile_ok_rate": compile_ok_rate,
-        "label_match_rate": label_match_rate,
-        "x_in_A_rate": x_in_a_rate,
-        "mean_coverage_eq_all": sum(coverage_eq_vals) / n,
-        "mean_coverage_ratio_all": sum(coverage_ratio_vals) / n,
-        "mean_faithfulness_defined_only": (
-            (sum(faithfulness_defined) / len(faithfulness_defined)) if faithfulness_defined else None
-        ),
-        "mean_faithfulness_all_missing_as_zero": sum(faithfulness_all) / n,
-    }
+    )
+    return out
 
 
 def _short_code_preview(code: Optional[str], max_len: int = 240) -> Optional[str]:

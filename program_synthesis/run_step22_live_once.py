@@ -29,6 +29,7 @@ try:
         build_thesis_generation_prompt,
         format_sample_for_thesis_prompt,
     )
+    from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
 except ModuleNotFoundError:
     # Allow running as: python run_step22_live_once.py from program_synthesis/
     from code_normalizer import sanitize_generated_code
@@ -49,6 +50,7 @@ except ModuleNotFoundError:
         build_thesis_generation_prompt,
         format_sample_for_thesis_prompt,
     )
+    from thesis_evaluator import ThesisEvaluator, load_split_lines  # type: ignore
 
 
 def resolve_run_root(run_root_arg: str, repo_root: Path) -> Path:
@@ -85,6 +87,20 @@ def get_first_test_sample(run_root: Path, row: dict[str, Any]) -> str:
         if line and "->" in line:
             return line
     raise ValueError("No usable test sample found.")
+
+
+def get_train_split_lines(run_root: Path, row: dict[str, Any]) -> list[str]:
+    fn = row.get("fn")
+    if fn not in TARGET_NAME_BY_FN:
+        raise ValueError(f"Unsupported fn for tabular decode: {fn}")
+    length = row.get("length")
+    dataset_seed = row.get("dataset_seed")
+    if length is None or dataset_seed is None:
+        raise ValueError("Row missing length or dataset_seed.")
+
+    target = TARGET_NAME_BY_FN[fn]
+    train_path = run_root / "datasets" / target / f"L{length}" / f"seed{dataset_seed}" / "train.txt"
+    return load_split_lines(train_path)
 
 
 def main() -> None:
@@ -235,12 +251,42 @@ def main() -> None:
     else:
         code1_error = "missing_conditions"
 
+    train_lines_error = None
+    train_lines: list[str] = []
+    try:
+        train_lines = get_train_split_lines(run_root, row)
+    except Exception as e:
+        train_lines_error = str(e)
+
+    equation_metrics = {
+        "S_size": len(train_lines),
+        "A_S_size": 0,
+        "x_in_A": False,
+        "coverage_ratio": 0.0,
+        "coverage_eq": 0.0,
+        "agreement_count": 0,
+        "faithfulness": None,
+        "code0_eval_errors": 0,
+        "code1_eval_errors": 0,
+        "error": train_lines_error,
+    }
+
     code1_bundle_dict = asdict(code1_bundle) if code1_bundle is not None else None
     code1_compile_ok = False
     code1_compile_error = None
     if code1_bundle is not None and isinstance(code1_bundle.final_code1, str) and code1_bundle.final_code1.strip():
-        _, code1_compile_error = compile_code1(code1_bundle.final_code1)
-        code1_compile_ok = code1_compile_error is None
+        code1_callable, code1_compile_error = compile_code1(code1_bundle.final_code1)
+        code1_compile_ok = code1_compile_error is None and callable(code1_callable)
+        if code1_compile_ok and callable(code1_callable):
+            try:
+                evaluator = ThesisEvaluator(code0_fn=fn_callable, train_lines=train_lines)
+                equation_metrics = evaluator.evaluate_thesis(
+                    sample_x=sample,
+                    pred_label=pred_label,
+                    check_conditions_fn=code1_callable,
+                ).to_legacy_dict()
+            except Exception as e:
+                equation_metrics["error"] = f"equation_metric_eval_failed: {e}"
 
     out_dir = repo_root / "program_synthesis" / f"quick_verify_step22_live_{datetime.now().strftime('%Y%m%d_%H%M%S')}"
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -291,6 +337,7 @@ def main() -> None:
             "code1_accepted": bool(code1_bundle and code1_bundle.accepted),
             "code1_attempts": code1_bundle.attempts if code1_bundle else None,
             "code1_verification_error": code1_error or (code1_bundle.error if code1_bundle else None),
+            "train_lines_error": train_lines_error,
         },
         "artifacts": {
             "dir": str(out_dir),
@@ -321,6 +368,7 @@ def main() -> None:
         },
         "parsed_response_json": parsed_json,
         "code1_verification": code1_bundle_dict,
+        "equation_metrics": equation_metrics,
     }
     (out_dir / "summary.json").write_text(json.dumps(summary, indent=2), encoding="utf-8")
 

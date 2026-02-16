@@ -34,10 +34,13 @@ class Step23MatrixMetricTests(unittest.TestCase):
 
         sys.modules.pop("run_step23_live_matrix", None)
         cls.mod = importlib.import_module("run_step23_live_matrix")
+        sys.modules.pop("thesis_evaluator", None)
+        cls.eval_mod = importlib.import_module("thesis_evaluator")
 
     @classmethod
     def tearDownClass(cls) -> None:
         sys.modules.pop("run_step23_live_matrix", None)
+        sys.modules.pop("thesis_evaluator", None)
         for module_name, original in cls._saved_modules.items():
             if original is None:
                 sys.modules.pop(module_name, None)
@@ -65,6 +68,13 @@ class Step23MatrixMetricTests(unittest.TestCase):
             pred_label=1,
             train_lines=train,
         )
+        evaluator = self.eval_mod.ThesisEvaluator(code0_fn=code0, train_lines=train)
+        expected = evaluator.evaluate_thesis(
+            sample_x=sample,
+            pred_label=1,
+            check_conditions_fn=code1,
+        ).to_legacy_dict()
+        self.assertEqual(out, expected)
         self.assertEqual(out["S_size"], 4)
         self.assertEqual(out["A_S_size"], 3)
         self.assertTrue(out["x_in_A"])
