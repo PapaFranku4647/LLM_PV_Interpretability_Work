@@ -71,6 +71,52 @@ Step 2.3 uses a Code1-only verifier pipeline (no condition parser):
 
 `run_step22_live_once.py` now includes this flow and writes Code1 verification diagnostics into `summary.json`.
 
+### Step 2.3 live matrix (multi-task, multi-seed, equation metrics)
+Use `run_step23_live_matrix.py` for end-to-end matrix runs with heavy logging and equation-level metrics.
+
+Example (all tabular tasks, 3 seeds, 3 samples/seed, `gpt-5-mini` for all calls):
+
+```bash
+python program_synthesis/run_step23_live_matrix.py \
+  --functions fn_m fn_n fn_o fn_p fn_q \
+  --seeds 2201 2202 2203 \
+  --samples-per-seed 3 \
+  --attempts 3 \
+  --num-trials 1 \
+  --train-size 100 \
+  --val-size 100 \
+  --test-size 3000 \
+  --prompt-variant explain \
+  --model gpt-5-mini \
+  --reasoning-effort minimal \
+  --text-verbosity low \
+  --max-output-tokens 1400 \
+  --code1-model gpt-5-mini \
+  --code1-verifier-model gpt-5-mini \
+  --code1-reasoning-effort minimal \
+  --code1-text-verbosity low \
+  --code1-max-output-tokens 1200
+```
+
+Artifacts are written under:
+- `runs_step23_live_matrix/<timestamp>/matrix.log`
+- `runs_step23_live_matrix/<timestamp>/cases.jsonl` (one row per sample, includes coverage/faithfulness)
+- `runs_step23_live_matrix/<timestamp>/combo_summaries.jsonl`
+- `runs_step23_live_matrix/<timestamp>/overall_summary.json`
+- `runs_step23_live_matrix/<timestamp>/per_function_summary.csv`
+- `runs_step23_live_matrix/<timestamp>/cases/<fn_seed>/sample_####/code0_sanitized.py`
+- `runs_step23_live_matrix/<timestamp>/cases/<fn_seed>/sample_####/code1.py`
+- `runs_step23_live_matrix/<timestamp>/cases/<fn_seed>/sample_####/summary.json`
+
+Guardrail:
+- The matrix runner hard-fails if sanitized Code0 still has comment tokens or docstrings before thesis/Code1 prompting.
+
+Coverage metric implemented:
+- `coverage_eq = I(x in A^x) * (|A^x_S| / |S|)`
+
+Faithfulness metric implemented:
+- `faithfulness = Pr[Code0(x_i) = Code0(x) | x_i in A_S]`
+
 ## Common flags
 - Grid: `--functions`, `--lengths`, `--attempts`, `--num-trials`
 - OpenAI: `--model`, `--max-output-tokens`, `--reasoning-effort`, `--verbosity`, `--tool-choice`, `--enable-code-interpreter`
