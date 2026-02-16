@@ -62,6 +62,15 @@ Why:
 
 For tabular tasks (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`) lengths are fixed by task metadata, so `--lengths` is optional.
 
+## Phase 2.3 Code1 verification
+Step 2.3 uses a Code1-only verifier pipeline (no condition parser):
+- `code1_verifier.py` writes `check_conditions(x)` from raw thesis conditions.
+- A verifier LLM judges Code1 and supplies thesis-grounded positive/negative testcases.
+- Code1 is accepted only if semantic judgement is `pass` and testcase execution passes.
+- On failure, one retry is attempted; if still failing, the sample is marked invalid and processing continues.
+
+`run_step22_live_once.py` now includes this flow and writes Code1 verification diagnostics into `summary.json`.
+
 ## Common flags
 - Grid: `--functions`, `--lengths`, `--attempts`, `--num-trials`
 - OpenAI: `--model`, `--max-output-tokens`, `--reasoning-effort`, `--verbosity`, `--tool-choice`, `--enable-code-interpreter`
