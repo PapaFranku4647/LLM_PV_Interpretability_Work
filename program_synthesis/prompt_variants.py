@@ -1,6 +1,9 @@
-"""Prompt suffix variants for interpretability-aware code generation."""
+"""Prompt helpers for code-generation variants and thesis-generation prompts."""
 
-from typing import Dict
+from __future__ import annotations
+
+import re
+from typing import Any, Dict, Mapping
 
 
 STANDARD_SUFFIX = ""
@@ -37,6 +40,75 @@ PROMPT_VARIANT_SUFFIXES: Dict[str, str] = {
     "interview": INTERVIEW_SUFFIX,
     "preview": PREVIEW_SUFFIX,
 }
+
+
+THESIS_GENERATION_TEMPLATE = """
+You previously generated the following classification code from
+training data:
+
+[CODE0]
+
+I ran the following sample through your code:
+Sample: [SAMPLE]
+Your code classified it as: [LABEL]
+
+Explain WHY this classification was made. Your explanation must be
+a structured thesis of the following form:
+
+THESIS:
+Conditions: [list of conditions on the features, e.g., "x1 > 5 AND x3 < 2"]
+Label: [the predicted label, e.g., 1]
+
+Requirements:
+- The conditions must be SHORT and human-interpretable
+- The conditions must hold for the given sample
+- The conditions must reflect what your CODE actually does (not just
+  random true facts about the data)
+- The conditions should define a MEANINGFUL subset of the data - not
+  just this one sample, but a general pattern
+- Every sample that satisfies these conditions should be classified
+  as [LABEL] by your code (or as close to 100% as possible)
+- The subset should be as LARGE as possible while maintaining accuracy
+
+Output your thesis in this exact JSON format:
+{
+  "conditions": "x1 > 5 AND x3 < 2",
+  "label": 1
+}
+""".strip()
+
+
+_FEATURE_KEY_RE = re.compile(r"^x(\d+)$")
+
+
+def _sample_sort_key(key: Any) -> tuple[int, int, str]:
+    key_str = str(key)
+    m = _FEATURE_KEY_RE.fullmatch(key_str)
+    if m:
+        return (0, int(m.group(1)), key_str)
+    return (1, 0, key_str)
+
+
+def format_sample_for_thesis_prompt(sample: Mapping[str, Any] | str) -> str:
+    if isinstance(sample, str):
+        return sample.strip()
+    parts = []
+    for key in sorted(sample.keys(), key=_sample_sort_key):
+        value = sample[key]
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
+def build_thesis_generation_prompt(code0: str, sample_repr: str, predicted_label: int) -> str:
+    code_text = (code0 or "").strip()
+    sample_text = (sample_repr or "").strip()
+    label_text = str(int(predicted_label))
+
+    prompt = THESIS_GENERATION_TEMPLATE
+    prompt = prompt.replace("[CODE0]", code_text)
+    prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
+    prompt = prompt.replace("[LABEL]", label_text)
+    return prompt
 
 
 def get_prompt_variant_suffix(variant: str) -> str:
