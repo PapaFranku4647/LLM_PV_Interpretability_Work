@@ -14,8 +14,11 @@ temp_results*
 
 # Program synthesis run artifacts (keep local, do not commit)
 program_synthesis/datasets/
+program_synthesis/runs/
 program_synthesis/runs*/
 program_synthesis/runs_*/
+program_synthesis/quick_verify_*/
+program_synthesis/no_comment_verify_*/
 program_synthesis/results_attempts*.jsonl
 program_synthesis/results_attempts*.csv
 program_synthesis/*_trial*.jsonl

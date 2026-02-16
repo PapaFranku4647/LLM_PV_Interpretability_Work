@@ -31,7 +31,7 @@
 # =====================================================================================
 
 from __future__ import annotations
-import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, shutil, hashlib
+import os, sys, json, csv, time, argparse, asyncio, re, ast, random, tempfile, shutil, hashlib
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
@@ -47,6 +47,7 @@ from openai import AsyncOpenAI
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 from prompt_variants import get_prompt_variant_suffix
+from code_normalizer import normalize_generated_code, sanitize_generated_code
 
 external_get_accuracy = None
 
@@ -156,6 +157,13 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
 # Config
 # =========================
 
+def _env_flag(name: str, default: bool) -> bool:
+    value = os.getenv(name)
+    if value is None:
+        return default
+    return value.strip().lower() not in {"0", "false", "off", "no", ""}
+
+
 @dataclass
 class Config:
     api_key: str = field(default_factory=lambda: os.getenv("TAMU_API_KEY", os.getenv("OPENAI_API_KEY", "")))
@@ -166,6 +174,7 @@ class Config:
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
     tool_choice: str = os.getenv("TOOL_CHOICE", "auto")
+    sanitize_generated_code: bool = field(default_factory=lambda: _env_flag("SANITIZE_GENERATED_CODE", True))
     prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
 
@@ -318,7 +327,10 @@ class DatasetStore:
         return [f"{''.join(sample['Input'])} -> {sample['Output']}" for sample in dataset]
     
     def _stable_derived_seed(self, fn: str, L: int) -> int:
-        key = f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}|base_seed={self.cfg.seed}"
+        key = (
+            f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}"
+            f"|base_seed={self.cfg.seed}"
+        )
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         return (int.from_bytes(digest[:8], "big") & 0x7FFFFFFF)
 
@@ -492,11 +504,9 @@ def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
         "model": model_name,
     }
 
-def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
-    code_str = textwrap.dedent(code_str.strip())
-    if code_str.startswith("```"):
-        code_str = re.sub(r"^```(?:python)?\s*|\s*```$", "", code_str, flags=re.IGNORECASE | re.DOTALL)
-    tree = ast.parse(code_str)
+def compile_callable_from_code(code_str: str, sanitize: bool = True) -> Callable[[str], int]:
+    prepared_code = sanitize_generated_code(code_str) if sanitize else normalize_generated_code(code_str)
+    tree = ast.parse(prepared_code)
     fn_names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
     if not fn_names:
         raise ValueError("No function definition found in generated code.")
@@ -509,10 +519,8 @@ def compile_callable_from_code(code_str: str) -> Callable[[str], int]:
         raise ValueError(f"Function '{prefer_name}' not found after exec.")
     return fn
 
-def analyze_code_structure(code_str: str) -> Dict[str, Any]:
-    normalized = textwrap.dedent(code_str.strip())
-    if normalized.startswith("```"):
-        normalized = re.sub(r"^```(?:python)?\s*|\s*```$", "", normalized, flags=re.IGNORECASE | re.DOTALL)
+def analyze_code_structure(code_str: str, sanitize: bool = True) -> Dict[str, Any]:
+    normalized = sanitize_generated_code(code_str) if sanitize else normalize_generated_code(code_str)
 
     non_empty_lines = [ln for ln in normalized.splitlines() if ln.strip()]
     out = {
@@ -866,9 +874,9 @@ class Runner:
                                 compile_error = None
 
                                 if code_str:
-                                    code_info = analyze_code_structure(code_str)
+                                    code_info = analyze_code_structure(code_str, sanitize=self.cfg.sanitize_generated_code)
                                     try:
-                                        fn_callable = compile_callable_from_code(code_str)
+                                        fn_callable = compile_callable_from_code(code_str, sanitize=self.cfg.sanitize_generated_code)
                                         val_acc = evaluate_accuracy(fn_callable, val_lines, self.log, is_tabular)
                                         test_acc = evaluate_accuracy(fn_callable, test_lines, self.log, is_tabular)
                                         
@@ -913,7 +921,7 @@ class Runner:
                                     self.log.info("early_stop", extra={"fn": fn, "length": L, "attempt": k, "trial": trial + 1, "val_acc": val_acc, "test_acc": test_acc})
                                     break
 
-                            if best_test_acc >= 0 and best_row:
+                            if best_row and best_row.get("test_acc") is not None:
                                 trial_test_accuracies.append(best_test_acc)
                                 trial_val_accuracies.append(best_val_acc if best_val_acc is not None else 0.0)
                                 trial_best_rows.append(best_row)
@@ -1062,6 +1070,7 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
             "verbosity": cfg.verbosity,
             "tool_choice": cfg.tool_choice,
             "prompt_variant": cfg.prompt_variant,
+            "sanitize_generated_code": cfg.sanitize_generated_code,
             "enable_code_interpreter": cfg.enable_code_interpreter,
             "dry_run": cfg.dry_run,
             "concurrency": cfg.concurrency,
@@ -1114,6 +1123,7 @@ def parse_args() -> Config:
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
+    p.add_argument("--sanitize-generated-code", choices=["on", "off"], help="Normalize generated code before compile/analyze (default: on)")
     p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview"], help="Prompt variant (default: standard)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
     p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
@@ -1145,6 +1155,8 @@ def parse_args() -> Config:
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
     if args.enable_code_interpreter: cfg.enable_code_interpreter = True
     if args.tool_choice: cfg.tool_choice = args.tool_choice
+    if args.sanitize_generated_code is not None:
+        cfg.sanitize_generated_code = args.sanitize_generated_code == "on"
     if args.prompt_variant: cfg.prompt_variant = args.prompt_variant
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
