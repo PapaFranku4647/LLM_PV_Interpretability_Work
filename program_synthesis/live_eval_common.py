@@ -16,6 +16,44 @@ TARGET_NAME_BY_FN = {
     "fn_q": "chess",
 }
 
+FEATURE_LENGTH_BY_FN = {
+    "fn_m": 14,
+    "fn_n": 20,
+    "fn_o": 21,
+    "fn_p": 8,
+    "fn_q": 35,
+}
+
+
+def compute_auto_split(
+    n_positive: int,
+    n_negative: int,
+    train_cap: int = 200,
+    train_ratio: float = 0.10,
+    val_ratio: float = 0.15,
+    total_cap: int = 5000,
+) -> tuple[int, int, int]:
+    pool = min(n_positive, n_negative)
+    total = min(2 * pool, total_cap)
+
+    raw_train = int(total * train_ratio)
+    train = min(raw_train, train_cap)
+    overflow = raw_train - train
+
+    val = int(total * val_ratio) + overflow
+    test = total - train - val
+
+    if train % 2:
+        train -= 1
+        test += 1
+    if val % 2:
+        val -= 1
+        test += 1
+    if test % 2:
+        test -= 1
+
+    return train, val, test
+
 
 def detect_repo_root() -> Path:
     script_dir = Path(__file__).resolve().parent

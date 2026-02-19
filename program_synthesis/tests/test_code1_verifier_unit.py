@@ -12,6 +12,7 @@ if str(PROGRAM_SYNTHESIS_DIR) not in sys.path:
 
 from code1_verifier import (  # noqa: E402
     TestCase,
+    _detect_categorical_features,
     compile_code1,
     generate_code1_from_thesis,
     verify_code1_with_testcases,
@@ -106,6 +107,31 @@ class Code1VerifierUnitTests(unittest.TestCase):
         self.assertTrue(callable(fn))
         self.assertTrue(fn([0, 9]))
         self.assertFalse(fn({"x1": 2}))
+
+    def test_compile_code1_categorical_string_comparison(self) -> None:
+        code = """
+        def check_conditions(x):
+            return x.get("x5") == 'c4' and x.get("x0", 0) >= 40.0
+        """
+        fn, err = compile_code1(code)
+        self.assertIsNone(err)
+        self.assertTrue(callable(fn))
+        self.assertTrue(fn({"x0": 50.0, "x5": "c4"}))
+        self.assertFalse(fn({"x0": 50.0, "x5": "c1"}))
+        self.assertFalse(fn({"x0": 30.0, "x5": "c4"}))
+
+    def test_detect_categorical_features(self) -> None:
+        sample = "x0=50.0, x1=c0, x5=c4, x10=3.2"
+        cats = _detect_categorical_features(sample)
+        self.assertIn("x1", cats)
+        self.assertIn("x5", cats)
+        self.assertNotIn("x0", cats)
+        self.assertNotIn("x10", cats)
+
+    def test_detect_categorical_features_none(self) -> None:
+        sample = "x0=50.0, x1=3.2"
+        cats = _detect_categorical_features(sample)
+        self.assertEqual(cats, [])
 
     def test_generate_code1_handles_malformed_writer_json(self) -> None:
         client = _FakeClient(["not-json-at-all"])

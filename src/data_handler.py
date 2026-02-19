@@ -2136,6 +2136,12 @@ def get_data_generator(target_name: str, sequence_length: int, num_samples: int)
 
     raise ValueError(f"No data generator found for target function '{target_name}'")
 
+
+def get_available_class_counts(target_name: str, sequence_length: int) -> Tuple[int, int]:
+    gen = get_data_generator(target_name, sequence_length, 2)
+    pos, neg = gen._load_dataset()
+    return len(pos), len(neg)
+
 def create_stratified_splits(
     all_samples: List[Dict[str, Any]],
     train_size: int,

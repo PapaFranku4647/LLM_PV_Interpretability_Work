@@ -32,14 +32,14 @@ class Step23MatrixMetricTests(unittest.TestCase):
             cls._saved_modules[module_name] = sys.modules.get(module_name)
             sys.modules[module_name] = module_obj
 
-        sys.modules.pop("run_step23_live_matrix", None)
-        cls.mod = importlib.import_module("run_step23_live_matrix")
+        sys.modules.pop("thesis_runner", None)
+        cls.mod = importlib.import_module("thesis_runner")
         sys.modules.pop("thesis_evaluator", None)
         cls.eval_mod = importlib.import_module("thesis_evaluator")
 
     @classmethod
     def tearDownClass(cls) -> None:
-        sys.modules.pop("run_step23_live_matrix", None)
+        sys.modules.pop("thesis_runner", None)
         sys.modules.pop("thesis_evaluator", None)
         for module_name, original in cls._saved_modules.items():
             if original is None:

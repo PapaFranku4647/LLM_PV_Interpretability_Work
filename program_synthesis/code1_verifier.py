@@ -7,7 +7,10 @@ import threading
 from dataclasses import dataclass, field
 from typing import Any, Callable, Literal, Optional, Sequence
 
-from code_normalizer import sanitize_generated_code
+try:
+    from program_synthesis.code_normalizer import sanitize_generated_code
+except ModuleNotFoundError:
+    from code_normalizer import sanitize_generated_code  # type: ignore
 
 
 Judgement = Literal["pass", "fail", "uncertain"]
@@ -40,6 +43,10 @@ Rules:
 - x may be either:
   1) dict with keys like x0, x1, ...
   2) list/tuple where xN maps to x[N]
+- DATA FORMAT: Some features are categorical strings like 'c0', 'c1', 'c4'.
+  Compare them as strings: x.get("x5") == 'c4', NOT x.get("x5") == 4.
+  Numeric features are floats: x.get("x0") >= 40.0.
+  Check the reference sample above to determine each feature's type.
 
 Output STRICT JSON only:
 {
@@ -77,6 +84,9 @@ Testcase requirements:
 - Provide thesis-grounded cases.
 - Include both positive and negative cases.
 - Prefer at least 3 positive and 3 negative cases when possible.
+- DATA FORMAT: Categorical features use string values like "c0", "c1", "c4".
+  Testcase samples must use the exact string format: {"x5": "c4"}, NOT {"x5": 4}.
+  Numeric features use floats: {"x0": 40.0}.
 """.strip()
 
 
@@ -288,6 +298,20 @@ def _request_json_object(
     return parsed, parse_error, response_text
 
 
+_CATEGORICAL_VALUE_RE = re.compile(r"=c\d+")
+
+
+def _detect_categorical_features(sample_repr: str) -> list[str]:
+    features: list[str] = []
+    for match in _CATEGORICAL_VALUE_RE.finditer(sample_repr):
+        start = sample_repr.rfind(",", 0, match.start())
+        start = 0 if start < 0 else start + 1
+        feat = sample_repr[start:match.start()].strip()
+        if feat:
+            features.append(feat)
+    return features
+
+
 def _build_code1_writer_prompt(
     thesis_conditions: str,
     thesis_label: int,
@@ -298,6 +322,13 @@ def _build_code1_writer_prompt(
     prompt = prompt.replace("[CONDITIONS]", str(thesis_conditions).strip())
     prompt = prompt.replace("[LABEL]", str(int(thesis_label)))
     prompt = prompt.replace("[SAMPLE]", str(sample_repr).strip())
+    cat_features = _detect_categorical_features(str(sample_repr))
+    if cat_features:
+        prompt += (
+            f"\n\nIMPORTANT: Features {', '.join(cat_features)} are categorical STRINGS "
+            f"(e.g. 'c0', 'c1', 'c4'). Use string comparison: x.get(\"{cat_features[0]}\") == 'c4', "
+            f"NOT integer comparison."
+        )
     if feedback:
         prompt += f"\n\nPrevious attempt feedback:\n{feedback.strip()}\n"
     return prompt

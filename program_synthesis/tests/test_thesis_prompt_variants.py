@@ -10,7 +10,9 @@ if str(PROGRAM_SYNTHESIS_DIR) not in sys.path:
 
 from prompt_variants import (  # noqa: E402
     THESIS_GENERATION_TEMPLATE,
+    THESIS_GENERATION_TEMPLATE_V2,
     build_thesis_generation_prompt,
+    build_thesis_generation_prompt_v2,
     format_sample_for_thesis_prompt,
 )
 
@@ -32,7 +34,7 @@ class ThesisPromptVariantsTests(unittest.TestCase):
 
     def test_build_prompt_includes_required_json_contract(self) -> None:
         prompt = build_thesis_generation_prompt("def f(x):\n    return 1", "x0=1", 1)
-        self.assertIn('"conditions": "x1 > 5 AND x3 < 2"', prompt)
+        self.assertIn('"conditions":', prompt)
         self.assertIn('"label": 1', prompt)
 
     def test_build_prompt_includes_step22_requirement_lines(self) -> None:
@@ -69,6 +71,43 @@ class ThesisPromptVariantsTests(unittest.TestCase):
         self.assertIn("[CODE0]", THESIS_GENERATION_TEMPLATE)
         self.assertIn("[SAMPLE]", THESIS_GENERATION_TEMPLATE)
         self.assertIn("[LABEL]", THESIS_GENERATION_TEMPLATE)
+
+    def test_v1_template_has_categorical_format_hint(self) -> None:
+        self.assertIn("Categorical features use string values", THESIS_GENERATION_TEMPLATE)
+        self.assertIn("'c0'", THESIS_GENERATION_TEMPLATE)
+
+    def test_v2_template_has_code_tracing_instruction(self) -> None:
+        self.assertIn("trace through your code", THESIS_GENERATION_TEMPLATE_V2)
+        self.assertIn("Step 1", THESIS_GENERATION_TEMPLATE_V2)
+
+    def test_v2_template_has_coverage_target(self) -> None:
+        self.assertIn("at least 30%", THESIS_GENERATION_TEMPLATE_V2)
+        self.assertIn("BROADEST conditions", THESIS_GENERATION_TEMPLATE_V2)
+
+    def test_v2_template_has_boundary_guidance(self) -> None:
+        self.assertIn(">= or <=", THESIS_GENERATION_TEMPLATE_V2)
+
+    def test_v2_template_has_categorical_format_hint(self) -> None:
+        self.assertIn("Categorical features use string values", THESIS_GENERATION_TEMPLATE_V2)
+        self.assertIn("'c0'", THESIS_GENERATION_TEMPLATE_V2)
+
+    def test_v2_template_contains_expected_placeholders(self) -> None:
+        self.assertIn("[CODE0]", THESIS_GENERATION_TEMPLATE_V2)
+        self.assertIn("[SAMPLE]", THESIS_GENERATION_TEMPLATE_V2)
+        self.assertIn("[LABEL]", THESIS_GENERATION_TEMPLATE_V2)
+
+    def test_build_prompt_v2_replaces_placeholders(self) -> None:
+        prompt = build_thesis_generation_prompt_v2("def f(x):\n    return 0", "x0=1, x1=2", 1)
+        self.assertIn("Sample: [x0=1, x1=2]", prompt)
+        self.assertIn("Your code classified it as: 1", prompt)
+        self.assertNotIn("[CODE0]", prompt)
+        self.assertNotIn("[SAMPLE]", prompt)
+        self.assertNotIn("[LABEL]", prompt)
+
+    def test_build_prompt_v2_includes_trace_instruction(self) -> None:
+        prompt = build_thesis_generation_prompt_v2("def f(x):\n    return 1", "x0=1", 1)
+        self.assertIn("trace through your code", prompt)
+        self.assertIn("at least 30%", prompt)
 
 
 if __name__ == "__main__":

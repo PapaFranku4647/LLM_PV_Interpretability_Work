@@ -6,6 +6,8 @@ __pycache__/
 *.py[cod]
 *.pyo
 *.pyd
+.pytest_cache/
+pytest-cache-files-*/
 
 # Local logs and temporary outputs
 *.log
@@ -33,3 +35,6 @@ program_synthesis/*TODO*.md
 
 # Prompt verification artifacts
 program_synthesis/prompt_verify/
+
+# Local raw data cache
+data_cache/

@@ -35,6 +35,7 @@ try:
     )
     from program_synthesis.prompt_variants import (
         build_thesis_generation_prompt,
+        build_thesis_generation_prompt_v2,
         format_sample_for_thesis_prompt,
     )
     from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
@@ -55,7 +56,7 @@ except ModuleNotFoundError:
     )
     from code_normalizer import sanitize_generated_code  # type: ignore
     from code1_verifier import build_code1_with_verification, compile_code1  # type: ignore
-    from prompt_variants import build_thesis_generation_prompt, format_sample_for_thesis_prompt  # type: ignore
+    from prompt_variants import build_thesis_generation_prompt, build_thesis_generation_prompt_v2, format_sample_for_thesis_prompt  # type: ignore
     from thesis_evaluator import ThesisEvaluator, load_split_lines  # type: ignore
 
 
@@ -269,6 +270,10 @@ def main() -> None:
         default="",
         help="Dataset cache directory passed to runner_val_selection (default: <out-root>/datasets).",
     )
+    parser.add_argument("--thesis-prompt-version", default="v1", choices=["v1", "v2"],
+        help="Thesis prompt version: v1 (original) or v2 (code-tracing + coverage guidance).")
+    parser.add_argument("--compute-baselines", action="store_true",
+        help="Compute trivial baselines per (fn, seed) and include in overall_summary.json.")
     parser.add_argument("--skip-runner", action="store_true", help="Reuse existing run dirs; skip runner_val_selection calls.")
     parser.add_argument("--auto-split", action="store_true",
         help="Auto-compute train/val/test sizes per dataset using balanced class pools.")
@@ -489,7 +494,10 @@ def main() -> None:
                     )
                     continue
                 sample_repr = format_sample_for_thesis_prompt(sample)
-                thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
+                if args.thesis_prompt_version == "v2":
+                    thesis_prompt = build_thesis_generation_prompt_v2(sanitized_code, sample_repr, pred_label)
+                else:
+                    thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
 
                 request_body = {
                     "model": args.model,
@@ -693,6 +701,33 @@ def main() -> None:
         fn_summary.update(summarize_group(rows_for_fn))
         per_fn_rows.append(fn_summary)
 
+    baselines_data: Optional[dict[str, Any]] = None
+    if args.compute_baselines:
+        try:
+            from thesis_analysis import compute_trivial_baselines as _compute_baselines
+        except ModuleNotFoundError:
+            from program_synthesis.thesis_analysis import compute_trivial_baselines as _compute_baselines  # type: ignore
+        baselines_data = {}
+        for fn in args.functions:
+            for seed in args.seeds:
+                combo_id = f"{fn}_seed{seed}"
+                run_dir = out_root / "runs" / combo_id
+                try:
+                    best_row_file, row = load_best_row(run_dir)
+                    original_code = row.get("code")
+                    if not isinstance(original_code, str):
+                        continue
+                    code0_fn_bl = compile_callable(sanitize_generated_code(original_code))
+                    target = TARGET_NAME_BY_FN[fn]
+                    length = row.get("length")
+                    dataset_seed = row.get("dataset_seed")
+                    split_dir = dataset_dir / target / f"L{length}" / f"seed{dataset_seed}"
+                    train_lines_bl = read_split_lines(split_dir / "train.txt")
+                    baselines_data[combo_id] = _compute_baselines(train_lines_bl, code0_fn_bl)
+                    logger.info("baselines_done combo=%s", combo_id)
+                except Exception as e:
+                    logger.warning("baselines_failed combo=%s err=%s", combo_id, e)
+
     overall_summary = summarize_group(case_rows)
     overall_payload = {
         "timestamp": stamp,
@@ -706,6 +741,7 @@ def main() -> None:
         "overall": overall_summary,
         "per_function": per_fn_rows,
         "auto_split_sizes": auto_split_sizes if auto_split_sizes else None,
+        "trivial_baselines": baselines_data,
     }
 
     write_jsonl(out_root / "cases.jsonl", case_rows)

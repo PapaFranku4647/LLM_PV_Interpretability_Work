@@ -70,9 +70,66 @@ Requirements:
   as [LABEL] by your code (or as close to 100% as possible)
 - The subset should be as LARGE as possible while maintaining accuracy
 
+Note on data format:
+- Numeric features use float comparisons: x0 >= 40.0
+- Categorical features use string values like 'c0', 'c1', 'c4'.
+  Write them as: x5 == 'c2', NOT x5 == 2.
+
 Output your thesis in this exact JSON format:
 {
-  "conditions": "x1 > 5 AND x3 < 2",
+  "conditions": "x5 == 'c2' AND x0 >= 40.0",
+  "label": 1
+}
+""".strip()
+
+
+THESIS_GENERATION_TEMPLATE_V2 = """
+You previously generated the following classification code from
+training data:
+
+[CODE0]
+
+I ran the following sample through your code:
+Sample: [SAMPLE]
+Your code classified it as: [LABEL]
+
+Step 1 — Code-path trace:
+First, trace through your code for this sample step by step. Identify
+which branches and conditions led to the classification [LABEL].
+
+Step 2 — Thesis:
+Based on your trace, produce a thesis: a set of conditions that explain
+WHY this sample received label [LABEL].
+
+THESIS:
+Conditions: [list of conditions on the features]
+Label: [the predicted label]
+
+Requirements:
+- The conditions must be SHORT and human-interpretable
+- The conditions must hold for the given sample
+- The conditions must reflect what your CODE actually does — trace the
+  actual code path, do not invent conditions
+- The conditions should define a BROAD subset of the data — not just
+  this one sample, but a general pattern
+- Your conditions should capture at least 30% of training samples.
+  Think about the BROADEST conditions that faithfully describe what
+  your code does.
+- Every sample that satisfies these conditions should be classified
+  as [LABEL] by your code (or as close to 100% as possible)
+- Use >= or <= (not strict > or <) when the sample's value equals
+  a threshold in the code
+- Focus on the 2-4 most important conditions rather than listing every
+  minor check
+
+Note on data format:
+- Numeric features use float comparisons: x0 >= 40.0
+- Categorical features use string values like 'c0', 'c1', 'c4'.
+  Write them as: x5 == 'c2', NOT x5 == 2.
+
+Output your thesis in this exact JSON format:
+{
+  "conditions": "x5 == 'c2' AND x0 >= 40.0",
   "label": 1
 }
 """.strip()
@@ -105,6 +162,18 @@ def build_thesis_generation_prompt(code0: str, sample_repr: str, predicted_label
     label_text = str(int(predicted_label))
 
     prompt = THESIS_GENERATION_TEMPLATE
+    prompt = prompt.replace("[CODE0]", code_text)
+    prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
+    prompt = prompt.replace("[LABEL]", label_text)
+    return prompt
+
+
+def build_thesis_generation_prompt_v2(code0: str, sample_repr: str, predicted_label: int) -> str:
+    code_text = (code0 or "").strip()
+    sample_text = (sample_repr or "").strip()
+    label_text = str(int(predicted_label))
+
+    prompt = THESIS_GENERATION_TEMPLATE_V2
     prompt = prompt.replace("[CODE0]", code_text)
     prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
     prompt = prompt.replace("[LABEL]", label_text)

@@ -72,12 +72,12 @@ Step 2.3 uses a Code1-only verifier pipeline (no condition parser):
 `run_step22_live_once.py` now includes this flow and writes Code1 verification diagnostics into `summary.json`.
 
 ### Step 2.3 live matrix (multi-task, multi-seed, equation metrics)
-Use `run_step23_live_matrix.py` for end-to-end matrix runs with heavy logging and equation-level metrics.
+Use `thesis_runner.py` (the main pipeline orchestrator) for end-to-end matrix runs with heavy logging and equation-level metrics.
 
 Example (all tabular tasks, 3 seeds, 3 samples/seed, `gpt-5-mini` for all calls):
 
 ```bash
-python program_synthesis/run_step23_live_matrix.py \
+python program_synthesis/thesis_runner.py \
   --functions fn_m fn_n fn_o fn_p fn_q \
   --seeds 2201 2202 2203 \
   --samples-per-seed 3 \
@@ -97,6 +97,11 @@ python program_synthesis/run_step23_live_matrix.py \
   --code1-text-verbosity low \
   --code1-max-output-tokens 1200
 ```
+
+Useful options:
+- `--thesis-prompt-version v1|v2` to switch between original and trace-guided thesis prompts.
+- `--compute-baselines` to add trivial baseline metrics (`always_0`, `always_1`) into `overall_summary.json`.
+- `--auto-split --train-cap 200 --total-cap 5000` to auto-size train/val/test per function from available class pools.
 
 Artifacts are written under:
 - `runs_step23_live_matrix/<timestamp>/matrix.log`
@@ -122,7 +127,7 @@ Step 2.4 extracts equation-metric logic into a shared evaluator:
 - `thesis_evaluator.py` provides `ThesisEvaluator`.
 - `evaluate_thesis(...)` computes per-sample `coverage_ratio`, `coverage_eq`, and `faithfulness`.
 - `summarize(...)` computes aggregate metric summaries across many samples.
-- Both `run_step23_live_matrix.py` and `run_step22_live_once.py` now use this module so metric semantics stay consistent.
+- Both `thesis_runner.py` (formerly `run_step23_live_matrix.py`) and `run_step22_live_once.py` now use this module so metric semantics stay consistent.
 
 Additional Step 2.4 details:
 - `load_split_lines(...)` is the shared split reader for `train.txt`/`test.txt`.
@@ -146,11 +151,13 @@ Additional Step 2.4 details:
 ## Analysis scripts
 - `program_synthesis/analyze_baseline_run.py`: leakage checks, compile stats, summary tables, plots.
 - `program_synthesis/analyze_run_advanced.py`: run-level summary plots and text readout.
+- `program_synthesis/thesis_analysis.py`: thesis metric summaries, failure diagnosis, complexity stats, and prompt-version comparison.
 
 Example:
 ```bash
 python program_synthesis/analyze_baseline_run.py --run-dir program_synthesis/runs/example_run
 python program_synthesis/analyze_run_advanced.py --run-dir program_synthesis/runs/example_run
+python program_synthesis/thesis_analysis.py --results-dir program_synthesis/runs_step23_live_matrix/<timestamp>
 ```
 
 ## Usage and spend tracking
