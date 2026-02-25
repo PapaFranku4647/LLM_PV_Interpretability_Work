@@ -116,22 +116,64 @@ Artifacts are written under:
 Guardrail:
 - The matrix runner hard-fails if sanitized Code0 still has comment tokens or docstrings before thesis/Code1 prompting.
 
-Coverage metric implemented:
-- `coverage_eq = I(x in A^x) * (|A^x_S| / |S|)`
+### Metrics
 
-Faithfulness metric implemented:
-- `faithfulness = Pr[Code0(x_i) = Code0(x) | x_i in A_S]`
+**Coverage** (per sample i, averaged over n test samples):
+
+```
+coverage_eq_i = 1[c_i(x_i) = true] * |A_{x_i}| / |S|
+
+coverage_mean = (1/n) * sum_{i=1}^{n} coverage_eq_i
+```
+
+Where `c_i` is Code1's condition check, `A_{x_i}` is the set of training samples satisfying the thesis conditions, and `S` is the full training set. When the test sample does not satisfy the thesis conditions, its contribution is zero — this penalizes theses that fail to cover their own sample.
+
+**Faithfulness (Ground Truth)** — PRIMARY metric:
+
+```
+faithfulness_gt_i = |{x_j in A_{x_i} : y_j^true = L_i}| / |A_{x_i}|
+```
+
+Measures what fraction of training samples in the acceptance set share the same ground truth label as the thesis predicts. This tells us whether the thesis captures real data structure.
+
+**Faithfulness (Code0)** — secondary metric:
+
+```
+faithfulness_code0_i = |{x_j in A_{x_i} : Code0(x_j) = L_i}| / |A_{x_i}|
+```
+
+Measures what fraction of training samples in the acceptance set receive the same label from Code0 as the thesis predicts. This measures self-consistency with the model.
+
+When Code0 is a perfect classifier, both metrics are equal. When Code0 is imperfect, `faithfulness_code0` is typically inflated relative to `faithfulness_gt`.
 
 ## Step 2.4 Thesis evaluator module
 Step 2.4 extracts equation-metric logic into a shared evaluator:
 - `thesis_evaluator.py` provides `ThesisEvaluator`.
-- `evaluate_thesis(...)` computes per-sample `coverage_ratio`, `coverage_eq`, and `faithfulness`.
+- `evaluate_thesis(...)` computes per-sample `coverage_ratio`, `coverage_eq`, `faithfulness_code0`, and `faithfulness_gt`.
 - `summarize(...)` computes aggregate metric summaries across many samples.
 - Both `thesis_runner.py` (formerly `run_step23_live_matrix.py`) and `run_step22_live_once.py` now use this module so metric semantics stay consistent.
 
 Additional Step 2.4 details:
 - `load_split_lines(...)` is the shared split reader for `train.txt`/`test.txt`.
 - `run_step22_live_once.py` includes equation metrics in `summary.json` under `equation_metrics`.
+
+## Phase 2.5: Dual Faithfulness & Equation Corrections
+Phase 2.5 (2/24 meeting) corrects the faithfulness metric per Tomer's guidance:
+
+**Problem**: The original faithfulness only measured Code0-vs-Code0 agreement (how well the thesis captures Code0's behavior). The ground truth label from `parse_tabular_line()` was discarded (`x_i, _ = ...`).
+
+**Fix**: Now computes both metrics. The ground truth label is captured and compared against the thesis's predicted label. Both metrics are emitted in all outputs, with backward-compatible field names for loading old JSONL data.
+
+**Key fields** (new names with backward-compat aliases):
+- `faithfulness_gt` / `agreement_count_gt` — primary, against ground truth
+- `faithfulness_code0` / `agreement_count_code0` — secondary, against Code0
+- `faithfulness` / `agreement_count` — backward-compat aliases (equal to code0 values)
+- `mean_faithfulness_gt_defined` / `mean_faithfulness_gt_all_zero` — aggregate GT metrics
+- `mean_faithfulness_code0_defined` / `mean_faithfulness_code0_all_zero` — aggregate Code0 metrics
+
+**Class balance**: All splits are guaranteed to have exactly 50/50 class 0/1 distribution via `compute_auto_split()` (even sizes) and `create_stratified_splits()` (exact class targets).
+
+See `EXAMPLES.md` for recommended PowerShell commands.
 
 ## Common flags
 - Grid: `--functions`, `--lengths`, `--attempts`, `--num-trials`

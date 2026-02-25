@@ -38,3 +38,5 @@ program_synthesis/prompt_verify/
 
 # Local raw data cache
 data_cache/
+
+.claude

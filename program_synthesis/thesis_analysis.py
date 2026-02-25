@@ -52,18 +52,21 @@ def compute_trivial_baselines(
 
     n = len(parsed)
     if n == 0:
-        empty = {"coverage_eq": 0.0, "faithfulness": 0.0}
+        empty: dict[str, float] = {"coverage_eq": 0.0, "faithfulness_code0": 0.0, "faithfulness_gt": 0.0}
         return {"always_1": empty, "always_0": empty}
 
     baselines: dict[str, dict[str, float]] = {}
     for strategy_label in [0, 1]:
         strategy_name = f"always_{strategy_label}"
         coverage = 1.0
-        agree = sum(1 for _, _, p in parsed if p == strategy_label)
-        faithfulness = agree / n if n > 0 else 0.0
+        agree_code0 = sum(1 for _, _, p in parsed if p == strategy_label)
+        agree_gt = sum(1 for _, gt, _ in parsed if gt == strategy_label)
+        faithfulness_code0 = agree_code0 / n if n > 0 else 0.0
+        faithfulness_gt = agree_gt / n if n > 0 else 0.0
         baselines[strategy_name] = {
             "coverage_eq": coverage,
-            "faithfulness": faithfulness,
+            "faithfulness_code0": faithfulness_code0,
+            "faithfulness_gt": faithfulness_gt,
         }
 
     return baselines
@@ -80,7 +83,18 @@ def per_function_summary(cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]
         rows = groups[fn]
         n = len(rows)
         cov_values = [float(r.get("coverage_eq", 0.0)) for r in rows]
-        faith_values = [float(r["faithfulness"]) for r in rows if r.get("faithfulness") is not None]
+
+        # faithfulness_code0 with fallback to old "faithfulness" key
+        faith_code0_values = []
+        for r in rows:
+            v = r.get("faithfulness_code0")
+            if v is None:
+                v = r.get("faithfulness")
+            if v is not None:
+                faith_code0_values.append(float(v))
+
+        faith_gt_values = [float(r["faithfulness_gt"]) for r in rows if r.get("faithfulness_gt") is not None]
+
         x_in_a_count = sum(1 for r in rows if r.get("x_in_A"))
         accepted_count = sum(1 for r in rows if r.get("code1_accepted"))
         c1_errors = sum(int(r.get("code1_eval_errors", 0)) for r in rows)
@@ -89,7 +103,8 @@ def per_function_summary(cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]
             "fn": fn,
             "n_cases": n,
             "mean_coverage_eq": sum(cov_values) / n if n else 0.0,
-            "mean_faithfulness": sum(faith_values) / len(faith_values) if faith_values else None,
+            "mean_faithfulness": sum(faith_code0_values) / len(faith_code0_values) if faith_code0_values else None,
+            "mean_faithfulness_gt": sum(faith_gt_values) / len(faith_gt_values) if faith_gt_values else None,
             "x_in_A_rate": x_in_a_count / n if n else 0.0,
             "accepted_rate": accepted_count / n if n else 0.0,
             "code1_eval_errors": c1_errors,
@@ -100,17 +115,22 @@ def per_function_summary(cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]
 def coverage_faith_pairs(cases: Sequence[dict[str, Any]]) -> list[dict[str, Any]]:
     pairs = []
     for case in cases:
-        faith = case.get("faithfulness")
-        if faith is None:
+        # faithfulness_code0 with fallback to old "faithfulness" key
+        faith_code0 = case.get("faithfulness_code0")
+        if faith_code0 is None:
+            faith_code0 = case.get("faithfulness")
+        if faith_code0 is None:
             continue
-        pairs.append({
+        entry: dict[str, Any] = {
             "fn": case.get("fn"),
             "seed": case.get("seed"),
             "sample_index": case.get("sample_index"),
             "coverage_eq": float(case.get("coverage_eq", 0.0)),
-            "faithfulness": float(faith),
+            "faithfulness": float(faith_code0),
+            "faithfulness_gt": float(case["faithfulness_gt"]) if case.get("faithfulness_gt") is not None else None,
             "x_in_A": bool(case.get("x_in_A")),
-        })
+        }
+        pairs.append(entry)
     return pairs
 
 
@@ -173,18 +193,27 @@ def compare_prompt_versions(
     def _aggregate(cases: Sequence[dict[str, Any]]) -> dict[str, float]:
         n = len(cases)
         if n == 0:
-            return {"n": 0, "mean_coverage_eq": 0.0, "mean_faithfulness": 0.0, "x_in_A_rate": 0.0}
+            return {"n": 0, "mean_coverage_eq": 0.0, "mean_faithfulness": 0.0, "mean_faithfulness_gt": 0.0, "x_in_A_rate": 0.0}
         cov = sum(float(c.get("coverage_eq", 0)) for c in cases) / n
-        faith_vals = [float(c["faithfulness"]) for c in cases if c.get("faithfulness") is not None]
-        faith = sum(faith_vals) / len(faith_vals) if faith_vals else 0.0
+        # faithfulness_code0 with fallback to old "faithfulness"
+        faith_code0_vals = []
+        for c in cases:
+            v = c.get("faithfulness_code0")
+            if v is None:
+                v = c.get("faithfulness")
+            if v is not None:
+                faith_code0_vals.append(float(v))
+        faith = sum(faith_code0_vals) / len(faith_code0_vals) if faith_code0_vals else 0.0
+        faith_gt_vals = [float(c["faithfulness_gt"]) for c in cases if c.get("faithfulness_gt") is not None]
+        faith_gt = sum(faith_gt_vals) / len(faith_gt_vals) if faith_gt_vals else 0.0
         x_in_a = sum(1 for c in cases if c.get("x_in_A")) / n
-        return {"n": n, "mean_coverage_eq": cov, "mean_faithfulness": faith, "x_in_A_rate": x_in_a}
+        return {"n": n, "mean_coverage_eq": cov, "mean_faithfulness": faith, "mean_faithfulness_gt": faith_gt, "x_in_A_rate": x_in_a}
 
     v1_agg = _aggregate(v1_cases)
     v2_agg = _aggregate(v2_cases)
 
     delta = {}
-    for key in ["mean_coverage_eq", "mean_faithfulness", "x_in_A_rate"]:
+    for key in ["mean_coverage_eq", "mean_faithfulness", "mean_faithfulness_gt", "x_in_A_rate"]:
         delta[f"delta_{key}"] = v2_agg[key] - v1_agg[key]
 
     return {"v1": v1_agg, "v2": v2_agg, "delta": delta}

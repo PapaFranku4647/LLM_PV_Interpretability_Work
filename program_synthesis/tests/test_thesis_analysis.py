@@ -11,6 +11,7 @@ if str(PROGRAM_SYNTHESIS_DIR) not in sys.path:
     sys.path.insert(0, str(PROGRAM_SYNTHESIS_DIR))
 
 from thesis_analysis import (  # noqa: E402
+    compute_trivial_baselines,
     coverage_faith_pairs,
     diagnose_failures,
     load_cases,
@@ -26,7 +27,8 @@ def _make_case(
     seed: int = 2201,
     sample_index: int = 1,
     coverage_eq: float = 0.5,
-    faithfulness: float | None = 1.0,
+    faithfulness_code0: float | None = 1.0,
+    faithfulness_gt: float | None = 0.8,
     x_in_A: bool = True,
     code1_accepted: bool = True,
     code1_eval_errors: int = 0,
@@ -40,7 +42,10 @@ def _make_case(
         "sample_index": sample_index,
         "coverage_eq": coverage_eq,
         "coverage_ratio": coverage_eq,
-        "faithfulness": faithfulness,
+        "faithfulness_code0": faithfulness_code0,
+        "faithfulness_gt": faithfulness_gt,
+        # backward compat alias
+        "faithfulness": faithfulness_code0,
         "x_in_A": x_in_A,
         "code1_accepted": code1_accepted,
         "code1_eval_errors": code1_eval_errors,
@@ -53,8 +58,8 @@ def _make_case(
 class TestPerFunctionSummary(unittest.TestCase):
     def test_single_function(self) -> None:
         cases = [
-            _make_case(fn="fn_m", coverage_eq=0.5, faithfulness=1.0),
-            _make_case(fn="fn_m", coverage_eq=0.3, faithfulness=0.8),
+            _make_case(fn="fn_m", coverage_eq=0.5, faithfulness_code0=1.0, faithfulness_gt=0.8),
+            _make_case(fn="fn_m", coverage_eq=0.3, faithfulness_code0=0.8, faithfulness_gt=0.6),
         ]
         result = per_function_summary(cases)
         self.assertEqual(len(result), 1)
@@ -62,6 +67,7 @@ class TestPerFunctionSummary(unittest.TestCase):
         self.assertEqual(result[0]["n_cases"], 2)
         self.assertAlmostEqual(result[0]["mean_coverage_eq"], 0.4, places=6)
         self.assertAlmostEqual(result[0]["mean_faithfulness"], 0.9, places=6)
+        self.assertAlmostEqual(result[0]["mean_faithfulness_gt"], 0.7, places=6)
 
     def test_multiple_functions(self) -> None:
         cases = [
@@ -77,11 +83,12 @@ class TestPerFunctionSummary(unittest.TestCase):
 
     def test_faithfulness_none_excluded(self) -> None:
         cases = [
-            _make_case(fn="fn_m", faithfulness=1.0),
-            _make_case(fn="fn_m", faithfulness=None),
+            _make_case(fn="fn_m", faithfulness_code0=1.0, faithfulness_gt=0.5),
+            _make_case(fn="fn_m", faithfulness_code0=None, faithfulness_gt=None),
         ]
         result = per_function_summary(cases)
         self.assertAlmostEqual(result[0]["mean_faithfulness"], 1.0, places=6)
+        self.assertAlmostEqual(result[0]["mean_faithfulness_gt"], 0.5, places=6)
 
 
 class TestDiagnoseFailures(unittest.TestCase):
@@ -149,8 +156,8 @@ class TestThesisComplexityStats(unittest.TestCase):
 class TestCoverageFaithPairs(unittest.TestCase):
     def test_filters_none_faithfulness(self) -> None:
         cases = [
-            _make_case(faithfulness=1.0),
-            _make_case(faithfulness=None, sample_index=2),
+            _make_case(faithfulness_code0=1.0, faithfulness_gt=0.8),
+            _make_case(faithfulness_code0=None, faithfulness_gt=None, sample_index=2),
         ]
         pairs = coverage_faith_pairs(cases)
         self.assertEqual(len(pairs), 1)
@@ -160,16 +167,46 @@ class TestCoverageFaithPairs(unittest.TestCase):
         pairs = coverage_faith_pairs(cases)
         self.assertIn("coverage_eq", pairs[0])
         self.assertIn("faithfulness", pairs[0])
+        self.assertIn("faithfulness_gt", pairs[0])
         self.assertIn("fn", pairs[0])
 
 
 class TestComparePromptVersions(unittest.TestCase):
     def test_comparison(self) -> None:
-        v1 = [_make_case(coverage_eq=0.3, faithfulness=0.9)]
-        v2 = [_make_case(coverage_eq=0.5, faithfulness=0.85)]
+        v1 = [_make_case(coverage_eq=0.3, faithfulness_code0=0.9, faithfulness_gt=0.7)]
+        v2 = [_make_case(coverage_eq=0.5, faithfulness_code0=0.85, faithfulness_gt=0.8)]
         result = compare_prompt_versions(v1, v2)
         self.assertAlmostEqual(result["delta"]["delta_mean_coverage_eq"], 0.2, places=6)
         self.assertAlmostEqual(result["delta"]["delta_mean_faithfulness"], -0.05, places=6)
+        self.assertAlmostEqual(result["delta"]["delta_mean_faithfulness_gt"], 0.1, places=6)
+
+
+class TestComputeTrivialBaselines(unittest.TestCase):
+    def test_baselines_have_both_faithfulness_types(self) -> None:
+        def code0(x):
+            return 1 if float(x.get("x1", 0)) > 5 else 0
+
+        train_lines = [
+            "x1:8 -> 1",
+            "x1:2 -> 0",
+            "x1:6 -> 1",
+            "x1:4 -> 0",
+        ]
+        baselines = compute_trivial_baselines(train_lines, code0)
+        for strategy in ["always_0", "always_1"]:
+            self.assertIn(strategy, baselines)
+            self.assertIn("faithfulness_code0", baselines[strategy])
+            self.assertIn("faithfulness_gt", baselines[strategy])
+            self.assertIn("coverage_eq", baselines[strategy])
+
+        # always_1: code0 returns 1 for x1=8,6 → 2 agree out of 4 → 0.5
+        self.assertAlmostEqual(baselines["always_1"]["faithfulness_code0"], 0.5, places=6)
+        # always_1: gt labels 1 for x1=8,6 → 2 agree out of 4 → 0.5
+        self.assertAlmostEqual(baselines["always_1"]["faithfulness_gt"], 0.5, places=6)
+        # always_0: code0 returns 0 for x1=2,4 → 2 agree out of 4 → 0.5
+        self.assertAlmostEqual(baselines["always_0"]["faithfulness_code0"], 0.5, places=6)
+        # always_0: gt labels 0 for x1=2,4 → 2 agree out of 4 → 0.5
+        self.assertAlmostEqual(baselines["always_0"]["faithfulness_gt"], 0.5, places=6)
 
 
 class TestLoadCases(unittest.TestCase):

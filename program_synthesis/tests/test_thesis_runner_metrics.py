@@ -80,6 +80,12 @@ class Step23MatrixMetricTests(unittest.TestCase):
         self.assertTrue(out["x_in_A"])
         self.assertAlmostEqual(float(out["coverage_ratio"]), 0.75, places=8)
         self.assertAlmostEqual(float(out["coverage_eq"]), 0.75, places=8)
+        # New field names
+        self.assertEqual(out["agreement_count_code0"], 2)
+        self.assertAlmostEqual(float(out["faithfulness_code0"]), 2.0 / 3.0, places=8)
+        self.assertEqual(out["agreement_count_gt"], 2)
+        self.assertAlmostEqual(float(out["faithfulness_gt"]), 2.0 / 3.0, places=8)
+        # Backward compat aliases still present
         self.assertEqual(out["agreement_count"], 2)
         self.assertAlmostEqual(float(out["faithfulness"]), 2.0 / 3.0, places=8)
 
@@ -117,6 +123,8 @@ class Step23MatrixMetricTests(unittest.TestCase):
                 "x_in_A": True,
                 "coverage_eq": 0.2,
                 "coverage_ratio": 0.2,
+                "faithfulness_code0": 1.0,
+                "faithfulness_gt": 0.8,
                 "faithfulness": 1.0,
             },
             {
@@ -126,6 +134,8 @@ class Step23MatrixMetricTests(unittest.TestCase):
                 "x_in_A": False,
                 "coverage_eq": 0.0,
                 "coverage_ratio": 0.1,
+                "faithfulness_code0": None,
+                "faithfulness_gt": None,
                 "faithfulness": None,
             },
         ]
@@ -137,6 +147,12 @@ class Step23MatrixMetricTests(unittest.TestCase):
         self.assertAlmostEqual(float(s["x_in_A_rate"]), 0.5, places=8)
         self.assertAlmostEqual(float(s["mean_coverage_eq_all"]), 0.1, places=8)
         self.assertAlmostEqual(float(s["mean_coverage_ratio_all"]), 0.15, places=8)
+        # New names
+        self.assertAlmostEqual(float(s["mean_faithfulness_code0_defined"]), 1.0, places=8)
+        self.assertAlmostEqual(float(s["mean_faithfulness_code0_all_zero"]), 0.5, places=8)
+        self.assertAlmostEqual(float(s["mean_faithfulness_gt_defined"]), 0.8, places=8)
+        self.assertAlmostEqual(float(s["mean_faithfulness_gt_all_zero"]), 0.4, places=8)
+        # Backward compat aliases
         self.assertAlmostEqual(float(s["mean_faithfulness_defined_only"]), 1.0, places=8)
         self.assertAlmostEqual(float(s["mean_faithfulness_all_missing_as_zero"]), 0.5, places=8)
 

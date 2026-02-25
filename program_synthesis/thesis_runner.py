@@ -422,6 +422,10 @@ def main() -> None:
                             "x_in_A": False,
                             "coverage_ratio": 0.0,
                             "coverage_eq": 0.0,
+                            "agreement_count_code0": 0,
+                            "faithfulness_code0": None,
+                            "agreement_count_gt": 0,
+                            "faithfulness_gt": None,
                             "agreement_count": 0,
                             "faithfulness": None,
                             "code0_comment_free_ok": code0_comment_free_ok,
@@ -475,6 +479,10 @@ def main() -> None:
                             "x_in_A": False,
                             "coverage_ratio": 0.0,
                             "coverage_eq": 0.0,
+                            "agreement_count_code0": 0,
+                            "faithfulness_code0": None,
+                            "agreement_count_gt": 0,
+                            "faithfulness_gt": None,
                             "agreement_count": 0,
                             "faithfulness": None,
                             "code0_eval_errors": 0,
@@ -544,6 +552,10 @@ def main() -> None:
                     "x_in_A": False,
                     "coverage_ratio": 0.0,
                     "coverage_eq": 0.0,
+                    "agreement_count_code0": 0,
+                    "faithfulness_code0": None,
+                    "agreement_count_gt": 0,
+                    "faithfulness_gt": None,
                     "agreement_count": 0,
                     "faithfulness": None,
                     "code0_eval_errors": 0,
@@ -643,6 +655,10 @@ def main() -> None:
                     "x_in_A": equation_metrics["x_in_A"],
                     "coverage_ratio": equation_metrics["coverage_ratio"],
                     "coverage_eq": equation_metrics["coverage_eq"],
+                    "agreement_count_code0": equation_metrics["agreement_count_code0"],
+                    "faithfulness_code0": equation_metrics["faithfulness_code0"],
+                    "agreement_count_gt": equation_metrics["agreement_count_gt"],
+                    "faithfulness_gt": equation_metrics["faithfulness_gt"],
                     "agreement_count": equation_metrics["agreement_count"],
                     "faithfulness": equation_metrics["faithfulness"],
                     "code0_eval_errors": equation_metrics["code0_eval_errors"],
@@ -656,15 +672,20 @@ def main() -> None:
                 write_json(case_dir / "summary.json", row_out)
 
                 logger.info(
-                    "case_done fn=%s seed=%s sample=%s accepted=%s cov_eq=%.4f faith=%s code1_err=%s",
+                    "case_done fn=%s seed=%s sample=%s accepted=%s cov_eq=%.4f faith_code0=%s faith_gt=%s code1_err=%s",
                     fn,
                     seed,
                     sample_idx + 1,
                     row_out["code1_accepted"],
                     float(row_out["coverage_eq"] or 0.0),
                     (
-                        f"{float(row_out['faithfulness']):.4f}"
-                        if row_out.get("faithfulness") is not None
+                        f"{float(row_out['faithfulness_code0']):.4f}"
+                        if row_out.get("faithfulness_code0") is not None
+                        else "None"
+                    ),
+                    (
+                        f"{float(row_out['faithfulness_gt']):.4f}"
+                        if row_out.get("faithfulness_gt") is not None
                         else "None"
                     ),
                     row_out.get("code1_verification_error"),
@@ -681,15 +702,20 @@ def main() -> None:
             combo_summary.update(summarize_group(combo_case_rows))
             combo_rows.append(combo_summary)
             logger.info(
-                "combo_done fn=%s seed=%s cases=%s accepted_rate=%.4f mean_cov_eq=%.4f mean_faith_defined=%s",
+                "combo_done fn=%s seed=%s cases=%s accepted_rate=%.4f mean_cov_eq=%.4f mean_faith_code0=%s mean_faith_gt=%s",
                 fn,
                 seed,
                 combo_summary["n_cases"],
                 combo_summary["accepted_rate"],
                 combo_summary["mean_coverage_eq_all"],
                 (
-                    f"{combo_summary['mean_faithfulness_defined_only']:.4f}"
-                    if combo_summary["mean_faithfulness_defined_only"] is not None
+                    f"{combo_summary['mean_faithfulness_code0_defined']:.4f}"
+                    if combo_summary.get("mean_faithfulness_code0_defined") is not None
+                    else "None"
+                ),
+                (
+                    f"{combo_summary['mean_faithfulness_gt_defined']:.4f}"
+                    if combo_summary.get("mean_faithfulness_gt_defined") is not None
                     else "None"
                 ),
             )
