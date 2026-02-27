@@ -6,6 +6,8 @@ import io
 import json
 import logging
 import os
+import random
+import shutil
 import subprocess
 import sys
 import tokenize
@@ -36,6 +38,7 @@ try:
     from program_synthesis.prompt_variants import (
         build_thesis_generation_prompt,
         build_thesis_generation_prompt_v2,
+        build_thesis_generation_prompt_v3,
         format_sample_for_thesis_prompt,
     )
     from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
@@ -56,7 +59,7 @@ except ModuleNotFoundError:
     )
     from code_normalizer import sanitize_generated_code  # type: ignore
     from code1_verifier import build_code1_with_verification, compile_code1  # type: ignore
-    from prompt_variants import build_thesis_generation_prompt, build_thesis_generation_prompt_v2, format_sample_for_thesis_prompt  # type: ignore
+    from prompt_variants import build_thesis_generation_prompt, build_thesis_generation_prompt_v2, build_thesis_generation_prompt_v3, format_sample_for_thesis_prompt  # type: ignore
     from thesis_evaluator import ThesisEvaluator, load_split_lines  # type: ignore
 
 
@@ -108,6 +111,86 @@ def write_jsonl(path: Path, rows: Iterable[dict[str, Any]]) -> None:
     with path.open("w", encoding="utf-8") as f:
         for row in rows:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
+
+
+def select_test_sample_indices(
+    test_lines: list[str],
+    n_samples: int,
+    *,
+    stratified: bool = False,
+    sample_seed: Optional[int] = None,
+    parse_line_fn: Any = None,
+    logger: Optional[logging.Logger] = None,
+) -> list[int]:
+    """Select test sample indices, optionally stratified 50/50 by label.
+
+    When *stratified* is True, draws n_samples/2 from label-0 rows and
+    n_samples/2 from label-1 rows, each sampled randomly from anywhere
+    in the test set (not just the first N).  When False, returns the
+    first *n_samples* indices (legacy behaviour).
+
+    Returns a sorted list of 0-based indices into *test_lines*.
+    """
+    if not stratified:
+        return list(range(n_samples))
+
+    if parse_line_fn is None:
+        parse_line_fn = parse_tabular_line
+
+    # Separate indices by ground-truth label
+    label_0_indices: list[int] = []
+    label_1_indices: list[int] = []
+    for idx, line in enumerate(test_lines):
+        try:
+            _, label = parse_line_fn(line)
+            if int(label) == 0:
+                label_0_indices.append(idx)
+            else:
+                label_1_indices.append(idx)
+        except Exception:
+            continue  # skip unparseable lines
+
+    half = n_samples // 2
+    remainder = n_samples - 2 * half  # 1 if odd, 0 if even
+
+    if len(label_0_indices) < half:
+        raise RuntimeError(
+            f"Stratified sampling needs {half} label-0 samples but only "
+            f"{len(label_0_indices)} available in test set"
+        )
+    if len(label_1_indices) < half + remainder:
+        raise RuntimeError(
+            f"Stratified sampling needs {half + remainder} label-1 samples but only "
+            f"{len(label_1_indices)} available in test set"
+        )
+
+    rng = random.Random(sample_seed)
+    chosen_0 = sorted(rng.sample(label_0_indices, half))
+    chosen_1 = sorted(rng.sample(label_1_indices, half + remainder))
+    indices = sorted(chosen_0 + chosen_1)
+
+    if logger:
+        logger.info(
+            "stratified_sampling n_samples=%d label_0=%d/%d label_1=%d/%d seed=%s",
+            len(indices), len(chosen_0), len(label_0_indices),
+            len(chosen_1), len(label_1_indices), sample_seed,
+        )
+
+    return indices
+
+
+def load_sample_indices(path: Path) -> dict[str, list[int]]:
+    """Load a {combo_id: [indices]} mapping from a JSON file."""
+    with path.open("r", encoding="utf-8") as f:
+        data = json.load(f)
+    return {k: list(v) for k, v in data.items()}
+
+
+def save_sample_indices(path: Path, mapping: dict[str, list[int]]) -> None:
+    """Save a {combo_id: [indices]} mapping to a JSON file."""
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with path.open("w", encoding="utf-8") as f:
+        json.dump(mapping, f, indent=2)
 
 
 def make_logger(log_path: Path) -> logging.Logger:
@@ -245,7 +328,7 @@ def main() -> None:
     parser.add_argument("--train-size", type=int, default=100)
     parser.add_argument("--val-size", type=int, default=100)
     parser.add_argument("--test-size", type=int, default=3000)
-    parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview"])
+    parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
     parser.add_argument("--reasoning-effort", default="minimal", choices=["minimal", "medium", "high"])
@@ -270,11 +353,13 @@ def main() -> None:
         default="",
         help="Dataset cache directory passed to runner_val_selection (default: <out-root>/datasets).",
     )
-    parser.add_argument("--thesis-prompt-version", default="v1", choices=["v1", "v2"],
-        help="Thesis prompt version: v1 (original) or v2 (code-tracing + coverage guidance).")
+    parser.add_argument("--thesis-prompt-version", default="v1", choices=["v1", "v2", "v3"],
+        help="Thesis prompt version: v1 (original), v2 (code-tracing + coverage guidance), or v3 (faithfulness-first).")
     parser.add_argument("--compute-baselines", action="store_true",
         help="Compute trivial baselines per (fn, seed) and include in overall_summary.json.")
     parser.add_argument("--skip-runner", action="store_true", help="Reuse existing run dirs; skip runner_val_selection calls.")
+    parser.add_argument("--reuse-code0-from", default="",
+        help="Path to a previous run root dir. Copies runs/ and datasets/ into the new output so --skip-runner can reuse the same Code0.")
     parser.add_argument("--auto-split", action="store_true",
         help="Auto-compute train/val/test sizes per dataset using balanced class pools.")
     parser.add_argument("--train-cap", type=int, default=200,
@@ -285,6 +370,24 @@ def main() -> None:
         "--python-exe",
         default=sys.executable,
         help="Python executable used for runner_val_selection subprocess calls.",
+    )
+    parser.add_argument(
+        "--stratified-sampling",
+        action="store_true",
+        help="Sample test cases 50/50 by ground-truth label, drawn from random positions.",
+    )
+    parser.add_argument(
+        "--sample-seed",
+        type=int,
+        default=None,
+        help="Random seed for test sample selection (used with --stratified-sampling).",
+    )
+    parser.add_argument(
+        "--sample-indices-file",
+        default="",
+        help="Path to JSON file with pre-selected sample indices. "
+             "If it exists, indices are loaded from it. If not, indices are "
+             "computed and saved to it for reuse across runs.",
     )
     args = parser.parse_args()
 
@@ -300,6 +403,18 @@ def main() -> None:
     logger = make_logger(out_root / "matrix.log")
     logger.info("matrix_start out_root=%s", out_root)
 
+    if args.reuse_code0_from:
+        src = Path(args.reuse_code0_from)
+        if not src.is_absolute():
+            src = (repo_root / src).resolve()
+        for subdir in ("runs", "datasets"):
+            src_sub = src / subdir
+            dst_sub = out_root / subdir
+            if src_sub.is_dir() and not dst_sub.exists():
+                shutil.copytree(src_sub, dst_sub)
+                logger.info("reuse_copied %s -> %s", src_sub, dst_sub)
+        args.skip_runner = True
+
     dataset_dir = Path(args.dataset_dir) if args.dataset_dir else (out_root / "datasets")
     if not dataset_dir.is_absolute():
         dataset_dir = (repo_root / dataset_dir).resolve()
@@ -311,6 +426,18 @@ def main() -> None:
 
     case_rows: list[dict[str, Any]] = []
     combo_rows: list[dict[str, Any]] = []
+
+    # --- Sample index management ---
+    sample_indices_path: Optional[Path] = None
+    preloaded_indices: Optional[dict[str, list[int]]] = None
+    computed_indices: dict[str, list[int]] = {}
+    if args.sample_indices_file:
+        sample_indices_path = Path(args.sample_indices_file)
+        if not sample_indices_path.is_absolute():
+            sample_indices_path = (repo_root / sample_indices_path).resolve()
+        if sample_indices_path.exists():
+            preloaded_indices = load_sample_indices(sample_indices_path)
+            logger.info("loaded_sample_indices path=%s combos=%d", sample_indices_path, len(preloaded_indices))
 
     auto_split_sizes: dict[str, dict[str, int]] = {}
 
@@ -389,7 +516,21 @@ def main() -> None:
                     f"for fn={fn}, seed={seed}"
                 )
 
-            for sample_idx in range(args.samples_per_seed):
+            # --- Resolve which test indices to use ---
+            if preloaded_indices is not None and combo_id in preloaded_indices:
+                sample_indices = preloaded_indices[combo_id]
+                logger.info("using_preloaded_indices combo=%s n=%d", combo_id, len(sample_indices))
+            else:
+                sample_indices = select_test_sample_indices(
+                    test_lines,
+                    args.samples_per_seed,
+                    stratified=args.stratified_sampling,
+                    sample_seed=args.sample_seed,
+                    logger=logger,
+                )
+            computed_indices[combo_id] = sample_indices
+
+            for enum_pos, sample_idx in enumerate(sample_indices):
                 test_line = test_lines[sample_idx]
                 sample, true_label = parse_tabular_line(test_line)
                 pred_label = None
@@ -400,7 +541,7 @@ def main() -> None:
                 except Exception as e:
                     code0_pred_error = str(e)
                 if pred_label is None:
-                    case_dir = case_root / f"sample_{sample_idx + 1:04d}"
+                    case_dir = case_root / f"sample_{enum_pos + 1:04d}"
                     case_dir.mkdir(parents=True, exist_ok=True)
                     (case_dir / "code0_sanitized.py").write_text(sanitized_code, encoding="utf-8")
                     write_json(
@@ -408,7 +549,8 @@ def main() -> None:
                         {
                             "fn": fn,
                             "seed": seed,
-                            "sample_index": sample_idx + 1,
+                            "sample_index": enum_pos + 1,
+                            "test_set_index": sample_idx,
                             "test_line": test_line,
                             "true_label": true_label,
                             "predicted_label": None,
@@ -439,7 +581,8 @@ def main() -> None:
                         {
                             "fn": fn,
                             "seed": seed,
-                            "sample_index": sample_idx + 1,
+                            "sample_index": enum_pos + 1,
+                            "test_set_index": sample_idx,
                             "run_dir": str(run_dir),
                             "best_row_file": best_row_file,
                             "row_trial": row.get("trial"),
@@ -497,12 +640,14 @@ def main() -> None:
                         "case_skipped_code0_eval fn=%s seed=%s sample=%s err=%s",
                         fn,
                         seed,
-                        sample_idx + 1,
+                        enum_pos + 1,
                         code0_pred_error,
                     )
                     continue
                 sample_repr = format_sample_for_thesis_prompt(sample)
-                if args.thesis_prompt_version == "v2":
+                if args.thesis_prompt_version == "v3":
+                    thesis_prompt = build_thesis_generation_prompt_v3(sanitized_code, sample_repr, pred_label)
+                elif args.thesis_prompt_version == "v2":
                     thesis_prompt = build_thesis_generation_prompt_v2(sanitized_code, sample_repr, pred_label)
                 else:
                     thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
@@ -593,7 +738,7 @@ def main() -> None:
                             train_lines=train_lines,
                         )
 
-                case_dir = case_root / f"sample_{sample_idx + 1:04d}"
+                case_dir = case_root / f"sample_{enum_pos + 1:04d}"
                 case_dir.mkdir(parents=True, exist_ok=True)
                 (case_dir / "code0_sanitized.py").write_text(sanitized_code, encoding="utf-8")
                 (case_dir / "prompt.txt").write_text(thesis_prompt, encoding="utf-8")
@@ -609,7 +754,8 @@ def main() -> None:
                 row_out = {
                     "fn": fn,
                     "seed": seed,
-                    "sample_index": sample_idx + 1,
+                    "sample_index": enum_pos + 1,
+                    "test_set_index": sample_idx,
                     "run_dir": str(run_dir),
                     "best_row_file": best_row_file,
                     "row_trial": row.get("trial"),
@@ -675,7 +821,7 @@ def main() -> None:
                     "case_done fn=%s seed=%s sample=%s accepted=%s cov_eq=%.4f faith_code0=%s faith_gt=%s code1_err=%s",
                     fn,
                     seed,
-                    sample_idx + 1,
+                    enum_pos + 1,
                     row_out["code1_accepted"],
                     float(row_out["coverage_eq"] or 0.0),
                     (
@@ -768,11 +914,21 @@ def main() -> None:
         "per_function": per_fn_rows,
         "auto_split_sizes": auto_split_sizes if auto_split_sizes else None,
         "trivial_baselines": baselines_data,
+        "sample_indices": computed_indices if computed_indices else None,
     }
 
     write_jsonl(out_root / "cases.jsonl", case_rows)
     write_jsonl(out_root / "combo_summaries.jsonl", combo_rows)
     write_json(out_root / "overall_summary.json", overall_payload)
+
+    # Save sample indices for cross-run reuse
+    if computed_indices:
+        indices_out = out_root / "sample_indices.json"
+        save_sample_indices(indices_out, computed_indices)
+        logger.info("saved_sample_indices path=%s combos=%d", indices_out, len(computed_indices))
+        if sample_indices_path and not sample_indices_path.exists():
+            save_sample_indices(sample_indices_path, computed_indices)
+            logger.info("saved_sample_indices_to_requested_path path=%s", sample_indices_path)
 
     per_fn_csv = out_root / "per_function_summary.csv"
     with per_fn_csv.open("w", newline="", encoding="utf-8") as f:

@@ -1130,7 +1130,7 @@ def parse_args() -> Config:
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
     p.add_argument("--sanitize-generated-code", choices=["on", "off"], help="Normalize generated code before compile/analyze (default: on)")
-    p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview"], help="Prompt variant (default: standard)")
+    p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"], help="Prompt variant (default: standard)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
     p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
 
