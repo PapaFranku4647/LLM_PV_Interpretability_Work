@@ -259,6 +259,10 @@ def run_runner_val_selection(
         "--out-manifest",
         str(out_manifest),
     ]
+    if args.api_base_url:
+        cmd.extend(["--api-base-url", args.api_base_url])
+    if args.api_mode and args.api_mode != "responses":
+        cmd.extend(["--api-mode", args.api_mode])
     logger.info("runner_start fn=%s seed=%s run_dir=%s", fn, seed, run_dir)
     proc = subprocess.run(
         cmd,
@@ -331,13 +335,18 @@ def main() -> None:
     parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
-    parser.add_argument("--reasoning-effort", default="minimal", choices=["minimal", "medium", "high"])
+    parser.add_argument("--api-base-url", default=os.getenv("API_BASE_URL", "").strip(),
+        help="Override API base URL for OpenAI-compatible endpoints (e.g., http://localhost:1234/v1).")
+    parser.add_argument("--api-mode", default=os.getenv("API_MODE", "responses").strip().lower(),
+        choices=["responses", "chat_completions"],
+        help="API mode: 'responses' for OpenAI Responses API, 'chat_completions' for OpenAI-compatible chat endpoints (LM Studio, Ollama, vLLM, etc.).")
+    parser.add_argument("--reasoning-effort", default="low", choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     parser.add_argument("--text-verbosity", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--max-output-tokens", type=int, default=1400)
 
     parser.add_argument("--code1-model", default="")
     parser.add_argument("--code1-verifier-model", default="")
-    parser.add_argument("--code1-reasoning-effort", default="minimal", choices=["minimal", "medium", "high"])
+    parser.add_argument("--code1-reasoning-effort", default="low", choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     parser.add_argument("--code1-text-verbosity", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--code1-max-output-tokens", type=int, default=1200)
     parser.add_argument("--code1-exec-timeout", type=float, default=1.0)
@@ -422,7 +431,10 @@ def main() -> None:
 
     code1_model = args.code1_model.strip() or args.model
     code1_verifier_model = args.code1_verifier_model.strip() or code1_model
-    client = OpenAI(api_key=api_key)
+    client_kwargs: dict[str, Any] = {"api_key": api_key}
+    if args.api_base_url:
+        client_kwargs["base_url"] = args.api_base_url
+    client = OpenAI(**client_kwargs)
 
     case_rows: list[dict[str, Any]] = []
     combo_rows: list[dict[str, Any]] = []
@@ -652,19 +664,31 @@ def main() -> None:
                 else:
                     thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
 
-                request_body = {
-                    "model": args.model,
-                    "input": [{"role": "user", "content": [{"type": "input_text", "text": thesis_prompt}]}],
-                    "reasoning": {"effort": args.reasoning_effort},
-                    "text": {"verbosity": args.text_verbosity},
-                    "max_output_tokens": args.max_output_tokens,
-                    "tool_choice": "none",
-                }
-                response = client.responses.create(**request_body)
-                response_text = extract_text_from_response(response)
-                response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
-                response_status = getattr(response, "status", None)
-                response_id = getattr(response, "id", None)
+                if args.api_mode == "chat_completions":
+                    request_body = {
+                        "model": args.model,
+                        "messages": [{"role": "user", "content": thesis_prompt}],
+                        "max_tokens": args.max_output_tokens,
+                    }
+                    response = client.chat.completions.create(**request_body)
+                    response_text = response.choices[0].message.content or ""
+                    response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
+                    response_status = "completed"
+                    response_id = getattr(response, "id", None)
+                else:
+                    request_body = {
+                        "model": args.model,
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": thesis_prompt}]}],
+                        "reasoning": {"effort": args.reasoning_effort},
+                        "text": {"verbosity": args.text_verbosity},
+                        "max_output_tokens": args.max_output_tokens,
+                        "tool_choice": "none",
+                    }
+                    response = client.responses.create(**request_body)
+                    response_text = extract_text_from_response(response)
+                    response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
+                    response_status = getattr(response, "status", None)
+                    response_id = getattr(response, "id", None)
 
                 parsed_json, parse_err = parse_json_from_text(response_text)
                 has_conditions = (
@@ -720,6 +744,7 @@ def main() -> None:
                             reasoning_effort=args.code1_reasoning_effort,
                             text_verbosity=args.code1_text_verbosity,
                             execution_timeout_s=args.code1_exec_timeout,
+                            api_mode=args.api_mode,
                         )
                     except Exception as e:
                         code1_error = str(e)

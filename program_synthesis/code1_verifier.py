@@ -244,6 +244,10 @@ def _parse_json_dict(text: str) -> tuple[Optional[dict[str, Any]], Optional[str]
     text = (text or "").strip()
     if not text:
         return None, "empty_response"
+    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        return None, "empty_after_think_strip"
 
     try:
         parsed = json.loads(text)
@@ -283,17 +287,27 @@ def _request_json_object(
     max_output_tokens: int = 1200,
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
+    api_mode: str = "responses",
 ) -> tuple[Optional[dict[str, Any]], Optional[str], str]:
-    body = {
-        "model": model,
-        "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
-        "reasoning": {"effort": reasoning_effort},
-        "text": {"verbosity": text_verbosity},
-        "max_output_tokens": max_output_tokens,
-        "tool_choice": "none",
-    }
-    response = client.responses.create(**body)
-    response_text = _extract_text_from_response(response)
+    if api_mode == "chat_completions":
+        body = {
+            "model": model,
+            "messages": [{"role": "user", "content": prompt}],
+            "max_tokens": max_output_tokens,
+        }
+        response = client.chat.completions.create(**body)
+        response_text = response.choices[0].message.content or ""
+    else:
+        body = {
+            "model": model,
+            "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt}]}],
+            "reasoning": {"effort": reasoning_effort},
+            "text": {"verbosity": text_verbosity},
+            "max_output_tokens": max_output_tokens,
+            "tool_choice": "none",
+        }
+        response = client.responses.create(**body)
+        response_text = _extract_text_from_response(response)
     parsed, parse_error = _parse_json_dict(response_text)
     return parsed, parse_error, response_text
 
@@ -488,6 +502,7 @@ def generate_code1_from_thesis(
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     feedback: str = "",
+    api_mode: str = "responses",
 ) -> Code1GenerationResult:
     prompt = _build_code1_writer_prompt(
         thesis_conditions=thesis_conditions,
@@ -502,6 +517,7 @@ def generate_code1_from_thesis(
         max_output_tokens=max_output_tokens,
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
+        api_mode=api_mode,
     )
     if not isinstance(parsed, dict):
         return Code1GenerationResult(
@@ -537,6 +553,7 @@ def verify_code1_semantics(
     max_output_tokens: int = 1200,
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
+    api_mode: str = "responses",
 ) -> SemanticVerificationResult:
     prompt = _build_code1_verifier_prompt(
         thesis_conditions=thesis_conditions,
@@ -550,6 +567,7 @@ def verify_code1_semantics(
         max_output_tokens=max_output_tokens,
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
+        api_mode=api_mode,
     )
     if not isinstance(parsed, dict):
         return SemanticVerificationResult(
@@ -669,6 +687,7 @@ def build_code1_with_verification(
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     execution_timeout_s: float = 1.0,
+    api_mode: str = "responses",
 ) -> Code1VerificationBundle:
     max_attempts = 2 if retry_once else 1
     feedback = ""
@@ -689,6 +708,7 @@ def build_code1_with_verification(
             reasoning_effort=reasoning_effort,
             text_verbosity=text_verbosity,
             feedback=feedback,
+            api_mode=api_mode,
         )
         final_code1 = generation.code1
 
@@ -712,6 +732,7 @@ def build_code1_with_verification(
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             text_verbosity=text_verbosity,
+            api_mode=api_mode,
         )
         last_semantic = semantic
 

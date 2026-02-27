@@ -405,13 +405,17 @@ class DatasetStore:
 def extract_code_from_output(output_text: str) -> Optional[str]:
     if not output_text:
         return None
+    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
+    cleaned = re.sub(r"<think>.*?</think>", "", output_text, flags=re.DOTALL).strip()
+    if not cleaned:
+        cleaned = output_text
     try:
-        obj = json.loads(output_text)
+        obj = json.loads(cleaned)
         if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
             return obj["code"]
     except Exception:
         pass
-    m = re.search(r"\{.*\}", output_text, flags=re.DOTALL)
+    m = re.search(r"\{.*\}", cleaned, flags=re.DOTALL)
     if m:
         try:
             obj = json.loads(m.group(0))
@@ -1132,7 +1136,7 @@ def parse_args() -> Config:
     p.add_argument("--sanitize-generated-code", choices=["on", "off"], help="Normalize generated code before compile/analyze (default: on)")
     p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"], help="Prompt variant (default: standard)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
-    p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
+    p.add_argument("--reasoning-effort", choices=["none","minimal","low","medium","high","xhigh"], help="reasoning.effort (default: high)")
 
     p.add_argument("--train-size", type=int, help="Train size per (fn, L) (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size per (fn, L) (default: 100)")

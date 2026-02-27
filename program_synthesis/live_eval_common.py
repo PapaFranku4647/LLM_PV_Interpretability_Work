@@ -147,12 +147,30 @@ def normalize_pred_to01(pred: Any) -> int:
     return 1 if pred else 0
 
 
+def _sample_to_kv_string(sample: dict[str, Any]) -> str:
+    """Reconstruct 'x0:val0, x1:val1, ...' string from sample dict."""
+    ordered_pairs: list[tuple[int, str, Any]] = []
+    for key, value in sample.items():
+        if not isinstance(key, str) or not key.startswith("x"):
+            continue
+        try:
+            idx = int(key[1:])
+        except Exception:
+            continue
+        ordered_pairs.append((idx, key, value))
+    ordered_pairs.sort()
+    return ", ".join(f"{k}:{v}" for _, k, v in ordered_pairs)
+
+
 def predict_code0_label(code0_fn: Any, sample: dict[str, Any]) -> tuple[int, str]:
     attempts: list[tuple[str, Any]] = [("dict", sample)]
     ordered = sample_dict_to_ordered_list(sample)
     if ordered:
         attempts.append(("list", ordered))
         attempts.append(("tuple", tuple(ordered)))
+    kv_str = _sample_to_kv_string(sample)
+    if kv_str:
+        attempts.append(("string", kv_str))
 
     errors: list[str] = []
     for mode, payload in attempts:
@@ -235,6 +253,10 @@ def parse_json_from_text(text: str) -> tuple[Optional[dict[str, Any]], Optional[
     text = (text or "").strip()
     if not text:
         return None, "empty_response_text"
+    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
+    text = re.sub(r"<think>.*?</think>", "", text, flags=re.DOTALL).strip()
+    if not text:
+        return None, "empty_after_think_strip"
     try:
         parsed = json.loads(text)
         if isinstance(parsed, dict):
