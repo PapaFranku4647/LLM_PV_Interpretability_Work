@@ -250,6 +250,8 @@ def run_runner_val_selection(
         str(args.max_output_tokens),
         "--prompt-variant",
         args.prompt_variant,
+        "--code0-train-mode",
+        args.code0_train_mode,
         "--dataset-dir",
         str(dataset_dir),
         "--out-jsonl",
@@ -259,6 +261,8 @@ def run_runner_val_selection(
         "--out-manifest",
         str(out_manifest),
     ]
+    if args.code0_train_mode == "batched":
+        cmd.extend(["--code0-batch-size", str(args.code0_batch_size)])
     if args.api_base_url:
         cmd.extend(["--api-base-url", args.api_base_url])
     if args.api_mode and args.api_mode != "responses":
@@ -332,6 +336,8 @@ def main() -> None:
     parser.add_argument("--train-size", type=int, default=100)
     parser.add_argument("--val-size", type=int, default=100)
     parser.add_argument("--test-size", type=int, default=3000)
+    parser.add_argument("--code0-train-mode", choices=["normal", "batched"], default="normal")
+    parser.add_argument("--code0-batch-size", type=int, default=0)
     parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
@@ -399,6 +405,8 @@ def main() -> None:
              "computed and saved to it for reuse across runs.",
     )
     args = parser.parse_args()
+    if args.code0_train_mode == "batched" and args.code0_batch_size <= 0:
+        raise SystemExit("--code0-batch-size must be positive when --code0-train-mode batched is used")
 
     repo_root = detect_repo_root()
     load_env(repo_root / ".env")

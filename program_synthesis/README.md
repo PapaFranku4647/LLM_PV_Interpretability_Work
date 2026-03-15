@@ -15,28 +15,65 @@ conda activate llm_pv
 export OPENAI_API_KEY=sk-...
 ```
 
-## TAMU API setup (GPT-5.2)
-If you are using the TAMU gateway (OpenAI-compatible chat completions endpoint), set:
+## TAMU API setup
+If you are using the TAMU gateway, the verified raw REST path is:
 
-```bash
-export TAMU_API_KEY=...
-export API_MODE=chat_completions
-export API_BASE_URL="https://<tamu-host>/openai"
+```text
+https://chat-api.tamu.ai/api/chat/completions
 ```
 
-Then run with:
+Recommended environment variables:
 
 ```bash
-python program_synthesis/runner.py \
-  --model gpt-5.2 \
-  --reasoning-effort medium \
-  --tool-choice none
+export TAMUS_AI_CHAT_API_KEY=...
+export TAMUS_AI_CHAT_API_ENDPOINT="https://chat-api.tamu.ai"
+export TAMU_API_KEY="$TAMUS_AI_CHAT_API_KEY"
+export API_MODE=chat_completions
+export API_BASE_URL="https://chat-api.tamu.ai/api"
+```
+
+PowerShell equivalent:
+
+```powershell
+$env:TAMUS_AI_CHAT_API_KEY = "..."
+$env:TAMUS_AI_CHAT_API_ENDPOINT = "https://chat-api.tamu.ai"
+$env:TAMU_API_KEY = $env:TAMUS_AI_CHAT_API_KEY
+$env:API_MODE = "chat_completions"
+$env:API_BASE_URL = "https://chat-api.tamu.ai/api"
+```
+
+Minimal TAMU smoke test:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\program_synthesis\test_tamu_api.ps1 `
+  -Mode api `
+  -Model protected.gpt-5 `
+  -ReasoningEffort minimal
+```
+
+Broader TAMU endpoint sweep:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_api_smoke_matrix.ps1 `
+  -Models protected.gpt-5 protected.gemini-2.0-flash-lite protected.gemini-2.5-flash-lite `
+  -ReasoningEfforts minimal medium `
+  -PromptSet standard
+```
+
+Then run the small Code0 TAMU comparison:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batch_compare.ps1 `
+  -ApiBaseUrl "https://chat-api.tamu.ai/api" `
+  -Models protected.gpt-5 `
+  -ReasoningEffort minimal
 ```
 
 Notes:
-- `API_BASE_URL` should be the TAMU gateway base that serves `/chat/completions`.
+- `API_BASE_URL` should be the TAMU gateway base that serves `/chat/completions`, which is `https://chat-api.tamu.ai/api` for the current TAMU docs path.
 - If both `TAMU_API_KEY` and `OPENAI_API_KEY` are set, `TAMU_API_KEY` is used.
 - For OpenAI Responses API, keep `API_MODE=responses` (default) and use your OpenAI key.
+- See `program_synthesis/TAMU_API_GUIDE.md` for a Windows-focused workflow and artifact paths.
 
 ## Minimal run
 ```bash
@@ -59,6 +96,7 @@ python program_synthesis/runner_val_selection.py ...
 Why:
 - `runner_val_selection.py` selects the best attempt per trial by `val_acc`.
 - This avoids test-set leakage from selecting candidates by `test_acc`, which can inflate test results.
+- It now also supports batched Code0 training, where the best code on each train batch is carried forward and revised on the next batch.
 
 For tabular tasks (`fn_m`, `fn_n`, `fn_o`, `fn_p`, `fn_q`) lengths are fixed by task metadata, so `--lengths` is optional.
 
@@ -180,9 +218,32 @@ See `EXAMPLES.md` for recommended PowerShell commands.
 - OpenAI: `--model`, `--max-output-tokens`, `--reasoning-effort`, `--verbosity`, `--tool-choice`, `--enable-code-interpreter`
 - API routing: `--api-mode` (`responses` or `chat_completions`), `--api-base-url`
 - Data: `--train-size`, `--val-size`, `--test-size`, `--seed`, `--dataset-dir`
+- Code0 batching: `--code0-train-mode normal|batched`, `--code0-batch-size N`
 - Outputs: `--out-jsonl`, `--out-csv`, `--out-manifest`, `--run-id`
 - Infra: `--concurrency`, `--timeout`, `--retry-delay`
 - Dry run: `--dry-run`
+
+## Code0 batched training
+
+`runner_val_selection.py` supports a batched Code0 mode:
+
+- Split the train set into fixed-size batches.
+- Generate `--attempts` Code0 candidates for the current batch.
+- Score candidates on train accuracy over the seen batches so far.
+- Carry the best code forward and revise it on the next batch.
+
+In batched mode:
+
+- `train_acc` means cumulative accuracy on all seen train batches.
+- `current_batch_train_acc` is the accuracy on just the newest batch.
+- `results_batches.jsonl` and `results_batches.csv` store one winner per batch.
+
+For fair normal-vs-batched comparisons, match both:
+
+- total training samples
+- total Code0 generations
+
+Example: `train_size=200`, `batch_size=50`, `attempts=5` gives 4 batches, so compare against a normal run with `attempts=20`.
 
 ## Output artifacts
 - `results_attempts.jsonl`: best row per trial plus summary rows.

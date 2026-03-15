@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 import os, sys, json, csv, time, argparse, asyncio, re, ast, random, tempfile, shutil, hashlib
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
@@ -422,14 +423,70 @@ def extract_code_from_output(output_text: str) -> Optional[str]:
     return None
 
 
+def _flatten_chat_content_text(content: Any) -> List[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, Mapping):
+        nested = content.get("text")
+        if isinstance(nested, str):
+            return [nested]
+        return _flatten_chat_content_text(content.get("content"))
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            parts.extend(_flatten_chat_content_text(item))
+        return parts
+    text_attr = getattr(content, "text", None)
+    if isinstance(text_attr, str):
+        return [text_attr]
+    nested_attr = getattr(content, "content", None)
+    if nested_attr is not None:
+        return _flatten_chat_content_text(nested_attr)
+    return []
+
+
+def _extract_text_parts_from_chat_choice(choice: Any) -> List[str]:
+    parts: List[str] = []
+    if isinstance(choice, Mapping):
+        delta = choice.get("delta")
+        message = choice.get("message")
+        text_value = choice.get("text")
+    else:
+        delta = getattr(choice, "delta", None)
+        message = getattr(choice, "message", None)
+        text_value = getattr(choice, "text", None)
+
+    parts.extend(_flatten_chat_content_text(text_value))
+
+    if delta is not None:
+        if isinstance(delta, Mapping):
+            parts.extend(_flatten_chat_content_text(delta.get("content")))
+        else:
+            parts.extend(_flatten_chat_content_text(getattr(delta, "content", None)))
+
+    if message is not None:
+        if isinstance(message, Mapping):
+            parts.extend(_flatten_chat_content_text(message.get("content")))
+        else:
+            parts.extend(_flatten_chat_content_text(getattr(message, "content", None)))
+
+    return [p for p in parts if isinstance(p, str) and p]
+
+
 def extract_text_from_chat_completion(res: Any) -> str:
     if isinstance(res, str):
         return parse_chat_completion_sse(res).get("text", "")
 
-    choices = getattr(res, "choices", None) or []
+    choices = getattr(res, "choices", None)
+    if choices is None and isinstance(res, Mapping):
+        choices = res.get("choices")
+    choices = choices or []
     if not choices:
         return ""
     first = choices[0]
+    direct_parts = _extract_text_parts_from_chat_choice(first)
+    if direct_parts:
+        return "".join(direct_parts).strip()
     msg = getattr(first, "message", None)
     if msg is None and isinstance(first, Mapping):
         msg = first.get("message")
@@ -440,22 +497,7 @@ def extract_text_from_chat_completion(res: Any) -> str:
     if content is None and isinstance(msg, Mapping):
         content = msg.get("content")
 
-    if isinstance(content, str):
-        return content.strip()
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            txt = None
-            if isinstance(part, Mapping):
-                txt = part.get("text") or part.get("content")
-            else:
-                txt = getattr(part, "text", None) or getattr(part, "content", None)
-            if isinstance(txt, str) and txt.strip():
-                parts.append(txt.strip())
-        return "\n".join(parts).strip()
-
-    return ""
+    return "".join(_flatten_chat_content_text(content)).strip()
 
 
 def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
@@ -488,20 +530,33 @@ def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
                 for c in choices:
                     if not isinstance(c, Mapping):
                         continue
-                    delta = c.get("delta")
-                    if isinstance(delta, Mapping):
-                        content = delta.get("content")
-                        if isinstance(content, str) and content:
-                            text_parts.append(content)
-                    message = c.get("message")
-                    if isinstance(message, Mapping):
-                        content = message.get("content")
-                        if isinstance(content, str) and content:
-                            text_parts.append(content)
+                    text_parts.extend(_extract_text_parts_from_chat_choice(c))
     return {
         "text": "".join(text_parts).strip(),
         "usage": usage,
         "model": model_name,
+    }
+
+
+def parse_chat_completion_http_payload(payload_text: str, content_type: str = "") -> Dict[str, Any]:
+    text = payload_text or ""
+    lowered_content_type = (content_type or "").lower()
+    if "text/event-stream" in lowered_content_type or text.lstrip().startswith("data:"):
+        parsed = parse_chat_completion_sse(text)
+        return {
+            "text": parsed.get("text", ""),
+            "usage": normalize_usage(parsed.get("usage") or {}),
+            "raw_payload": text,
+        }
+
+    data = json.loads(text)
+    usage = {}
+    if isinstance(data, Mapping):
+        usage = normalize_usage(data.get("usage") or {})
+    return {
+        "text": extract_text_from_chat_completion(data),
+        "usage": usage,
+        "raw_payload": text,
     }
 
 def compile_callable_from_code(code_str: str, sanitize: bool = True) -> Callable[[str], int]:
@@ -612,6 +667,17 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
             pass
     return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
+
+def chat_completion_supports_reasoning_effort(model_name: str) -> bool:
+    model_l = (model_name or "").strip().lower()
+    return (
+        model_l.startswith("o3")
+        or model_l.startswith("o4")
+        or "gpt-5" in model_l
+        or model_l.startswith("openai/o3")
+        or model_l.startswith("openai/o4")
+    )
+
 def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
     return {
         "run_id": cfg.run_id,
@@ -660,6 +726,45 @@ class Runner:
 
         self.ds = DatasetStore(cfg, logger)
 
+    async def _call_chat_completions_raw(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.cfg.api_base_url:
+            raise RuntimeError("Raw chat completions require api_base_url.")
+        url = self.cfg.api_base_url.rstrip("/") + "/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.cfg.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=self.cfg.per_call_timeout_s) as client:
+            try:
+                response = await client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                parsed = parse_chat_completion_http_payload(
+                    response.text,
+                    response.headers.get("content-type", ""),
+                )
+                if parsed.get("text") or body.get("stream") is True:
+                    return parsed
+                content_type = (response.headers.get("content-type", "") or "").lower()
+                if "text/event-stream" not in content_type:
+                    return parsed
+            except httpx.HTTPStatusError:
+                if body.get("stream") is True:
+                    raise
+
+            retry_body = dict(body)
+            retry_body["stream"] = True
+            retry_body["stream_options"] = {"include_usage": True}
+            async with client.stream("POST", url, headers=headers, json=retry_body) as response:
+                response.raise_for_status()
+                chunks: List[str] = []
+                async for chunk in response.aiter_text():
+                    chunks.append(chunk)
+                return parse_chat_completion_http_payload(
+                    "".join(chunks),
+                    response.headers.get("content-type", ""),
+                )
+
     def _attach_meta(self, row: Dict[str, Any], dataset_seed: Optional[int] = None) -> Dict[str, Any]:
         out = {**self.row_meta, **row}
         if dataset_seed is not None:
@@ -680,14 +785,10 @@ class Runner:
             body: Dict[str, Any] = {
                 "model": self.cfg.model,
                 "messages": msg_payload,
+                "stream": False,
                 "max_tokens": self.cfg.max_output_tokens,
             }
-            base_url_lower = (self.cfg.api_base_url or "").lower()
-            if ("tamu" in base_url_lower) or ("tamus" in base_url_lower):
-                # TAMU gateway currently returns SSE payloads even via SDK non-stream path.
-                body["stream"] = True
-                body["stream_options"] = {"include_usage": True}
-            if self.cfg.reasoning_effort:
+            if self.cfg.reasoning_effort and chat_completion_supports_reasoning_effort(self.cfg.model):
                 body["reasoning_effort"] = self.cfg.reasoning_effort
         else:
             body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
@@ -717,53 +818,56 @@ class Runner:
                 tool_uses = 0
                 tool_results_chars = 0
                 if self.cfg.api_mode == "chat_completions":
-                    res = await asyncio.wait_for(
-                        self.client.chat.completions.create(**body),
-                        timeout=self.cfg.per_call_timeout_s,
-                    )
-                    if hasattr(res, "__aiter__"):
-                        text_parts: List[str] = []
-                        usage_obj: Dict[str, Any] = {}
-                        async for chunk in res:
-                            if hasattr(chunk, "model_dump"):
-                                d = chunk.model_dump()
-                            elif isinstance(chunk, Mapping):
-                                d = dict(chunk)
-                            elif isinstance(chunk, str):
-                                d = parse_chat_completion_sse(chunk)
-                            else:
-                                continue
-
-                            if isinstance(d, Mapping):
-                                chs = d.get("choices")
-                                if isinstance(chs, list):
-                                    for c in chs:
-                                        if not isinstance(c, Mapping):
-                                            continue
-                                        delta = c.get("delta")
-                                        if isinstance(delta, Mapping):
-                                            content = delta.get("content")
-                                            if isinstance(content, str) and content:
-                                                text_parts.append(content)
-                                        message = c.get("message")
-                                        if isinstance(message, Mapping):
-                                            content = message.get("content")
-                                            if isinstance(content, str) and content:
-                                                text_parts.append(content)
-                                u = d.get("usage")
-                                if isinstance(u, Mapping):
-                                    usage_obj = dict(u)
-                                elif "usage" in d and isinstance(d.get("usage"), dict):
-                                    usage_obj = d.get("usage", {})
-                        out_text = "".join(text_parts).strip()
-                        usage = normalize_usage(usage_obj)
-                    elif isinstance(res, str):
-                        parsed = parse_chat_completion_sse(res)
-                        out_text = parsed.get("text", "")
-                        usage = normalize_usage(parsed.get("usage") or {})
+                    if self.cfg.api_base_url:
+                        parsed_chat = await asyncio.wait_for(
+                            self._call_chat_completions_raw(body),
+                            timeout=self.cfg.per_call_timeout_s,
+                        )
+                        out_text = parsed_chat.get("text", "")
+                        usage = parsed_chat.get("usage", {})
                     else:
-                        out_text = extract_text_from_chat_completion(res)
-                        usage = normalize_usage(getattr(res, "usage", {}))
+                        res = await asyncio.wait_for(
+                            self.client.chat.completions.create(**body),
+                            timeout=self.cfg.per_call_timeout_s,
+                        )
+                        if hasattr(res, "__aiter__"):
+                            text_parts: List[str] = []
+                            usage_obj: Dict[str, Any] = {}
+                            async for chunk in res:
+                                if hasattr(chunk, "model_dump"):
+                                    d = chunk.model_dump()
+                                elif isinstance(chunk, Mapping):
+                                    d = dict(chunk)
+                                elif isinstance(chunk, str):
+                                    d = parse_chat_completion_sse(chunk)
+                                elif isinstance(chunk, (bytes, bytearray)):
+                                    d = parse_chat_completion_sse(bytes(chunk).decode("utf-8", errors="ignore"))
+                                else:
+                                    continue
+
+                                if isinstance(d, Mapping):
+                                    chs = d.get("choices")
+                                    if isinstance(chs, list):
+                                        for c in chs:
+                                            text_parts.extend(_extract_text_parts_from_chat_choice(c))
+                                    u = d.get("usage")
+                                    if isinstance(u, Mapping):
+                                        usage_obj = dict(u)
+                                    elif "usage" in d and isinstance(d.get("usage"), dict):
+                                        usage_obj = d.get("usage", {})
+                            out_text = "".join(text_parts).strip()
+                            usage = normalize_usage(usage_obj)
+                        elif isinstance(res, str):
+                            parsed = parse_chat_completion_sse(res)
+                            out_text = parsed.get("text", "")
+                            usage = normalize_usage(parsed.get("usage") or {})
+                        elif isinstance(res, (bytes, bytearray)):
+                            parsed = parse_chat_completion_sse(bytes(res).decode("utf-8", errors="ignore"))
+                            out_text = parsed.get("text", "")
+                            usage = normalize_usage(parsed.get("usage") or {})
+                        else:
+                            out_text = extract_text_from_chat_completion(res)
+                            usage = normalize_usage(getattr(res, "usage", {}))
                 else:
                     res = await asyncio.wait_for(
                         self.client.responses.create(**body),

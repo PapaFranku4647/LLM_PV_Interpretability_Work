@@ -35,6 +35,8 @@ try:
     )
     from program_synthesis.prompt_variants import (
         build_thesis_generation_prompt,
+        build_thesis_generation_prompt_v2,
+        build_thesis_generation_prompt_v3,
         format_sample_for_thesis_prompt,
     )
     from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
@@ -55,7 +57,7 @@ except ModuleNotFoundError:
     )
     from code_normalizer import sanitize_generated_code  # type: ignore
     from code1_verifier import build_code1_with_verification, compile_code1  # type: ignore
-    from prompt_variants import build_thesis_generation_prompt, format_sample_for_thesis_prompt  # type: ignore
+    from prompt_variants import build_thesis_generation_prompt, build_thesis_generation_prompt_v2, build_thesis_generation_prompt_v3, format_sample_for_thesis_prompt  # type: ignore
     from thesis_evaluator import ThesisEvaluator, load_split_lines  # type: ignore
 
 
@@ -163,7 +165,7 @@ def run_runner_val_selection(
         "--tool-choice",
         "none",
         "--max-output-tokens",
-        str(args.max_output_tokens),
+        str(args.code0_max_output_tokens),
         "--prompt-variant",
         args.prompt_variant,
         "--dataset-dir",
@@ -222,6 +224,11 @@ def summarize_group(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
             "label_match_rate": label_match_rate,
         }
     )
+
+    train_accs = [float(r["train_acc"]) for r in rows if r.get("train_acc") is not None]
+    if train_accs:
+        out["mean_train_acc"] = sum(train_accs) / len(train_accs)
+
     return out
 
 
@@ -244,20 +251,30 @@ def main() -> None:
     parser.add_argument("--train-size", type=int, default=100)
     parser.add_argument("--val-size", type=int, default=100)
     parser.add_argument("--test-size", type=int, default=3000)
-    parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview"])
+    parser.add_argument("--prompt-variant", default="explain",
+        choices=["standard", "explain", "interview", "preview",
+                 "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
     parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
-    parser.add_argument("--reasoning-effort", default="minimal", choices=["minimal", "medium", "high"])
+    parser.add_argument("--reasoning-effort", default="low", choices=["none", "minimal", "low", "medium", "high"])
     parser.add_argument("--text-verbosity", default="low", choices=["low", "medium", "high"])
-    parser.add_argument("--max-output-tokens", type=int, default=1400)
+    parser.add_argument("--max-output-tokens", type=int, default=1400,
+        help="Max output tokens for thesis generation (default: 1400).")
+    parser.add_argument("--code0-max-output-tokens", type=int, default=16000,
+        help="Max output tokens for Code0 generation via runner_val_selection (default: 16000).")
 
     parser.add_argument("--code1-model", default="")
     parser.add_argument("--code1-verifier-model", default="")
-    parser.add_argument("--code1-reasoning-effort", default="minimal", choices=["minimal", "medium", "high"])
+    parser.add_argument("--code1-reasoning-effort", default="minimal",
+                        choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     parser.add_argument("--code1-text-verbosity", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--code1-max-output-tokens", type=int, default=1200)
     parser.add_argument("--code1-exec-timeout", type=float, default=1.0)
     parser.add_argument("--code1-no-retry", action="store_true")
+
+    parser.add_argument("--thesis-prompt-version", default="v2",
+        choices=["v1", "v2", "v3"],
+        help="Thesis prompt version (v1=original, v2=code-trace, v3=faithfulness-first).")
 
     parser.add_argument(
         "--out-root",
@@ -316,8 +333,8 @@ def main() -> None:
             try:
                 from src.data_handler import get_available_class_counts
             except ModuleNotFoundError:
-                sys.path.insert(0, str(repo_root / "src"))
-                from data_handler import get_available_class_counts  # type: ignore
+                sys.path.insert(0, str(repo_root))
+                from src.data_handler import get_available_class_counts  # type: ignore
             target = TARGET_NAME_BY_FN[fn]
             L = FEATURE_LENGTH_BY_FN[fn]
             n_pos, n_neg = get_available_class_counts(target, L)
@@ -444,6 +461,7 @@ def main() -> None:
                             "prompt_variant": row.get("prompt_variant"),
                             "val_acc": row.get("val_acc"),
                             "test_acc": row.get("test_acc"),
+                            "train_acc": row.get("train_acc"),
                             "test_line": test_line,
                             "true_label": true_label,
                             "predicted_label": None,
@@ -497,7 +515,12 @@ def main() -> None:
                     )
                     continue
                 sample_repr = format_sample_for_thesis_prompt(sample)
-                thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
+                if args.thesis_prompt_version == "v3":
+                    thesis_prompt = build_thesis_generation_prompt_v3(sanitized_code, sample_repr, pred_label)
+                elif args.thesis_prompt_version == "v2":
+                    thesis_prompt = build_thesis_generation_prompt_v2(sanitized_code, sample_repr, pred_label)
+                else:
+                    thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
 
                 request_body = {
                     "model": args.model,
@@ -611,6 +634,7 @@ def main() -> None:
                     "prompt_variant": row.get("prompt_variant"),
                     "val_acc": row.get("val_acc"),
                     "test_acc": row.get("test_acc"),
+                    "train_acc": row.get("train_acc"),
                     "test_line": test_line,
                     "true_label": true_label,
                     "predicted_label": pred_label,

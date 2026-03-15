@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import argparse
 import importlib
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -216,6 +218,61 @@ class Step23MatrixMetricTests(unittest.TestCase):
         pred, mode = self.mod.predict_code0_label(fn_requires_sequence, sample)
         self.assertEqual(pred, 1)
         self.assertIn(mode, {"list", "tuple"})
+
+    def test_run_runner_val_selection_forwards_batching_flags(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        orig_run = self.mod.subprocess.run
+        self.mod.subprocess.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir)
+                (repo_root / "program_synthesis").mkdir(parents=True, exist_ok=True)
+                run_dir = repo_root / "run_dir"
+                dataset_dir = repo_root / "datasets"
+                logger = self.mod.logging.getLogger("thesis_runner_forward_test")
+                logger.handlers[:] = [self.mod.logging.NullHandler()]
+                logger.propagate = False
+                args = argparse.Namespace(
+                    attempts=5,
+                    num_trials=1,
+                    train_size=200,
+                    val_size=300,
+                    test_size=400,
+                    model="gpt-5-mini",
+                    reasoning_effort="low",
+                    max_output_tokens=1600,
+                    prompt_variant="explain",
+                    dataset_dir="",
+                    api_base_url="",
+                    api_mode="responses",
+                    code0_train_mode="batched",
+                    code0_batch_size=50,
+                )
+                self.mod.run_runner_val_selection(
+                    python_exe=sys.executable,
+                    repo_root=repo_root,
+                    fn="fn_m",
+                    seed=2201,
+                    run_dir=run_dir,
+                    dataset_dir=dataset_dir,
+                    args=args,
+                    logger=logger,
+                )
+        finally:
+            self.mod.subprocess.run = orig_run
+
+        self.assertEqual(len(calls), 1)
+        cmd, kwargs = calls[0]
+        self.assertIn("--code0-train-mode", cmd)
+        self.assertIn("batched", cmd)
+        self.assertIn("--code0-batch-size", cmd)
+        self.assertIn("50", cmd)
+        self.assertEqual(kwargs["cwd"], str(repo_root))
 
 
 if __name__ == "__main__":

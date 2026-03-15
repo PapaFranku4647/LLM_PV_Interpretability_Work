@@ -293,6 +293,9 @@ def load_best_row(run_root: Path) -> tuple[str, dict[str, Any]]:
     best_val_acc: Optional[float] = None
     best_row = None
     best_file = None
+    best_final_val_acc: Optional[float] = None
+    best_final_row = None
+    best_final_file = None
 
     for path in sorted(run_root.glob("*_trial*.jsonl")):
         with path.open("r", encoding="utf-8") as f:
@@ -311,11 +314,18 @@ def load_best_row(run_root: Path) -> tuple[str, dict[str, Any]]:
                     val_acc_f = float(val_acc)
                 except Exception:
                     continue
+                if row.get("is_final_selected_model"):
+                    if best_final_val_acc is None or val_acc_f > best_final_val_acc:
+                        best_final_val_acc = val_acc_f
+                        best_final_row = row
+                        best_final_file = path.name
                 if best_val_acc is None or val_acc_f > best_val_acc:
                     best_val_acc = val_acc_f
                     best_row = row
                     best_file = path.name
 
+    if best_final_row is not None and best_final_file is not None:
+        return best_final_file, best_final_row
     if best_row is None or best_file is None:
         raise ValueError("No compile-valid row found with val_acc.")
     return best_file, best_row
