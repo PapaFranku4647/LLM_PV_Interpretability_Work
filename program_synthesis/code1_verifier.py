@@ -5,7 +5,7 @@ import json
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
@@ -288,6 +288,8 @@ def _request_json_object(
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
 ) -> tuple[Optional[dict[str, Any]], Optional[str], str]:
     if api_mode == "chat_completions":
         body = {
@@ -295,8 +297,21 @@ def _request_json_object(
             "messages": [{"role": "user", "content": prompt}],
             "max_tokens": max_output_tokens,
         }
-        response = client.chat.completions.create(**body)
-        response_text = response.choices[0].message.content or ""
+        if api_base_url and api_key:
+            import httpx
+            url = api_base_url.rstrip("/") + "/chat/completions"
+            headers = {
+                "Authorization": f"Bearer {api_key}",
+                "Content-Type": "application/json",
+                "Accept": "application/json",
+            }
+            resp = httpx.post(url, headers=headers, json=body, timeout=120.0)
+            resp.raise_for_status()
+            data = resp.json()
+            response_text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        else:
+            response = client.chat.completions.create(**body)
+            response_text = response.choices[0].message.content or ""
     else:
         body = {
             "model": model,
@@ -503,6 +518,8 @@ def generate_code1_from_thesis(
     text_verbosity: str = "low",
     feedback: str = "",
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
 ) -> Code1GenerationResult:
     prompt = _build_code1_writer_prompt(
         thesis_conditions=thesis_conditions,
@@ -518,6 +535,8 @@ def generate_code1_from_thesis(
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
         api_mode=api_mode,
+        api_base_url=api_base_url,
+        api_key=api_key,
     )
     if not isinstance(parsed, dict):
         return Code1GenerationResult(
@@ -554,6 +573,8 @@ def verify_code1_semantics(
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
 ) -> SemanticVerificationResult:
     prompt = _build_code1_verifier_prompt(
         thesis_conditions=thesis_conditions,
@@ -688,6 +709,8 @@ def build_code1_with_verification(
     text_verbosity: str = "low",
     execution_timeout_s: float = 1.0,
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
 ) -> Code1VerificationBundle:
     max_attempts = 2 if retry_once else 1
     feedback = ""
@@ -709,6 +732,8 @@ def build_code1_with_verification(
             text_verbosity=text_verbosity,
             feedback=feedback,
             api_mode=api_mode,
+            api_base_url=api_base_url,
+            api_key=api_key,
         )
         final_code1 = generation.code1
 
@@ -733,6 +758,8 @@ def build_code1_with_verification(
             reasoning_effort=reasoning_effort,
             text_verbosity=text_verbosity,
             api_mode=api_mode,
+            api_base_url=api_base_url,
+            api_key=api_key,
         )
         last_semantic = semantic
 

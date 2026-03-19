@@ -178,6 +178,7 @@ class Config:
     sanitize_generated_code: bool = field(default_factory=lambda: _env_flag("SANITIZE_GENERATED_CODE", True))
     prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
+    enable_thinking: bool = os.getenv("ENABLE_THINKING", "0") == "1"
 
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
@@ -221,6 +222,7 @@ def build_user_prompt(
             f"**Problem Statement:**\n"
             f"Given tabular input data (comma-separated feature:value pairs) and their corresponding scalar binary outputs ('0' or '1'), "
             f"find a concise Python function `f(x)` that accurately approximates the underlying relationship. "
+            f"The argument `x` is a Python dict mapping feature names to values (e.g. x['x3'] gives a float, x['x0'] gives a category string like 'c1'). "
             f"The function should not be a trainable model, but a direct logical or mathematical representation of the target function."
         )
     elif decimal:
@@ -239,7 +241,7 @@ def build_user_prompt(
         )
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.'
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}. Keep the function concise (under 30 lines, no comments). Output the JSON immediately with no other text.'
     variant_suffix = get_prompt_variant_suffix(prompt_variant)
     if variant_suffix:
         prompt += "\n\n" + variant_suffix
@@ -404,6 +406,10 @@ class DatasetStore:
 # =========================
 
 def extract_code_from_output(output_text: str) -> Optional[str]:
+    if not output_text:
+        return None
+    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
+    output_text = re.sub(r"<think>.*?</think>", "", output_text, flags=re.DOTALL).strip()
     if not output_text:
         return None
     try:
@@ -790,6 +796,8 @@ class Runner:
             }
             if self.cfg.reasoning_effort and chat_completion_supports_reasoning_effort(self.cfg.model):
                 body["reasoning_effort"] = self.cfg.reasoning_effort
+            if self.cfg.enable_thinking:
+                body["chat_template_kwargs"] = {"enable_thinking": True}
         else:
             body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
             body = {
@@ -1244,6 +1252,7 @@ def parse_args() -> Config:
     p.add_argument("--run-id", help="Optional run id for artifact traceability")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
+    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode (adds chat_template_kwargs for Qwen/DeepSeek models)")
 
     args = p.parse_args()
     cfg = Config()
@@ -1276,6 +1285,7 @@ def parse_args() -> Config:
     if args.seed is not None: cfg.seed = args.seed
     if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
     if args.dry_run: cfg.dry_run = True
+    if args.enable_thinking: cfg.enable_thinking = True
 
     os.environ["LOG_LEVEL"] = args.log_level
     return cfg

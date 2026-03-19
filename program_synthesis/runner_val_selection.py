@@ -178,6 +178,7 @@ class Config:
     sanitize_generated_code: bool = field(default_factory=lambda: _env_flag("SANITIZE_GENERATED_CODE", True))
     prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
+    enable_thinking: bool = os.getenv("ENABLE_THINKING", "0") == "1"
     code0_train_mode: str = os.getenv("CODE0_TRAIN_MODE", "normal").strip().lower()
     code0_batch_size: int = int(os.getenv("CODE0_BATCH_SIZE", "0"))
 
@@ -223,6 +224,7 @@ def build_user_prompt(
             f"**Problem Statement:**\n"
             f"Given tabular input data (comma-separated feature:value pairs) and their corresponding scalar binary outputs ('0' or '1'), "
             f"find a concise Python function `f(x)` that accurately approximates the underlying relationship. "
+            f"The argument `x` is a Python dict mapping feature names to values (e.g. x['x3'] gives a float, x['x0'] gives a category string like 'c1'). "
             f"The function should not be a trainable model, but a direct logical or mathematical representation of the target function."
         )
     elif decimal:
@@ -241,11 +243,44 @@ def build_user_prompt(
         )
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.'
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}. Keep the function concise (under 30 lines, no comments). Output the JSON immediately with no other text.'
     variant_suffix = get_prompt_variant_suffix(prompt_variant)
     if variant_suffix:
         prompt += "\n\n" + variant_suffix
     return prompt
+
+
+def find_misclassified_examples(
+    code_str: str,
+    data_lines: List[str],
+    is_tabular: bool = False,
+    max_examples: int = 10,
+    sanitize: bool = True,
+) -> List[str]:
+    """Return up to max_examples lines that the code misclassifies."""
+    if not code_str or not data_lines:
+        return []
+    try:
+        fn_callable = compile_callable_from_code(code_str, sanitize=sanitize)
+    except Exception:
+        return []
+    misclassified = []
+    for line in data_lines:
+        try:
+            x, y = line.split("->")
+            x = x.strip()
+            y_int = int(y.strip())
+            if is_tabular:
+                x = _parse_tabular_input(x)
+            pred = fn_callable(x)
+            pred_int = _normalize_pred_to01(pred)
+            if pred_int != y_int:
+                misclassified.append(line.strip())
+                if len(misclassified) >= max_examples:
+                    break
+        except Exception:
+            continue
+    return misclassified
 
 
 def build_batch_revision_prompt(
@@ -255,40 +290,41 @@ def build_batch_revision_prompt(
     decimal: bool = False,
     tabular: bool = False,
     prompt_variant: str = "standard",
+    train_acc: Optional[float] = None,
+    misclassified_examples: Optional[List[str]] = None,
 ) -> str:
     if tabular:
-        problem_statement = (
-            f"**Problem Statement:**\n"
-            f"You previously wrote a Python function `f(x)` for tabular input data "
-            f"(comma-separated feature:value pairs) with scalar binary outputs ('0' or '1'). "
-            f"Revise that function using the new training batch below."
-        )
+        data_type = "tabular input data (comma-separated feature:value pairs)"
+        x_desc = "The argument `x` is a Python dict mapping feature names to values (e.g. x['x3'] gives a float, x['x0'] gives a category string like 'c1'). "
     elif decimal:
-        problem_statement = (
-            f"**Problem Statement:**\n"
-            f"You previously wrote a Python function `f(x)` for decimal input vectors "
-            f"(length {seq_len}) with scalar binary outputs ('0' or '1'). "
-            f"Revise that function using the new training batch below."
-        )
+        data_type = f"decimal input vectors (length {seq_len})"
+        x_desc = ""
     else:
-        problem_statement = (
-            f"**Problem Statement:**\n"
-            f"You previously wrote a Python function `f(x)` for binary input vectors "
-            f"(length {seq_len}) with scalar binary outputs ('0' or '1'). "
-            f"Revise that function using the new training batch below."
-        )
-    prompt = f"{problem_statement}\n"
-    prompt += (
-        "Treat the current function as code that was built for earlier batches. "
-        "Keep as much of that existing logic as possible and prefer adding small, "
-        "targeted conditions or branches to support the new batch, rather than "
-        "rewriting the function from scratch. Preserve performance on previously "
-        "seen examples when possible. Return the full revised function, not a diff "
-        "or explanation.\n"
+        data_type = f"binary input vectors (length {seq_len})"
+        x_desc = ""
+
+    prompt = (
+        f"**Problem Statement:**\n"
+        f"You previously wrote a Python function `f(x)` for {data_type} "
+        f"with scalar binary outputs ('0' or '1'). {x_desc}"
+        f"Revise that function using the feedback and new training batch below.\n\n"
     )
     prompt += "**Current Best Function:**\n```python\n" + previous_code + "\n```\n\n"
+
+    if train_acc is not None:
+        prompt += f"**Performance:** This function achieves {train_acc:.0%} accuracy on all training data seen so far.\n\n"
+
+    if misclassified_examples:
+        prompt += "**Misclassified Examples** (your function gets these WRONG — fix them):\n```\n"
+        prompt += "\n".join(misclassified_examples) + "\n```\n\n"
+
     prompt += "**New Batch Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.' 
+    prompt += (
+        "Revise the function to correctly handle both the misclassified examples above "
+        "AND the new batch, while preserving correctness on previously seen data. "
+        "Keep the function concise. Return the full revised function.\n"
+    )
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}. Keep the function concise (under 30 lines, no comments). Output the JSON immediately with no other text.'
     variant_suffix = get_prompt_variant_suffix(prompt_variant)
     if variant_suffix:
         prompt += "\n\n" + variant_suffix
@@ -887,6 +923,8 @@ class Runner:
             }
             if self.cfg.reasoning_effort and chat_completion_supports_reasoning_effort(self.cfg.model):
                 body["reasoning_effort"] = self.cfg.reasoning_effort
+            if self.cfg.enable_thinking:
+                body["chat_template_kwargs"] = {"enable_thinking": True}
         else:
             body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
             body = {
@@ -1193,6 +1231,7 @@ class Runner:
         batch_winner_rows: List[Dict[str, Any]] = []
         seen_train_lines: List[str] = []
         incumbent_code: Optional[str] = None
+        incumbent_eval: Optional[Dict[str, Any]] = None
         attempt_counter = 0
         final_best_row: Optional[Dict[str, Any]] = None
 
@@ -1264,6 +1303,16 @@ class Runner:
                     best_batch_train_acc = incumbent_row.get("current_batch_train_acc")
                     best_val_acc = incumbent_row.get("val_acc")
 
+            # Compute misclassified examples from incumbent on all seen data
+            incumbent_misclassified: List[str] = []
+            incumbent_train_acc: Optional[float] = None
+            if incumbent_code is not None and batch_index > 1:
+                incumbent_misclassified = find_misclassified_examples(
+                    incumbent_code, seen_train_lines, is_tabular=is_tabular,
+                    max_examples=10, sanitize=self.cfg.sanitize_generated_code,
+                )
+                incumbent_train_acc = incumbent_eval.get("train_acc") if incumbent_eval else None
+
             for _ in range(self.cfg.attempts):
                 attempt_counter += 1
                 if batch_index == 1:
@@ -1276,6 +1325,8 @@ class Runner:
                         decimal=is_decimal,
                         tabular=is_tabular,
                         prompt_variant=self.cfg.prompt_variant,
+                        train_acc=incumbent_train_acc,
+                        misclassified_examples=incumbent_misclassified,
                     )
                     res = await self._call_with_prompt(fn, L, attempt_counter, prompt_text)
                 code_str = extract_code_from_output(res.get("text") or "")
@@ -1656,6 +1707,7 @@ def parse_args() -> Config:
     p.add_argument("--run-id", help="Optional run id for artifact traceability")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
+    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode (adds chat_template_kwargs for Qwen/DeepSeek models)")
 
     args = p.parse_args()
     cfg = Config()
@@ -1690,6 +1742,7 @@ def parse_args() -> Config:
     if args.seed is not None: cfg.seed = args.seed
     if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
     if args.dry_run: cfg.dry_run = True
+    if args.enable_thinking: cfg.enable_thinking = True
     if cfg.code0_train_mode == "batched" and cfg.code0_batch_size <= 0:
         p.error("--code0-batch-size must be positive when --code0-train-mode batched is used")
 

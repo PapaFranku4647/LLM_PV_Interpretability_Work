@@ -17,6 +17,7 @@ from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
 from openai import OpenAI
+from typing import Mapping
 
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
@@ -326,6 +327,38 @@ def _short_code_preview(code: Optional[str], max_len: int = 240) -> Optional[str
     return compact[:max_len] + "...<truncated>"
 
 
+def _call_chat_completions_raw(
+    api_base_url: str, api_key: str, body: dict[str, Any], timeout: float = 120.0
+) -> tuple[str, dict, str | None]:
+    """Call a chat completions endpoint directly via httpx (bypasses OpenAI SDK).
+
+    Returns (response_text, response_dump, response_id).
+    """
+    import httpx
+
+    url = api_base_url.rstrip("/") + "/chat/completions"
+    headers = {
+        "Authorization": f"Bearer {api_key}",
+        "Content-Type": "application/json",
+        "Accept": "application/json",
+    }
+    response = httpx.post(url, headers=headers, json=body, timeout=timeout)
+    response.raise_for_status()
+    data = response.json()
+    text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+    return text, data, data.get("id")
+
+
+def _extract_chat_completion(response: Any) -> tuple[str, dict, str | None]:
+    """Extract text, dump dict, and id from a ChatCompletion SDK response."""
+    if isinstance(response, Mapping):
+        text = (response.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
+        return text, dict(response), response.get("id")
+    text = response.choices[0].message.content or ""
+    dump = response.model_dump() if hasattr(response, "model_dump") else {}
+    return text, dump, getattr(response, "id", None)
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description="Step 2.3 live matrix runner with equation metrics.")
     parser.add_argument("--functions", nargs="+", default=["fn_m", "fn_n", "fn_o", "fn_p", "fn_q"])
@@ -410,9 +443,9 @@ def main() -> None:
 
     repo_root = detect_repo_root()
     load_env(repo_root / ".env")
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = os.getenv("TAMU_API_KEY") or os.getenv("OPENAI_API_KEY")
     if not api_key:
-        raise SystemExit("OPENAI_API_KEY missing in env/.env")
+        raise SystemExit("TAMU_API_KEY or OPENAI_API_KEY missing in env/.env")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = repo_root / args.out_root / stamp
@@ -678,11 +711,14 @@ def main() -> None:
                         "messages": [{"role": "user", "content": thesis_prompt}],
                         "max_tokens": args.max_output_tokens,
                     }
-                    response = client.chat.completions.create(**request_body)
-                    response_text = response.choices[0].message.content or ""
-                    response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
+                    if args.api_base_url:
+                        response_text, response_dump, response_id = _call_chat_completions_raw(
+                            args.api_base_url, api_key, request_body,
+                        )
+                    else:
+                        response = client.chat.completions.create(**request_body)
+                        response_text, response_dump, response_id = _extract_chat_completion(response)
                     response_status = "completed"
-                    response_id = getattr(response, "id", None)
                 else:
                     request_body = {
                         "model": args.model,
@@ -753,6 +789,8 @@ def main() -> None:
                             text_verbosity=args.code1_text_verbosity,
                             execution_timeout_s=args.code1_exec_timeout,
                             api_mode=args.api_mode,
+                            api_base_url=args.api_base_url or "",
+                            api_key=api_key,
                         )
                     except Exception as e:
                         code1_error = str(e)

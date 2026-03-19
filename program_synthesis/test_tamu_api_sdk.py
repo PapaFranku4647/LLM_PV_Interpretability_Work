@@ -83,7 +83,7 @@ def parse_chat_completion_sse(raw_text: str) -> dict[str, Any]:
 
 
 def extract_text(result: Any) -> tuple[str, Any]:
-    if hasattr(result, "__iter__") and not hasattr(result, "choices"):
+    if hasattr(result, "__iter__") and not hasattr(result, "choices") and not isinstance(result, Mapping):
         text_parts: list[str] = []
         usage: dict[str, Any] = {}
         for chunk in result:
