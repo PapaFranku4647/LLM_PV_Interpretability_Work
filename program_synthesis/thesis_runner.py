@@ -16,12 +16,26 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from openai import OpenAI
 from typing import Mapping
 
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
     from program_synthesis.code1_verifier import build_code1_with_verification, compile_code1
+    from program_synthesis.llm_client import (
+        build_chat_completions_body,
+        build_sync_client,
+        call_llm_sync,
+        estimate_usage_cost,
+        flatten_cost_fields,
+        flatten_usage_fields,
+        infer_default_api_mode,
+        merge_cost_estimates,
+        merge_usage,
+        resolve_api_key_from_env,
+        resolve_api_version_from_env,
+        resolve_azure_endpoint_from_env,
+        resolve_default_model_from_env,
+    )
     from program_synthesis.live_eval_common import (
         FEATURE_LENGTH_BY_FN,
         TARGET_NAME_BY_FN,
@@ -44,6 +58,7 @@ try:
     )
     from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
 except ModuleNotFoundError:
+    from llm_client import build_chat_completions_body, build_sync_client, call_llm_sync, estimate_usage_cost, flatten_cost_fields, flatten_usage_fields, infer_default_api_mode, merge_cost_estimates, merge_usage, resolve_api_key_from_env, resolve_api_version_from_env, resolve_azure_endpoint_from_env, resolve_default_model_from_env  # type: ignore
     from live_eval_common import (  # type: ignore
         FEATURE_LENGTH_BY_FN,
         TARGET_NAME_BY_FN,
@@ -264,9 +279,13 @@ def run_runner_val_selection(
     ]
     if args.code0_train_mode == "batched":
         cmd.extend(["--code0-batch-size", str(args.code0_batch_size)])
-    if args.api_base_url:
+    if getattr(args, "api_base_url", ""):
         cmd.extend(["--api-base-url", args.api_base_url])
-    if args.api_mode and args.api_mode != "responses":
+    if getattr(args, "azure_endpoint", ""):
+        cmd.extend(["--azure-endpoint", args.azure_endpoint])
+    if getattr(args, "api_version", ""):
+        cmd.extend(["--api-version", args.api_version])
+    if getattr(args, "api_mode", "") and args.api_mode != "responses":
         cmd.extend(["--api-mode", args.api_mode])
     logger.info("runner_start fn=%s seed=%s run_dir=%s", fn, seed, run_dir)
     proc = subprocess.run(
@@ -307,12 +326,20 @@ def summarize_group(rows: Sequence[dict[str, Any]]) -> dict[str, Any]:
 
     metric_results = [ThesisEvaluator.result_from_mapping(r) for r in rows]
     metric_report = ThesisEvaluator.summarize(metric_results)
+    llm_prompt_tokens = sum(int(r.get("llm_prompt_tokens") or 0) for r in rows)
+    llm_completion_tokens = sum(int(r.get("llm_completion_tokens") or 0) for r in rows)
+    llm_reasoning_tokens = sum(int(r.get("llm_reasoning_tokens") or 0) for r in rows)
+    llm_total_cost_usd = sum(float(r.get("llm_estimated_total_cost_usd") or 0.0) for r in rows)
     out = metric_report.to_legacy_dict()
     out.update(
         {
             "accepted_rate": accepted_rate,
             "compile_ok_rate": compile_ok_rate,
             "label_match_rate": label_match_rate,
+            "llm_prompt_tokens": llm_prompt_tokens,
+            "llm_completion_tokens": llm_completion_tokens,
+            "llm_reasoning_tokens": llm_reasoning_tokens,
+            "llm_estimated_total_cost_usd": llm_total_cost_usd,
         }
     )
     return out
@@ -373,12 +400,16 @@ def main() -> None:
     parser.add_argument("--code0-batch-size", type=int, default=0)
     parser.add_argument("--prompt-variant", default="explain", choices=["standard", "explain", "interview", "preview", "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
+    parser.add_argument("--model", default=resolve_default_model_from_env("gpt-5-mini"))
     parser.add_argument("--api-base-url", default=os.getenv("API_BASE_URL", "").strip(),
         help="Override API base URL for OpenAI-compatible endpoints (e.g., http://localhost:1234/v1).")
-    parser.add_argument("--api-mode", default=os.getenv("API_MODE", "responses").strip().lower(),
+    parser.add_argument("--azure-endpoint", default=resolve_azure_endpoint_from_env(),
+        help="Azure OpenAI endpoint (e.g., https://...openai.azure.com/).")
+    parser.add_argument("--api-version", default=resolve_api_version_from_env(),
+        help="Azure OpenAI API version.")
+    parser.add_argument("--api-mode", default=infer_default_api_mode(),
         choices=["responses", "chat_completions"],
-        help="API mode: 'responses' for OpenAI Responses API, 'chat_completions' for OpenAI-compatible chat endpoints (LM Studio, Ollama, vLLM, etc.).")
+        help="API mode: 'responses' for OpenAI Responses API, 'chat_completions' for OpenAI-compatible chat endpoints or Azure chat completions.")
     parser.add_argument("--reasoning-effort", default="low", choices=["none", "minimal", "low", "medium", "high", "xhigh"])
     parser.add_argument("--text-verbosity", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--max-output-tokens", type=int, default=1400)
@@ -443,9 +474,9 @@ def main() -> None:
 
     repo_root = detect_repo_root()
     load_env(repo_root / ".env")
-    api_key = os.getenv("TAMU_API_KEY") or os.getenv("OPENAI_API_KEY")
+    api_key = resolve_api_key_from_env()
     if not api_key:
-        raise SystemExit("TAMU_API_KEY or OPENAI_API_KEY missing in env/.env")
+        raise SystemExit("TAMU_API_KEY, TAMUS_AI_CHAT_API_KEY, or OPENAI_API_KEY missing in env/.env")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = repo_root / args.out_root / stamp
@@ -472,10 +503,12 @@ def main() -> None:
 
     code1_model = args.code1_model.strip() or args.model
     code1_verifier_model = args.code1_verifier_model.strip() or code1_model
-    client_kwargs: dict[str, Any] = {"api_key": api_key}
-    if args.api_base_url:
-        client_kwargs["base_url"] = args.api_base_url
-    client = OpenAI(**client_kwargs)
+    client, _ = build_sync_client(
+        api_key,
+        api_base_url=args.api_base_url or "",
+        azure_endpoint=args.azure_endpoint or "",
+        api_version=args.api_version or None,
+    )
 
     case_rows: list[dict[str, Any]] = []
     combo_rows: list[dict[str, Any]] = []
@@ -706,19 +739,15 @@ def main() -> None:
                     thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
 
                 if args.api_mode == "chat_completions":
-                    request_body = {
-                        "model": args.model,
-                        "messages": [{"role": "user", "content": thesis_prompt}],
-                        "max_tokens": args.max_output_tokens,
-                    }
-                    if args.api_base_url:
-                        response_text, response_dump, response_id = _call_chat_completions_raw(
-                            args.api_base_url, api_key, request_body,
-                        )
-                    else:
-                        response = client.chat.completions.create(**request_body)
-                        response_text, response_dump, response_id = _extract_chat_completion(response)
-                    response_status = "completed"
+                    request_body = build_chat_completions_body(
+                        model=args.model,
+                        messages=[{"role": "user", "content": thesis_prompt}],
+                        max_output_tokens=args.max_output_tokens,
+                        reasoning_effort=args.reasoning_effort,
+                        stream=False,
+                        api_base_url=args.api_base_url or "",
+                        azure_endpoint=args.azure_endpoint or "",
+                    )
                 else:
                     request_body = {
                         "model": args.model,
@@ -728,11 +757,22 @@ def main() -> None:
                         "max_output_tokens": args.max_output_tokens,
                         "tool_choice": "none",
                     }
-                    response = client.responses.create(**request_body)
-                    response_text = extract_text_from_response(response)
-                    response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
-                    response_status = getattr(response, "status", None)
-                    response_id = getattr(response, "id", None)
+                llm_result = call_llm_sync(
+                    client=client,
+                    api_mode=args.api_mode,
+                    body=request_body,
+                    timeout=120.0,
+                    api_base_url=args.api_base_url or "",
+                    api_key=api_key,
+                    azure_endpoint=args.azure_endpoint or "",
+                )
+                response_text = llm_result.text
+                response_dump = llm_result.response_dump
+                response_status = llm_result.response_status or ("completed" if args.api_mode == "chat_completions" else None)
+                response_id = llm_result.response_id
+                thesis_usage = llm_result.usage
+                thesis_cost = estimate_usage_cost(thesis_usage, llm_result.model or args.model)
+                returned_model = llm_result.model or args.model
 
                 parsed_json, parse_err = parse_json_from_text(response_text)
                 has_conditions = (
@@ -791,11 +831,17 @@ def main() -> None:
                             api_mode=args.api_mode,
                             api_base_url=args.api_base_url or "",
                             api_key=api_key,
+                            azure_endpoint=args.azure_endpoint or "",
                         )
                     except Exception as e:
                         code1_error = str(e)
                 else:
                     code1_error = "missing_conditions"
+
+                code1_usage = code1_bundle.usage_total if code1_bundle else {}
+                code1_cost = code1_bundle.cost_total if code1_bundle else {}
+                total_llm_usage = merge_usage([thesis_usage, code1_usage])
+                total_llm_cost = merge_cost_estimates([thesis_cost, code1_cost])
 
                 if code1_bundle is not None and isinstance(code1_bundle.final_code1, str) and code1_bundle.final_code1.strip():
                     code1_callable, code1_compile_error = compile_code1(code1_bundle.final_code1)
@@ -845,6 +891,7 @@ def main() -> None:
                     "code0_has_hash_comment_char": code0_has_hash,
                     "code0_has_comment_tokens": code0_has_comment_tokens,
                     "code0_has_docstring": code0_has_docstring,
+                    "returned_model": returned_model,
                     "response_id": response_id,
                     "response_status": response_status,
                     "response_json_parse_error": parse_err,
@@ -883,8 +930,20 @@ def main() -> None:
                     "case_dir": str(case_dir),
                     "code1_path": str(code1_path) if code1_path else None,
                     "code1_preview": _short_code_preview(code1_text),
+                    "thesis_usage": thesis_usage,
+                    "thesis_cost": thesis_cost,
+                    "code1_usage": code1_usage,
+                    "code1_cost": code1_cost,
+                    "llm_usage": total_llm_usage,
+                    "llm_cost": total_llm_cost,
                     "code1_verification": asdict(code1_bundle) if code1_bundle else None,
                 }
+                row_out.update(flatten_usage_fields(thesis_usage, "thesis_"))
+                row_out.update(flatten_cost_fields(thesis_cost, "thesis_"))
+                row_out.update(flatten_usage_fields(code1_usage, "code1_"))
+                row_out.update(flatten_cost_fields(code1_cost, "code1_"))
+                row_out.update(flatten_usage_fields(total_llm_usage, "llm_"))
+                row_out.update(flatten_cost_fields(total_llm_cost, "llm_"))
                 case_rows.append(row_out)
                 write_json(case_dir / "summary.json", row_out)
 

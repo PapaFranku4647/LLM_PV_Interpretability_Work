@@ -16,63 +16,75 @@ export OPENAI_API_KEY=sk-...
 ```
 
 ## TAMU API setup
-If you are using the TAMU gateway, the verified raw REST path is:
+The verified TAMU endpoint for this repo is the Azure OpenAI endpoint:
 
 ```text
-https://chat-api.tamu.ai/api/chat/completions
+https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/
 ```
 
 Recommended environment variables:
 
 ```bash
 export TAMUS_AI_CHAT_API_KEY=...
-export TAMUS_AI_CHAT_API_ENDPOINT="https://chat-api.tamu.ai"
 export TAMU_API_KEY="$TAMUS_AI_CHAT_API_KEY"
+export TAMU_AZURE_ENDPOINT="https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/"
+export TAMU_API_VERSION="2024-12-01-preview"
+export OPENAI_MODEL="gpt-5.2-deep-learning-fundamentals"
 export API_MODE=chat_completions
-export API_BASE_URL="https://chat-api.tamu.ai/api"
 ```
 
 PowerShell equivalent:
 
 ```powershell
 $env:TAMUS_AI_CHAT_API_KEY = "..."
-$env:TAMUS_AI_CHAT_API_ENDPOINT = "https://chat-api.tamu.ai"
 $env:TAMU_API_KEY = $env:TAMUS_AI_CHAT_API_KEY
+$env:TAMU_AZURE_ENDPOINT = "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/"
+$env:TAMU_API_VERSION = "2024-12-01-preview"
+$env:OPENAI_MODEL = "gpt-5.2-deep-learning-fundamentals"
 $env:API_MODE = "chat_completions"
-$env:API_BASE_URL = "https://chat-api.tamu.ai/api"
 ```
 
 Minimal TAMU smoke test:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\test_tamu_api.ps1 `
-  -Mode api `
-  -Model protected.gpt-5 `
-  -ReasoningEffort minimal
+  -Model gpt-5.2-deep-learning-fundamentals `
+  -MaxTokens 32
 ```
+
+This is the fastest sanity check. The script prints token counts and `estimated_total_cost_usd`.
 
 Broader TAMU endpoint sweep:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_api_smoke_matrix.ps1 `
-  -Models protected.gpt-5 protected.gemini-2.0-flash-lite protected.gemini-2.5-flash-lite `
-  -ReasoningEfforts minimal medium `
-  -PromptSet standard
+  -Deployments gpt-5.2-deep-learning-fundamentals `
+  -ReasoningEfforts minimal `
+  -PromptSet quick `
+  -MaxTokens 64
 ```
 
 Then run the small Code0 TAMU comparison:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batch_compare.ps1 `
-  -ApiBaseUrl "https://chat-api.tamu.ai/api" `
-  -Models protected.gpt-5 `
+  -AzureEndpoint "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/" `
+  -Models gpt-5.2-deep-learning-fundamentals `
   -ReasoningEffort minimal
 ```
 
+Summarize token/cost totals from those run CSVs with:
+
+```powershell
+.\.venv-3-11\Scripts\python.exe .\program_synthesis\usage_report.py `
+  .\program_synthesis\runs_tamu_batch_compare\*\*\results.csv
+```
+
 Notes:
-- `API_BASE_URL` should be the TAMU gateway base that serves `/chat/completions`, which is `https://chat-api.tamu.ai/api` for the current TAMU docs path.
-- If both `TAMU_API_KEY` and `OPENAI_API_KEY` are set, `TAMU_API_KEY` is used.
-- For OpenAI Responses API, keep `API_MODE=responses` (default) and use your OpenAI key.
+- Azure TAMU calls use deployment names such as `gpt-5.2-deep-learning-fundamentals`.
+- If both `TAMU_API_KEY` and `OPENAI_API_KEY` are set, `TAMU_API_KEY` is used first.
+- The shared client now auto-detects Azure when `TAMU_AZURE_ENDPOINT` or `DPF_URL` is set.
+- The first tabular run may spend several minutes building the cached UCI dataset; later runs reuse the cache.
 - See `program_synthesis/TAMU_API_GUIDE.md` for a Windows-focused workflow and artifact paths.
 
 ## Minimal run
@@ -265,6 +277,7 @@ python program_synthesis/thesis_analysis.py --results-dir program_synthesis/runs
 
 ## Usage and spend tracking
 Per-attempt tokens are written to CSV columns (`prompt_tokens`, `completion_tokens`, `reasoning_tokens`, `cached_tokens`).
+Per-attempt pricing is also written to CSV (`pricing_model`, `input_rate_per_million`, `output_rate_per_million`, `estimated_input_cost_usd`, `estimated_output_cost_usd`, `estimated_total_cost_usd`).
 
 Use the usage report helper:
 

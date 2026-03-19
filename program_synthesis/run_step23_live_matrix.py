@@ -14,11 +14,19 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Iterable, Optional, Sequence
 
-from openai import OpenAI
-
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
     from program_synthesis.code1_verifier import build_code1_with_verification, compile_code1
+    from program_synthesis.llm_client import (
+        build_chat_completions_body,
+        build_sync_client,
+        call_llm_sync,
+        infer_default_api_mode,
+        resolve_api_key_from_env,
+        resolve_api_version_from_env,
+        resolve_azure_endpoint_from_env,
+        resolve_default_model_from_env,
+    )
     from program_synthesis.live_eval_common import (
         FEATURE_LENGTH_BY_FN,
         TARGET_NAME_BY_FN,
@@ -41,6 +49,7 @@ try:
     )
     from program_synthesis.thesis_evaluator import ThesisEvaluator, load_split_lines
 except ModuleNotFoundError:
+    from llm_client import build_chat_completions_body, build_sync_client, call_llm_sync, infer_default_api_mode, resolve_api_key_from_env, resolve_api_version_from_env, resolve_azure_endpoint_from_env, resolve_default_model_from_env  # type: ignore
     from live_eval_common import (  # type: ignore
         FEATURE_LENGTH_BY_FN,
         TARGET_NAME_BY_FN,
@@ -177,6 +186,14 @@ def run_runner_val_selection(
         "--out-manifest",
         str(out_manifest),
     ]
+    if getattr(args, "api_base_url", ""):
+        cmd.extend(["--api-base-url", args.api_base_url])
+    if getattr(args, "azure_endpoint", ""):
+        cmd.extend(["--azure-endpoint", args.azure_endpoint])
+    if getattr(args, "api_version", ""):
+        cmd.extend(["--api-version", args.api_version])
+    if getattr(args, "api_mode", "") and args.api_mode != "responses":
+        cmd.extend(["--api-mode", args.api_mode])
     logger.info("runner_start fn=%s seed=%s run_dir=%s", fn, seed, run_dir)
     proc = subprocess.run(
         cmd,
@@ -255,7 +272,11 @@ def main() -> None:
         choices=["standard", "explain", "interview", "preview",
                  "multipath", "subgroups", "thesis_aware", "regional", "ensemble"])
 
-    parser.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5-mini"))
+    parser.add_argument("--model", default=resolve_default_model_from_env("gpt-5-mini"))
+    parser.add_argument("--api-mode", default=infer_default_api_mode(), choices=["responses", "chat_completions"])
+    parser.add_argument("--api-base-url", default=os.getenv("API_BASE_URL", "").strip())
+    parser.add_argument("--azure-endpoint", default=resolve_azure_endpoint_from_env())
+    parser.add_argument("--api-version", default=resolve_api_version_from_env())
     parser.add_argument("--reasoning-effort", default="low", choices=["none", "minimal", "low", "medium", "high"])
     parser.add_argument("--text-verbosity", default="low", choices=["low", "medium", "high"])
     parser.add_argument("--max-output-tokens", type=int, default=1400,
@@ -302,9 +323,9 @@ def main() -> None:
 
     repo_root = detect_repo_root()
     load_env(repo_root / ".env")
-    api_key = os.getenv("OPENAI_API_KEY")
+    api_key = resolve_api_key_from_env()
     if not api_key:
-        raise SystemExit("OPENAI_API_KEY missing in env/.env")
+        raise SystemExit("TAMU_API_KEY, TAMUS_AI_CHAT_API_KEY, dpf-key, or OPENAI_API_KEY missing in env/.env")
 
     stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     out_root = repo_root / args.out_root / stamp
@@ -319,7 +340,12 @@ def main() -> None:
 
     code1_model = args.code1_model.strip() or args.model
     code1_verifier_model = args.code1_verifier_model.strip() or code1_model
-    client = OpenAI(api_key=api_key)
+    client, _ = build_sync_client(
+        api_key,
+        api_base_url=args.api_base_url or "",
+        azure_endpoint=args.azure_endpoint or "",
+        api_version=args.api_version or None,
+    )
 
     case_rows: list[dict[str, Any]] = []
     combo_rows: list[dict[str, Any]] = []
@@ -522,19 +548,38 @@ def main() -> None:
                 else:
                     thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
 
-                request_body = {
-                    "model": args.model,
-                    "input": [{"role": "user", "content": [{"type": "input_text", "text": thesis_prompt}]}],
-                    "reasoning": {"effort": args.reasoning_effort},
-                    "text": {"verbosity": args.text_verbosity},
-                    "max_output_tokens": args.max_output_tokens,
-                    "tool_choice": "none",
-                }
-                response = client.responses.create(**request_body)
-                response_text = extract_text_from_response(response)
-                response_dump = response.model_dump() if hasattr(response, "model_dump") else {}
-                response_status = getattr(response, "status", None)
-                response_id = getattr(response, "id", None)
+                if args.api_mode == "chat_completions":
+                    request_body = build_chat_completions_body(
+                        model=args.model,
+                        messages=[{"role": "user", "content": thesis_prompt}],
+                        max_output_tokens=args.max_output_tokens,
+                        reasoning_effort=args.reasoning_effort,
+                        stream=False,
+                        api_base_url=args.api_base_url or "",
+                        azure_endpoint=args.azure_endpoint or "",
+                    )
+                else:
+                    request_body = {
+                        "model": args.model,
+                        "input": [{"role": "user", "content": [{"type": "input_text", "text": thesis_prompt}]}],
+                        "reasoning": {"effort": args.reasoning_effort},
+                        "text": {"verbosity": args.text_verbosity},
+                        "max_output_tokens": args.max_output_tokens,
+                        "tool_choice": "none",
+                    }
+                llm_result = call_llm_sync(
+                    client=client,
+                    api_mode=args.api_mode,
+                    body=request_body,
+                    timeout=120.0,
+                    api_base_url=args.api_base_url or "",
+                    api_key=api_key,
+                    azure_endpoint=args.azure_endpoint or "",
+                )
+                response_text = llm_result.text
+                response_dump = llm_result.response_dump
+                response_status = llm_result.response_status or ("completed" if args.api_mode == "chat_completions" else None)
+                response_id = llm_result.response_id
 
                 parsed_json, parse_err = parse_json_from_text(response_text)
                 has_conditions = (
@@ -590,6 +635,10 @@ def main() -> None:
                             reasoning_effort=args.code1_reasoning_effort,
                             text_verbosity=args.code1_text_verbosity,
                             execution_timeout_s=args.code1_exec_timeout,
+                            api_mode=args.api_mode,
+                            api_base_url=args.api_base_url or "",
+                            api_key=api_key,
+                            azure_endpoint=args.azure_endpoint or "",
                         )
                     except Exception as e:
                         code1_error = str(e)

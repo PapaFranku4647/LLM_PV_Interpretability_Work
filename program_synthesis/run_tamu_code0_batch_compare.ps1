@@ -1,11 +1,10 @@
 param(
-    [string]$ApiKey = $env:TAMUS_AI_CHAT_API_KEY,
-    [string]$ApiBaseUrl = "https://chat-api.tamu.ai/api",
+    [string]$ApiKey = $(if ($env:TAMU_API_KEY) { $env:TAMU_API_KEY } else { $env:TAMUS_AI_CHAT_API_KEY }),
+    [Alias("ApiBaseUrl", "ApiEndpoint")]
+    [string]$AzureEndpoint = $(if ($env:TAMU_AZURE_ENDPOINT) { $env:TAMU_AZURE_ENDPOINT } elseif ($env:DPF_URL) { $env:DPF_URL } else { "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/" }),
+    [string]$ApiVersion = $(if ($env:TAMU_API_VERSION) { $env:TAMU_API_VERSION } else { "2024-12-01-preview" }),
     [string]$PythonExe = ".\\.venv-3-11\\Scripts\\python.exe",
-    [string[]]$Models = @(
-        "protected.gemini-2.0-flash-lite",
-        "protected.gemini-2.5-flash-lite"
-    ),
+    [string[]]$Models = @("gpt-5.2-deep-learning-fundamentals"),
     [string]$FunctionId = "fn_o",
     [int]$Seed = 2201,
     [int]$TrainSize = 40,
@@ -24,7 +23,7 @@ param(
 $ErrorActionPreference = "Stop"
 
 if (-not $ApiKey) {
-    throw "TAMUS_AI_CHAT_API_KEY is missing."
+    throw "Missing API key. Set TAMU_API_KEY or TAMUS_AI_CHAT_API_KEY."
 }
 if (-not $OutRoot) {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
@@ -33,7 +32,9 @@ if (-not $OutRoot) {
 
 $env:TAMU_API_KEY = $ApiKey
 $env:API_MODE = "chat_completions"
-$env:API_BASE_URL = $ApiBaseUrl
+$env:TAMU_AZURE_ENDPOINT = $AzureEndpoint
+$env:TAMU_API_VERSION = $ApiVersion
+Remove-Item Env:API_BASE_URL -ErrorAction SilentlyContinue
 
 $sharedDatasetDir = Join-Path $OutRoot "shared_datasets"
 $numBatches = [int][Math]::Ceiling($TrainSize / [double]$BatchSize)
@@ -41,6 +42,8 @@ $normalAttempts = $BatchAttempts * $numBatches
 
 Write-Host "Output root: $OutRoot"
 Write-Host "Shared dataset dir: $sharedDatasetDir"
+Write-Host "Azure endpoint: $AzureEndpoint"
+Write-Host "API version: $ApiVersion"
 Write-Host "Fairness rule: batch attempts=$BatchAttempts, batches=$numBatches, normal attempts=$normalAttempts"
 Write-Host "Runner settings: concurrency=$Concurrency, max_output_tokens=$MaxOutputTokens"
 Write-Host ""
@@ -64,6 +67,9 @@ foreach ($model in $Models) {
         --test-size $TestSize `
         --seed $Seed `
         --model $model `
+        --azure-endpoint $AzureEndpoint `
+        --api-version $ApiVersion `
+        --api-mode chat_completions `
         --reasoning-effort $ReasoningEffort `
         --concurrency $Concurrency `
         --max-output-tokens $MaxOutputTokens `
@@ -75,7 +81,7 @@ foreach ($model in $Models) {
         --out-jsonl (Join-Path $batchedRoot "results.jsonl") `
         --out-csv (Join-Path $batchedRoot "results.csv")
     if ($LASTEXITCODE -ne 0) {
-        throw "Batched run failed for model $model with exit code $LASTEXITCODE"
+        throw "Batched run failed for deployment $model with exit code $LASTEXITCODE"
     }
 
     Write-Host "Running matched normal control..."
@@ -88,6 +94,9 @@ foreach ($model in $Models) {
         --test-size $TestSize `
         --seed $Seed `
         --model $model `
+        --azure-endpoint $AzureEndpoint `
+        --api-version $ApiVersion `
+        --api-mode chat_completions `
         --reasoning-effort $ReasoningEffort `
         --concurrency $Concurrency `
         --max-output-tokens $MaxOutputTokens `
@@ -97,21 +106,29 @@ foreach ($model in $Models) {
         --out-jsonl (Join-Path $normalRoot "results.jsonl") `
         --out-csv (Join-Path $normalRoot "results.csv")
     if ($LASTEXITCODE -ne 0) {
-        throw "Normal control run failed for model $model with exit code $LASTEXITCODE"
+        throw "Normal control run failed for deployment $model with exit code $LASTEXITCODE"
     }
 
     $rows = @()
     foreach ($mode in @("batched", "normal")) {
         $csvPath = Join-Path (Join-Path $modelRoot $mode) "results.csv"
         if (Test-Path $csvPath) {
-            $summary = Import-Csv $csvPath | Where-Object { $_.is_summary -eq "True" } | Select-Object -First 1
+            $csvRows = Import-Csv $csvPath
+            $summary = $csvRows | Where-Object { $_.is_summary -eq "True" } | Select-Object -First 1
+            $attemptRows = $csvRows | Where-Object { $_.attempt -ne "" -and $_.is_summary -ne "True" }
             if ($summary) {
+                $promptTokens = ($attemptRows | Measure-Object -Property prompt_tokens -Sum).Sum
+                $completionTokens = ($attemptRows | Measure-Object -Property completion_tokens -Sum).Sum
+                $estimatedCost = ($attemptRows | Measure-Object -Property estimated_total_cost_usd -Sum).Sum
                 $rows += [PSCustomObject]@{
-                    model = $model
+                    deployment = $model
                     mode = $mode
                     train_acc = $summary.train_acc
                     val_acc = $summary.val_acc
                     test_acc = $summary.test_acc
+                    prompt_tokens = $promptTokens
+                    completion_tokens = $completionTokens
+                    estimated_total_cost_usd = $estimatedCost
                     csv = $csvPath
                 }
             }
@@ -124,4 +141,4 @@ foreach ($model in $Models) {
 }
 
 Write-Host "Done."
-Write-Host "Budget note: the default settings are intentionally tiny to stay well under the $5 range on low-cost TAMU models."
+Write-Host "Budget note: the default settings are intentionally tiny. With one Azure deployment and small max token caps, this should stay low-cost."

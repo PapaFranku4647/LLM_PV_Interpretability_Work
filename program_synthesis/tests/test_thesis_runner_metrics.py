@@ -22,7 +22,11 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             self.args = args
             self.kwargs = kwargs
 
+    class DummyAzureOpenAI(DummyOpenAI):
+        pass
+
     openai_mod.OpenAI = DummyOpenAI
+    openai_mod.AzureOpenAI = DummyAzureOpenAI
     return {"openai": openai_mod}
 
 

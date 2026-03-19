@@ -9,8 +9,17 @@ from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
+    from program_synthesis.llm_client import (
+        LLMCallResult,
+        build_chat_completions_body,
+        call_llm_sync,
+        estimate_usage_cost,
+        merge_cost_estimates,
+        merge_usage,
+    )
 except ModuleNotFoundError:
     from code_normalizer import sanitize_generated_code  # type: ignore
+    from llm_client import LLMCallResult, build_chat_completions_body, call_llm_sync, estimate_usage_cost, merge_cost_estimates, merge_usage  # type: ignore
 
 
 Judgement = Literal["pass", "fail", "uncertain"]
@@ -177,6 +186,10 @@ class Code1GenerationResult:
     code1: Optional[str]
     compile_ok: bool
     compile_error: Optional[str]
+    usage: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
+    response_id: Optional[str] = None
+    response_status: Optional[str] = None
 
 
 @dataclass
@@ -191,6 +204,10 @@ class SemanticVerificationResult:
     judgement: Judgement
     reason: str
     testcases: list[TestCase] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
+    response_id: Optional[str] = None
+    response_status: Optional[str] = None
 
 
 @dataclass
@@ -209,6 +226,12 @@ class Code1VerificationBundle:
     semantic_result: Optional[SemanticVerificationResult]
     testcase_result: Optional[TestcaseVerificationResult]
     error: Optional[str]
+    writer_usage: dict[str, Any] = field(default_factory=dict)
+    verifier_usage: dict[str, Any] = field(default_factory=dict)
+    usage_total: dict[str, Any] = field(default_factory=dict)
+    writer_cost: dict[str, Any] = field(default_factory=dict)
+    verifier_cost: dict[str, Any] = field(default_factory=dict)
+    cost_total: dict[str, Any] = field(default_factory=dict)
 
 
 def _obj_get(obj: Any, key: str) -> Any:
@@ -290,28 +313,18 @@ def _request_json_object(
     api_mode: str = "responses",
     api_base_url: str = "",
     api_key: str = "",
-) -> tuple[Optional[dict[str, Any]], Optional[str], str]:
+    azure_endpoint: str = "",
+) -> tuple[Optional[dict[str, Any]], Optional[str], LLMCallResult]:
     if api_mode == "chat_completions":
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_output_tokens,
-        }
-        if api_base_url and api_key:
-            import httpx
-            url = api_base_url.rstrip("/") + "/chat/completions"
-            headers = {
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-                "Accept": "application/json",
-            }
-            resp = httpx.post(url, headers=headers, json=body, timeout=120.0)
-            resp.raise_for_status()
-            data = resp.json()
-            response_text = (data.get("choices") or [{}])[0].get("message", {}).get("content", "") or ""
-        else:
-            response = client.chat.completions.create(**body)
-            response_text = response.choices[0].message.content or ""
+        body = build_chat_completions_body(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            stream=False,
+            api_base_url=api_base_url,
+            azure_endpoint=azure_endpoint,
+        )
     else:
         body = {
             "model": model,
@@ -321,10 +334,17 @@ def _request_json_object(
             "max_output_tokens": max_output_tokens,
             "tool_choice": "none",
         }
-        response = client.responses.create(**body)
-        response_text = _extract_text_from_response(response)
-    parsed, parse_error = _parse_json_dict(response_text)
-    return parsed, parse_error, response_text
+    llm_result = call_llm_sync(
+        client=client,
+        api_mode=api_mode,
+        body=body,
+        timeout=120.0,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+    )
+    parsed, parse_error = _parse_json_dict(llm_result.text)
+    return parsed, parse_error, llm_result
 
 
 _CATEGORICAL_VALUE_RE = re.compile(r"=c\d+")
@@ -520,6 +540,7 @@ def generate_code1_from_thesis(
     api_mode: str = "responses",
     api_base_url: str = "",
     api_key: str = "",
+    azure_endpoint: str = "",
 ) -> Code1GenerationResult:
     prompt = _build_code1_writer_prompt(
         thesis_conditions=thesis_conditions,
@@ -527,7 +548,7 @@ def generate_code1_from_thesis(
         sample_repr=sample_repr,
         feedback=feedback,
     )
-    parsed, parse_error, _ = _request_json_object(
+    parsed, parse_error, llm_result = _request_json_object(
         client=client,
         model=model,
         prompt=prompt,
@@ -537,12 +558,19 @@ def generate_code1_from_thesis(
         api_mode=api_mode,
         api_base_url=api_base_url,
         api_key=api_key,
+        azure_endpoint=azure_endpoint,
     )
+    usage = llm_result.usage
+    cost = estimate_usage_cost(usage, llm_result.model or model)
     if not isinstance(parsed, dict):
         return Code1GenerationResult(
             code1=None,
             compile_ok=False,
             compile_error=f"writer_json_parse_error: {parse_error}",
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     raw_code = parsed.get("code1")
@@ -551,6 +579,10 @@ def generate_code1_from_thesis(
             code1=None,
             compile_ok=False,
             compile_error="writer_missing_code1_field",
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     code1 = sanitize_generated_code(raw_code)
@@ -559,6 +591,10 @@ def generate_code1_from_thesis(
         code1=code1,
         compile_ok=compile_error is None,
         compile_error=compile_error,
+        usage=usage,
+        cost=cost,
+        response_id=llm_result.response_id,
+        response_status=llm_result.response_status,
     )
 
 
@@ -575,13 +611,14 @@ def verify_code1_semantics(
     api_mode: str = "responses",
     api_base_url: str = "",
     api_key: str = "",
+    azure_endpoint: str = "",
 ) -> SemanticVerificationResult:
     prompt = _build_code1_verifier_prompt(
         thesis_conditions=thesis_conditions,
         thesis_label=thesis_label,
         code1=code1,
     )
-    parsed, parse_error, _ = _request_json_object(
+    parsed, parse_error, llm_result = _request_json_object(
         client=client,
         model=verifier_model,
         prompt=prompt,
@@ -589,12 +626,21 @@ def verify_code1_semantics(
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
         api_mode=api_mode,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
     )
+    usage = llm_result.usage
+    cost = estimate_usage_cost(usage, llm_result.model or verifier_model)
     if not isinstance(parsed, dict):
         return SemanticVerificationResult(
             judgement="uncertain",
             reason=f"verifier_json_parse_error: {parse_error}",
             testcases=[],
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     raw_judgement = str(parsed.get("judgement", "")).strip().lower()
@@ -607,7 +653,15 @@ def verify_code1_semantics(
     testcases, testcase_errors = _normalize_testcases(parsed.get("testcases"))
     if testcase_errors:
         reason = f"{reason} | testcase_parse_errors: {', '.join(testcase_errors)}"
-    return SemanticVerificationResult(judgement=judgement, reason=reason, testcases=testcases)
+    return SemanticVerificationResult(
+        judgement=judgement,
+        reason=reason,
+        testcases=testcases,
+        usage=usage,
+        cost=cost,
+        response_id=llm_result.response_id,
+        response_status=llm_result.response_status,
+    )
 
 
 def verify_code1_with_testcases(
@@ -711,6 +765,7 @@ def build_code1_with_verification(
     api_mode: str = "responses",
     api_base_url: str = "",
     api_key: str = "",
+    azure_endpoint: str = "",
 ) -> Code1VerificationBundle:
     max_attempts = 2 if retry_once else 1
     feedback = ""
@@ -719,6 +774,10 @@ def build_code1_with_verification(
     last_testcase: Optional[TestcaseVerificationResult] = None
     final_code1: Optional[str] = None
     final_error: Optional[str] = None
+    writer_usages: list[dict[str, Any]] = []
+    verifier_usages: list[dict[str, Any]] = []
+    writer_costs: list[dict[str, Any]] = []
+    verifier_costs: list[dict[str, Any]] = []
 
     for attempt_idx in range(1, max_attempts + 1):
         generation = generate_code1_from_thesis(
@@ -734,8 +793,11 @@ def build_code1_with_verification(
             api_mode=api_mode,
             api_base_url=api_base_url,
             api_key=api_key,
+            azure_endpoint=azure_endpoint,
         )
         final_code1 = generation.code1
+        writer_usages.append(generation.usage)
+        writer_costs.append(generation.cost)
 
         if not generation.compile_ok or not generation.code1:
             final_error = generation.compile_error or "code1_generation_failed"
@@ -760,8 +822,11 @@ def build_code1_with_verification(
             api_mode=api_mode,
             api_base_url=api_base_url,
             api_key=api_key,
+            azure_endpoint=azure_endpoint,
         )
         last_semantic = semantic
+        verifier_usages.append(semantic.usage)
+        verifier_costs.append(semantic.cost)
 
         testcase_result = verify_code1_with_testcases(
             code1_callable=code1_callable,
@@ -775,6 +840,12 @@ def build_code1_with_verification(
         testcase_pass = testcase_result.total > 0 and testcase_result.failed == 0 and testcase_balance_ok
 
         if semantic_pass and testcase_pass:
+            writer_usage = merge_usage(writer_usages)
+            verifier_usage = merge_usage(verifier_usages)
+            usage_total = merge_usage([writer_usage, verifier_usage])
+            writer_cost = merge_cost_estimates(writer_costs)
+            verifier_cost = merge_cost_estimates(verifier_costs)
+            cost_total = merge_cost_estimates([writer_cost, verifier_cost])
             return Code1VerificationBundle(
                 final_code1=generation.code1,
                 accepted=True,
@@ -782,6 +853,12 @@ def build_code1_with_verification(
                 semantic_result=semantic,
                 testcase_result=testcase_result,
                 error=None,
+                writer_usage=writer_usage,
+                verifier_usage=verifier_usage,
+                usage_total=usage_total,
+                writer_cost=writer_cost,
+                verifier_cost=verifier_cost,
+                cost_total=cost_total,
             )
 
         failure_reasons = []
@@ -796,6 +873,12 @@ def build_code1_with_verification(
         final_error = "; ".join(failure_reasons) or "verification_failed"
         feedback = _build_retry_feedback(final_error, semantic, testcase_result)
 
+    writer_usage = merge_usage(writer_usages)
+    verifier_usage = merge_usage(verifier_usages)
+    usage_total = merge_usage([writer_usage, verifier_usage])
+    writer_cost = merge_cost_estimates(writer_costs)
+    verifier_cost = merge_cost_estimates(verifier_costs)
+    cost_total = merge_cost_estimates([writer_cost, verifier_cost])
     return Code1VerificationBundle(
         final_code1=final_code1,
         accepted=False,
@@ -803,4 +886,10 @@ def build_code1_with_verification(
         semantic_result=last_semantic,
         testcase_result=last_testcase,
         error=final_error or "verification_failed_after_retries",
+        writer_usage=writer_usage,
+        verifier_usage=verifier_usage,
+        usage_total=usage_total,
+        writer_cost=writer_cost,
+        verifier_cost=verifier_cost,
+        cost_total=cost_total,
     )

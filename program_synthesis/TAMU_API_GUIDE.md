@@ -1,19 +1,13 @@
 # TAMU API Guide
 
-This guide captures the verified TAMU path and the scripts to move from a single successful completion to repeatable Code0 experiments.
+This guide captures the verified TAMU Azure endpoint and the scripts to move from a single successful completion to repeatable Code0 experiments.
 
 ## Verified endpoint
 
-The working chat completions path is:
+The working endpoint is:
 
 ```text
-https://chat-api.tamu.ai/api/chat/completions
-```
-
-For runner code that appends `"/chat/completions"` to a base URL, use:
-
-```text
-https://chat-api.tamu.ai/api
+https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/
 ```
 
 ## Environment setup
@@ -22,10 +16,11 @@ PowerShell:
 
 ```powershell
 $env:TAMUS_AI_CHAT_API_KEY = "<your TAMU key>"
-$env:TAMUS_AI_CHAT_API_ENDPOINT = "https://chat-api.tamu.ai"
 $env:TAMU_API_KEY = $env:TAMUS_AI_CHAT_API_KEY
+$env:TAMU_AZURE_ENDPOINT = "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/"
+$env:TAMU_API_VERSION = "2024-12-01-preview"
+$env:OPENAI_MODEL = "gpt-5.2-deep-learning-fundamentals"
 $env:API_MODE = "chat_completions"
-$env:API_BASE_URL = "https://chat-api.tamu.ai/api"
 ```
 
 Optional UTF-8 console fix if response text shows mojibake like `â`:
@@ -38,23 +33,22 @@ $OutputEncoding = [Console]::OutputEncoding
 
 ## 1. Exact raw REST smoke test
 
-This stays closest to the TAMU docs and verifies your key, endpoint, and model.
+This verifies your key, Azure endpoint, and deployment.
 
 ```powershell
 $body = @{
-    model = "protected.gpt-5"
-    stream = $false
     messages = @(
         @{
             role = "user"
-            content = "Why is the sky blue?"
+            content = "Reply with exactly: TAMU API OK"
         }
     )
+    max_completion_tokens = 32
 } | ConvertTo-Json -Depth 10
 
-$response = Invoke-RestMethod -Uri "$env:TAMUS_AI_CHAT_API_ENDPOINT/api/chat/completions" `
+$response = Invoke-RestMethod -Uri "$($env:TAMU_AZURE_ENDPOINT.TrimEnd('/'))/openai/deployments/$env:OPENAI_MODEL/chat/completions?api-version=$env:TAMU_API_VERSION" `
     -Headers @{
-        Authorization = "Bearer $env:TAMUS_AI_CHAT_API_KEY"
+        "api-key" = $env:TAMUS_AI_CHAT_API_KEY
         "Content-Type" = "application/json"
     } `
     -Method Post `
@@ -64,19 +58,18 @@ $response | ConvertTo-Json -Depth 100
 ```
 
 Expected success signals:
-- `object = "chat.completion"`
 - `choices[0].message.content` is populated
 - `usage` is populated
+- no `401 Unauthorized`
 
 ## 2. Scripted smoke test
 
-This uses the repo helper and will try `/api` first.
+This uses the repo helper and hits the Azure deployment directly.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\test_tamu_api.ps1 `
-  -Mode api `
-  -Model protected.gpt-5 `
-  -ReasoningEffort minimal `
+  -Model gpt-5.2-deep-learning-fundamentals `
+  -MaxTokens 32 `
   -Prompt "Reply with exactly: TAMU API OK"
 ```
 
@@ -84,15 +77,13 @@ Useful variants:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\test_tamu_api.ps1 `
-  -Mode api `
-  -Model protected.gemini-2.0-flash-lite `
+  -Model gpt-5.2-deep-learning-fundamentals `
   -Prompt "Why is the sky blue?"
 ```
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\test_tamu_api.ps1 `
-  -Mode auto `
-  -Model protected.gpt-5 `
+  -Model gpt-5.2-deep-learning-fundamentals `
   -ReasoningEffort medium `
   -MaxTokens 256
 ```
@@ -103,15 +94,14 @@ Use this when one message works and you want a broader stability check.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_api_smoke_matrix.ps1 `
-  -Models protected.gpt-5 protected.gemini-2.0-flash-lite protected.gemini-2.5-flash-lite `
-  -ReasoningEfforts minimal medium `
-  -PromptSet standard `
-  -MaxTokens 512 `
+  -Deployments gpt-5.2-deep-learning-fundamentals `
+  -ReasoningEfforts minimal `
+  -PromptSet quick `
+  -MaxTokens 64 `
   -PauseBetweenCallsMs 500
 ```
 
 Artifacts:
-- `program_synthesis/runs_tamu_api_smoke/<timestamp>/models.json`
 - `program_synthesis/runs_tamu_api_smoke/<timestamp>/results.jsonl`
 - `program_synthesis/runs_tamu_api_smoke/<timestamp>/results.csv`
 - `program_synthesis/runs_tamu_api_smoke/<timestamp>/manifest.json`
@@ -122,6 +112,7 @@ Fields to inspect in `results.csv`:
 - `finish_reason`
 - `total_tokens`
 - `reasoning_tokens`
+- `estimated_total_cost_usd`
 - `elapsed_ms`
 - `reply_preview`
 - `error`
@@ -132,8 +123,8 @@ After the smoke test is stable, move to the smallest end-to-end Code0 comparison
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batch_compare.ps1 `
-  -ApiBaseUrl "https://chat-api.tamu.ai/api" `
-  -Models protected.gpt-5 `
+  -AzureEndpoint "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/" `
+  -Models gpt-5.2-deep-learning-fundamentals `
   -FunctionId fn_o `
   -TrainSize 20 `
   -ValSize 50 `
@@ -146,14 +137,21 @@ powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batc
 
 This is intentionally tiny. The goal is to verify the pipeline, not to measure final research quality.
 
+After the run, summarize token/cost totals with:
+
+```powershell
+.\.venv-3-11\Scripts\python.exe .\program_synthesis\usage_report.py `
+  .\program_synthesis\runs_tamu_batch_compare\*\*\results.csv
+```
+
 ## 5. Larger TAMU Code0 compare
 
 Only do this after the tiny run works and token cost looks reasonable.
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batch_compare.ps1 `
-  -ApiBaseUrl "https://chat-api.tamu.ai/api" `
-  -Models protected.gpt-5 `
+  -AzureEndpoint "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/" `
+  -Models gpt-5.2-deep-learning-fundamentals `
   -FunctionId fn_o `
   -TrainSize 100 `
   -ValSize 100 `
@@ -168,19 +166,22 @@ powershell -ExecutionPolicy Bypass -File .\program_synthesis\run_tamu_code0_batc
 
 If `Invoke-RestMethod` fails before returning JSON:
 - check `TAMUS_AI_CHAT_API_KEY`
-- check `TAMUS_AI_CHAT_API_ENDPOINT`
-- confirm the path is `/api/chat/completions`
+- check `TAMU_AZURE_ENDPOINT`
+- check `TAMU_API_VERSION`
+- confirm you are using `api-key`, not `Authorization: Bearer`
 
 If the response works in raw REST but fails in the runner:
 - confirm `API_MODE=chat_completions`
-- confirm `API_BASE_URL=https://chat-api.tamu.ai/api`
+- confirm `TAMU_AZURE_ENDPOINT=https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/`
+- clear any stale `API_BASE_URL`
+- expect the first CDC/UCI-backed tabular run to be slower because it builds the local dataset cache
 - rerun `test_tamu_api_sdk.py` before the full compare script
 
 Python smoke test:
 
 ```powershell
 .\.venv-3-11\Scripts\python.exe .\program_synthesis\test_tamu_api_sdk.py `
-  --model protected.gpt-5 `
+  --model gpt-5.2-deep-learning-fundamentals `
   --reasoning-effort minimal `
   --max-tokens 64
 ```

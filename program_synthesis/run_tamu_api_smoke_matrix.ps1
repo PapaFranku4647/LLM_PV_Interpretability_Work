@@ -1,47 +1,28 @@
 param(
-    [string]$ApiKey = $env:TAMUS_AI_CHAT_API_KEY,
-    [string]$ApiEndpoint = $env:TAMUS_AI_CHAT_API_ENDPOINT,
-    [string[]]$Models = @(
-        "protected.gpt-5",
-        "protected.gemini-2.0-flash-lite",
-        "protected.gemini-2.5-flash-lite"
-    ),
-    [string[]]$ReasoningEfforts = @("minimal", "medium"),
+    [string]$ApiKey = $(if ($env:TAMU_API_KEY) { $env:TAMU_API_KEY } else { $env:TAMUS_AI_CHAT_API_KEY }),
+    [Alias("ApiEndpoint")]
+    [string]$AzureEndpoint = $(if ($env:TAMU_AZURE_ENDPOINT) { $env:TAMU_AZURE_ENDPOINT } elseif ($env:DPF_URL) { $env:DPF_URL } else { "https://tamu-it-ae-ai-prod-prod-eastus2.openai.azure.com/" }),
+    [string]$ApiVersion = $(if ($env:TAMU_API_VERSION) { $env:TAMU_API_VERSION } else { "2024-12-01-preview" }),
+    [Alias("Models")]
+    [string[]]$Deployments = @("gpt-5.2-deep-learning-fundamentals"),
+    [string[]]$ReasoningEfforts = @("minimal"),
     [ValidateSet("quick", "standard")]
-    [string]$PromptSet = "standard",
-    [int]$MaxTokens = 512,
+    [string]$PromptSet = "quick",
+    [int]$MaxTokens = 64,
     [int]$PauseBetweenCallsMs = 0,
     [string]$OutRoot = ""
 )
 
 $ErrorActionPreference = "Stop"
 
-function Get-ErrorResponseText {
-    param([System.Exception]$Exception)
-
-    $response = $Exception.Response
-    if ($null -eq $response) {
-        return $null
-    }
-
-    try {
-        $stream = $response.GetResponseStream()
-        if ($null -eq $stream) {
-            return $null
-        }
-        $reader = New-Object System.IO.StreamReader($stream)
-        $text = $reader.ReadToEnd()
-        $reader.Close()
-        return $text
-    } catch {
-        return $null
-    }
-}
-
 function Test-ModelSupportsReasoningEffort {
     param([string]$ModelName)
 
-    $lowered = $ModelName.ToLowerInvariant()
+    $lowered = [string]$ModelName
+    if (-not $lowered) {
+        $lowered = ""
+    }
+    $lowered = $lowered.ToLowerInvariant()
     return (
         $lowered.StartsWith("o3") -or
         $lowered.StartsWith("o4") -or
@@ -51,29 +32,58 @@ function Test-ModelSupportsReasoningEffort {
     )
 }
 
-function Get-AvailableModelIds {
-    param([object]$ModelsResponse)
+function Get-ModelPricing {
+    param([string]$ModelName)
 
-    $modelIds = @()
-    if ($ModelsResponse -is [System.Collections.IEnumerable] -and -not ($ModelsResponse -is [string])) {
-        foreach ($item in $ModelsResponse) {
-            if ($null -ne $item.id) {
-                $modelIds += [string]$item.id
-            } elseif ($null -ne $item.name) {
-                $modelIds += [string]$item.name
-            }
+    $lowered = [string]$ModelName
+    if (-not $lowered) {
+        $lowered = ""
+    }
+    $lowered = $lowered.ToLowerInvariant()
+    if ($lowered -match "gpt-5\.2") { return @{ name = "gpt-5.2"; input = 1.75; output = 14.00 } }
+    if ($lowered -match "gpt-5\.1") { return @{ name = "gpt-5.1"; input = 1.25; output = 10.00 } }
+    if ($lowered -match "gpt-5") { return @{ name = "gpt-5"; input = 1.25; output = 10.00 } }
+    if ($lowered -match "gpt-4\.1") { return @{ name = "gpt-4.1"; input = 2.00; output = 8.00 } }
+    if ($lowered -match "gpt-4o") { return @{ name = "gpt-4o"; input = 2.50; output = 10.00 } }
+    if ($lowered -match "o3-mini") { return @{ name = "o3-mini"; input = 1.10; output = 4.40 } }
+    if ($lowered -match "o4-mini") { return @{ name = "o4-mini"; input = 1.10; output = 4.40 } }
+    return $null
+}
+
+function Get-EstimatedCost {
+    param(
+        [string]$ModelName,
+        [object]$PromptTokens,
+        [object]$CompletionTokens
+    )
+
+    $pricing = Get-ModelPricing -ModelName $ModelName
+    if ($null -eq $pricing) {
+        return [PSCustomObject]@{
+            pricing_model = $null
+            input_rate_per_million = $null
+            output_rate_per_million = $null
+            estimated_input_cost_usd = $null
+            estimated_output_cost_usd = $null
+            estimated_total_cost_usd = $null
         }
     }
-    if ($ModelsResponse.data) {
-        foreach ($item in $ModelsResponse.data) {
-            if ($null -ne $item.id) {
-                $modelIds += [string]$item.id
-            } elseif ($null -ne $item.name) {
-                $modelIds += [string]$item.name
-            }
-        }
+
+    $prompt = 0.0
+    $completion = 0.0
+    if ($PromptTokens -ne $null -and "$PromptTokens" -ne "") { $prompt = [double]$PromptTokens }
+    if ($CompletionTokens -ne $null -and "$CompletionTokens" -ne "") { $completion = [double]$CompletionTokens }
+    $inputCost = ($prompt / 1000000.0) * [double]$pricing.input
+    $outputCost = ($completion / 1000000.0) * [double]$pricing.output
+
+    return [PSCustomObject]@{
+        pricing_model = $pricing.name
+        input_rate_per_million = [double]$pricing.input
+        output_rate_per_million = [double]$pricing.output
+        estimated_input_cost_usd = $inputCost
+        estimated_output_cost_usd = $outputCost
+        estimated_total_cost_usd = $inputCost + $outputCost
     }
-    return $modelIds | Sort-Object -Unique
 }
 
 function Get-TextContent {
@@ -122,81 +132,54 @@ function New-PromptCases {
             text = "Reply with exactly: TAMU API OK"
         },
         @{
-            label = "why_sky_blue"
-            text = "Why is the sky blue?"
+            label = "small_reasoning"
+            text = "In one sentence, explain why 2 + 2 = 4."
         }
     )
 }
 
-if (-not $ApiEndpoint) {
-    $ApiEndpoint = "https://chat-api.tamu.ai"
-}
 if (-not $ApiKey) {
-    throw "TAMUS_AI_CHAT_API_KEY is missing."
+    throw "Missing API key. Set TAMU_API_KEY or TAMUS_AI_CHAT_API_KEY."
 }
 if (-not $OutRoot) {
     $stamp = Get-Date -Format "yyyyMMdd_HHmmss"
     $OutRoot = "program_synthesis/runs_tamu_api_smoke/$stamp"
 }
 
-$apiRoot = $ApiEndpoint.TrimEnd("/")
-$headers = @{
-    Authorization = "Bearer $ApiKey"
-    "Content-Type" = "application/json"
-}
-
 New-Item -ItemType Directory -Force -Path $OutRoot | Out-Null
-$modelsPath = Join-Path $OutRoot "models.json"
 $resultsJsonlPath = Join-Path $OutRoot "results.jsonl"
 $resultsCsvPath = Join-Path $OutRoot "results.csv"
 $manifestPath = Join-Path $OutRoot "manifest.json"
 
-Write-Host "Listing models from $apiRoot/api/models ..."
-$modelsResponse = Invoke-RestMethod -Uri "$apiRoot/api/models" -Headers $headers -Method Get
-$modelsResponse | ConvertTo-Json -Depth 100 | Set-Content -Path $modelsPath -Encoding UTF8
-$availableModels = Get-AvailableModelIds -ModelsResponse $modelsResponse
-
-Write-Host "Found $($availableModels.Count) models."
-
-$selectedModels = @()
-foreach ($model in $Models) {
-    if ($availableModels -contains $model) {
-        $selectedModels += $model
-    } else {
-        Write-Warning "Skipping unavailable model '$model'."
-    }
-}
-
-if ($selectedModels.Count -eq 0) {
-    throw "None of the requested models were available."
-}
-
 $promptCases = New-PromptCases -SelectedPromptSet $PromptSet
 $results = New-Object System.Collections.Generic.List[object]
+$headers = @{
+    "api-key" = $ApiKey
+    "Content-Type" = "application/json"
+}
 
-foreach ($model in $selectedModels) {
+foreach ($deployment in $Deployments) {
     $efforts = @("")
-    if (Test-ModelSupportsReasoningEffort -ModelName $model) {
+    if (Test-ModelSupportsReasoningEffort -ModelName $deployment) {
         $efforts = $ReasoningEfforts
     }
 
     foreach ($effort in $efforts) {
         foreach ($promptCase in $promptCases) {
             $body = @{
-                model = $model
-                stream = $false
-                max_tokens = $MaxTokens
                 messages = @(
                     @{
                         role = "user"
                         content = $promptCase.text
                     }
                 )
+                max_completion_tokens = $MaxTokens
             }
             if ($effort) {
                 $body.reasoning_effort = $effort
             }
 
+            $requestUri = "$($AzureEndpoint.TrimEnd('/'))/openai/deployments/$deployment/chat/completions?api-version=$ApiVersion"
             $startedAt = Get-Date
             $status = "ok"
             $responseModel = $null
@@ -207,16 +190,15 @@ foreach ($model in $selectedModels) {
             $totalTokens = $null
             $reasoningTokens = $null
             $errorText = $null
-
             $effortLabel = if ($effort) { $effort } else { "default" }
 
             Write-Host ""
             Write-Host "=== Request ==="
-            Write-Host "model=$model prompt=$($promptCase.label) reasoning=$effortLabel"
+            Write-Host "deployment=$deployment prompt=$($promptCase.label) reasoning=$effortLabel"
 
             try {
                 $response = Invoke-RestMethod `
-                    -Uri "$apiRoot/api/chat/completions" `
+                    -Uri $requestUri `
                     -Headers $headers `
                     -Method Post `
                     -Body ($body | ConvertTo-Json -Depth 20)
@@ -236,10 +218,7 @@ foreach ($model in $selectedModels) {
                 }
             } catch {
                 $status = "error"
-                $errorText = Get-ErrorResponseText -Exception $_.Exception
-                if (-not $errorText) {
-                    $errorText = $_.Exception.Message
-                }
+                $errorText = $_.Exception.Message
             }
 
             $elapsedMs = [int]((Get-Date) - $startedAt).TotalMilliseconds
@@ -248,10 +227,12 @@ foreach ($model in $selectedModels) {
             } else {
                 $null
             }
+            $pricingModelName = if ($responseModel) { $responseModel } else { $deployment }
+            $pricing = Get-EstimatedCost -ModelName $pricingModelName -PromptTokens $promptTokens -CompletionTokens $completionTokens
 
             $row = [PSCustomObject]@{
                 ts = $startedAt.ToString("s")
-                model = $model
+                deployment = $deployment
                 requested_reasoning_effort = $effortLabel
                 prompt_label = $promptCase.label
                 status = $status
@@ -262,6 +243,12 @@ foreach ($model in $selectedModels) {
                 completion_tokens = $completionTokens
                 total_tokens = $totalTokens
                 reasoning_tokens = $reasoningTokens
+                pricing_model = $pricing.pricing_model
+                input_rate_per_million = $pricing.input_rate_per_million
+                output_rate_per_million = $pricing.output_rate_per_million
+                estimated_input_cost_usd = $pricing.estimated_input_cost_usd
+                estimated_output_cost_usd = $pricing.estimated_output_cost_usd
+                estimated_total_cost_usd = $pricing.estimated_total_cost_usd
                 reply_preview = $replyPreview
                 error = $errorText
             }
@@ -279,27 +266,31 @@ $results | Export-Csv -Path $resultsCsvPath -NoTypeInformation -Encoding UTF8
 
 $manifest = [PSCustomObject]@{
     out_root = $OutRoot
-    api_endpoint = $ApiEndpoint
-    models = $selectedModels
+    azure_endpoint = $AzureEndpoint
+    api_version = $ApiVersion
+    deployments = $Deployments
     reasoning_efforts = $ReasoningEfforts
     prompt_set = $PromptSet
     max_tokens = $MaxTokens
     pause_between_calls_ms = $PauseBetweenCallsMs
     results_csv = $resultsCsvPath
     results_jsonl = $resultsJsonlPath
-    models_json = $modelsPath
 }
 $manifest | ConvertTo-Json -Depth 20 | Set-Content -Path $manifestPath -Encoding UTF8
 
 Write-Host ""
 Write-Host "=== Summary ==="
 $results |
-    Select-Object model, requested_reasoning_effort, prompt_label, status, finish_reason, total_tokens, reasoning_tokens, elapsed_ms |
+    Select-Object deployment, requested_reasoning_effort, prompt_label, status, finish_reason, total_tokens, reasoning_tokens, estimated_total_cost_usd, elapsed_ms |
     Format-Table -AutoSize
+
+$totalEstimatedCost = ($results | Measure-Object -Property estimated_total_cost_usd -Sum).Sum
+$totalEstimatedCostValue = if ($null -ne $totalEstimatedCost) { [double]$totalEstimatedCost } else { 0.0 }
+Write-Host ""
+Write-Host ("Estimated total cost (USD): {0:N6}" -f $totalEstimatedCostValue)
 
 Write-Host ""
 Write-Host "Artifacts:"
-Write-Host "  models_json = $modelsPath"
 Write-Host "  results_jsonl = $resultsJsonlPath"
 Write-Host "  results_csv = $resultsCsvPath"
 Write-Host "  manifest_json = $manifestPath"
