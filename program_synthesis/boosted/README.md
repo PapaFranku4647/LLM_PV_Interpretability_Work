@@ -159,31 +159,36 @@ of full-train/test accuracy.
 ## Batch-256 Sampler Comparison
 
 ```bash
-python program_synthesis/boosted/boosted_runner.py \
-  --provider openai \
-  --api-mode chat_completions \
-  --functions fn_o \
-  --lengths 21 \
-  --train-size 10000 \
-  --val-size 2000 \
-  --test-size 10000 \
-  --seed 42 \
-  --batch-sizes 256 \
-  --boost-rounds 4 \
-  --round-retries 4 \
-  --resample-each-retry \
-  --sampling-strategy stratified_diverse \
-  --candidate-selection best_ensemble_val \
-  --ensemble-val-drop-tolerance 0.0025 \
-  --tabular-representation semantic \
-  --max-weak-error 0.49 \
-  --early-stop-val-patience 2 \
-  --restore-best-val-ensemble \
-  --reasoning-effort medium \
-  --max-output-tokens 20000 \
-  --no-tools \
-  --output-dir program_synthesis/boosted/runs/semantic_cdc_sampler_compare_b256_s1/stratified_diverse
+$methods = @('feature_diverse','label_balanced_diverse','stratified_diverse')
+foreach ($method in $methods) {
+  python program_synthesis\boosted\boosted_runner.py `
+    --provider openai `
+    --api-mode chat_completions `
+    --functions fn_o `
+    --lengths 21 `
+    --train-size 10000 `
+    --val-size 2000 `
+    --test-size 10000 `
+    --seed 42 `
+    --batch-sizes 256 `
+    --boost-rounds 3 `
+    --num-trials 1 `
+    --round-retries 3 `
+    --resample-each-retry `
+    --sampling-strategy $method `
+    --candidate-selection best_ensemble_val `
+    --ensemble-val-drop-tolerance 0.005 `
+    --tabular-representation semantic `
+    --max-weak-error 0.49 `
+    --early-stop-val-patience 2 `
+    --restore-best-val-ensemble `
+    --reasoning-effort medium `
+    --max-output-tokens 20000 `
+    --no-tools `
+    --output-dir program_synthesis\boosted\runs\semantic_cdc_sampler_compare_b256_s1\$method
+}
 ```
 
-Repeat with `--sampling-strategy feature_diverse` and
-`--sampling-strategy label_balanced_diverse` to compare generic sampler methods.
+This comparison has been run. Results are summarized in
+`program_synthesis/CODEBOOST_SAMPLER_COMPARE_B256.md`; the best test result was
+`stratified_diverse` at 0.7046, and all methods restored to one saved learner.

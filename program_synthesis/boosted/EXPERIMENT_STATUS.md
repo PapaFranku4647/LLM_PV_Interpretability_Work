@@ -201,6 +201,22 @@ features, so they are not tied to CDC's feature count. Added
 `--candidate-selection best_ensemble_val`. Next run should compare those methods
 at batch 256 before spending on larger sweeps.
 
+Batch-256 sampler comparison is now complete and saved in
+`program_synthesis/CODEBOOST_SAMPLER_COMPARE_B256.md`.
+
+Results on CDC semantic, 10000/2000/10000 train/val/test, one seed, batch 256,
+3 rounds, 3 retries, `best_ensemble_val`, weak-error gate 0.49:
+
+- `feature_diverse`: test 0.6965, val 0.6880.
+- `label_balanced_diverse`: test 0.7036, val 0.6905.
+- `stratified_diverse`: test 0.7046, val 0.6900.
+
+All three restored to a one-learner ensemble. This confirms the generic sampler
+machinery, but it is still an accuracy negative result relative to the CDC
+semantic `T=1` 5-trial mean of 0.7173 and best of 0.7300. Next sampler work
+should add candidate source logging, then build a larger offline candidate
+library for local validation/greedy ensemble selection.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the

@@ -289,3 +289,33 @@ The mushroom command was the same with `fn_n --lengths 20` and output directory
 `program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_n_mushroom`.
 Skip chess unless a new chess feature-description prompt is added or the budget
 is explicitly worth spending.
+
+## Batch-256 Sampler Comparison
+
+The batch-256 CDC sampler comparison is now saved in
+`program_synthesis/CODEBOOST_SAMPLER_COMPARE_B256.md`, with aggregate CSV at
+`program_synthesis/codeboost_sampler_compare_b256_s1.csv` and raw artifacts under
+`program_synthesis/boosted/runs/semantic_cdc_sampler_compare_b256_s1/`.
+
+Configuration: CDC semantic, 10000/2000/10000 train/val/test, batch 256, one
+seed, 3 boosting rounds, 3 retries per round, resample each retry,
+`best_ensemble_val` candidate selection, validation drop tolerance 0.005,
+max weak error 0.49, early stopping patience 2, restore best-validation
+ensemble.
+
+Test accuracies:
+
+- `feature_diverse`: final test 0.6965, final val 0.6880, saved 1 round after
+  best-validation restoration.
+- `label_balanced_diverse`: final test 0.7036, final val 0.6905, saved 1 round
+  after best-validation restoration.
+- `stratified_diverse`: final test 0.7046, final val 0.6900, saved 1 round
+  after best-validation restoration.
+
+Conclusion: the generic sampler and candidate-library machinery works, but this
+batch-256 comparison still did not improve over the current CDC semantic `T=1`
+scorecard. All three methods selected later weak learners during the run, but
+the best-validation restored ensemble kept only the first learner. Before larger
+sweeps, add candidate-program logging for every attempt so we preserve rejected
+and later-restored learner source, then try larger candidate libraries and
+post-hoc local ensemble selection.
