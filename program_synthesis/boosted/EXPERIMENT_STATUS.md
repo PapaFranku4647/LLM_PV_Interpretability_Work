@@ -246,6 +246,22 @@ source-logging artifact problem is fixed, but the next method step should be
 post-hoc local ensemble selection over the saved candidate library rather than
 more online AdaBoost rounds.
 
+Post-hoc local selection is now implemented in
+`program_synthesis/boosted/posthoc_selector.py` and summarized in
+`program_synthesis/CODEBOOST_POSTHOC_SELECTOR_B256.md`.
+
+Results on the 40-candidate CDC library:
+
+- `weighted_greedy` with inverted candidates selected 1 learner:
+  train/val/test 0.7031 / 0.6950 / 0.7027.
+- `uniform_greedy` with inverted candidates selected 6 learners:
+  train/val/test 0.7068 / 0.7045 / 0.7062.
+
+Conclusion: post-hoc selection does help. Uniform validation-greedy selection
+found complementary rules that the online AdaBoost-style loop missed. The gain is
+still too small to beat the CDC semantic `T=1` best result, so the next lever is
+better candidate-library generation rather than more online boosting retries.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the

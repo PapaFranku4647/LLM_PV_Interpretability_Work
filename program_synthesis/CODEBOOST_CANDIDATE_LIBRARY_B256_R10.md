@@ -113,11 +113,25 @@ rigid for this LLM-generated code setting.
 
 ## Next Steps
 
-1. Build a post-hoc local ensemble selector over the saved candidate library.
-2. Score all logged candidates on full train/val/test and greedily add only
-   candidates that improve validation.
-3. Try a relaxed library-generation mode where candidates are collected without
+1. Try a relaxed library-generation mode where candidates are collected without
    committing weights after every selected round.
-4. Add one-call multi-candidate prompting so a single API call can return several
+2. Add one-call multi-candidate prompting so a single API call can return several
    short candidate functions for local scoring.
-5. Re-run this on HTRU2 and mushroom after post-hoc selection exists.
+3. Re-run this on HTRU2 and mushroom after post-hoc selection exists.
+
+## Post-Hoc Selector Follow-Up
+
+The post-hoc local selector is now implemented in
+`program_synthesis/boosted/posthoc_selector.py` and summarized in
+`program_synthesis/CODEBOOST_POSTHOC_SELECTOR_B256.md`.
+
+On this same 40-candidate library:
+
+- `weighted_greedy` selected 1 learner and matched the online result:
+  train/val/test 0.7031 / 0.6950 / 0.7027.
+- `uniform_greedy` selected 6 learners and improved to:
+  train/val/test 0.7068 / 0.7045 / 0.7062.
+
+Conclusion: local post-hoc selection can extract complementary learners from the
+logged library, but this library is still not strong enough to beat the best CDC
+semantic `T=1` run.

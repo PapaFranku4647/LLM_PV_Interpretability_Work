@@ -354,3 +354,28 @@ AdaBoost-style selection still does not extract a better CDC ensemble. The next
 step should be post-hoc local ensemble selection over logged candidates, plus a
 library-generation mode that collects candidates without committing weights after
 each selected round.
+
+## Post-Hoc Local Selection
+
+Post-hoc local selection is implemented in
+`program_synthesis/boosted/posthoc_selector.py` and summarized in
+`program_synthesis/CODEBOOST_POSTHOC_SELECTOR_B256.md`, with aggregate CSV at
+`program_synthesis/codeboost_posthoc_selector_b256_s1.csv`.
+
+It reloads the same dataset split, recompiles every logged candidate from
+`candidate_code`, precomputes predictions, and greedily builds a validation
+selected ensemble without API calls.
+
+CDC 40-candidate library results:
+
+- Online `best_ensemble_val`: selected 1 learner, train/val/test
+  0.7031 / 0.6950 / 0.7027.
+- Post-hoc `weighted_greedy`: selected 1 learner, train/val/test
+  0.7031 / 0.6950 / 0.7027.
+- Post-hoc `uniform_greedy`: selected 6 learners, train/val/test
+  0.7068 / 0.7045 / 0.7062.
+
+Conclusion: uniform post-hoc voting is a real improvement over the online
+ensemble from the same saved candidates, but the candidate library is still not
+strong enough. Next work should generate broader libraries, especially
+multi-candidate prompts and diverse first-round candidates across seeds/samplers.

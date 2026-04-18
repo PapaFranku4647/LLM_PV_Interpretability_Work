@@ -240,3 +240,28 @@ python program_synthesis\boosted\boosted_runner.py `
 This sweep has been run. Results are summarized in
 `program_synthesis/CODEBOOST_CANDIDATE_LIBRARY_B256_R10.md`. It logged source
 for all 40 candidates, but restored to one saved learner with final test 0.7027.
+
+## Post-Hoc Candidate Selector
+
+```bash
+python program_synthesis\boosted\posthoc_selector.py `
+  --attempts-jsonl program_synthesis\boosted\runs\semantic_cdc_candidate_library_b256_r10_s1\stratified_diverse\attempts.jsonl `
+  --output-dir program_synthesis\boosted\runs\semantic_cdc_candidate_library_b256_r10_s1\posthoc_uniform_greedy_val `
+  --function fn_o `
+  --length 21 `
+  --train-size 10000 `
+  --val-size 2000 `
+  --test-size 10000 `
+  --seed 42 `
+  --tabular-representation semantic `
+  --selection-mode uniform_greedy `
+  --max-rounds 8 `
+  --min-val-improvement 0.0 `
+  --allow-inverted-candidates
+```
+
+This selector has been run on the 40-candidate CDC library. Results are
+summarized in `program_synthesis/CODEBOOST_POSTHOC_SELECTOR_B256.md`.
+`uniform_greedy` selected 6 candidates and reached train/val/test
+0.7068/0.7045/0.7062, improving over the online library ensemble but still not
+beating the best CDC semantic `T=1` run.
