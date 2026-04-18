@@ -42,7 +42,49 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from openai import AsyncOpenAI
+
+def _load_dotenv_file(path: str) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    loaded_any = False
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or key in os.environ:
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ[key] = value
+            loaded_any = True
+    return loaded_any
+
+
+def _bootstrap_env() -> None:
+    candidate_paths = []
+    for candidate in (
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(parent_dir, ".env"),
+        os.path.join(os.path.dirname(parent_dir), ".env"),
+    ):
+        norm = os.path.abspath(candidate)
+        if norm not in candidate_paths:
+            candidate_paths.append(norm)
+    for candidate in candidate_paths:
+        _load_dotenv_file(candidate)
+
+
+_bootstrap_env()
+
+from openai import AsyncOpenAI, AsyncAzureOpenAI
 
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
@@ -194,17 +236,55 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
     return logger
 
 
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _env_csv_first(*names: str) -> List[str]:
+    raw = _env_first(*names)
+    if not raw:
+        return []
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
+
 # =========================
 # Config
 # =========================
 
 @dataclass
 class Config:
-    api_key: str = field(default_factory=lambda: os.getenv("OPENAI_API_KEY", ""))
+    api_key: str = field(default_factory=lambda: _env_first(
+        "OPENAI_API_KEY",
+        "TAMU_API_KEY",
+        "TAMUS_AI_CHAT_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+    ))
+    api_key_explicit: bool = False
+    api_base_url: str = field(default_factory=lambda: _env_first(
+        "OPENAI_BASE_URL",
+        "API_BASE_URL",
+        "TAMU_API_BASE_URL",
+    ))
+    azure_endpoint: str = field(default_factory=lambda: _env_first(
+        "AZURE_OPENAI_ENDPOINT",
+        "TAMU_AZURE_ENDPOINT",
+        "TAMU_API_ENDPOINT",
+        "DPF_URL",
+    ))
+    api_version: str = field(default_factory=lambda: _env_first(
+        "OPENAI_API_VERSION",
+        "AZURE_OPENAI_API_VERSION",
+        "TAMU_API_VERSION",
+    ))
     gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
     anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
     model: str = os.getenv("OPENAI_MODEL", "gpt-5")
     provider: str = os.getenv("PROVIDER", "auto")
+    api_mode: str = field(default_factory=lambda: os.getenv("API_MODE", "responses"))
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
     thinking_level: str = os.getenv("THINKING_LEVEL", os.getenv("REASONING_EFFORT", "high"))
@@ -320,6 +400,17 @@ def _safe_write_json(path: str, obj: Dict[str, Any]) -> None:
 def _read_lines(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [ln.rstrip("\n") for ln in f]
+
+
+def should_update_best_by_val(
+    candidate_val_acc: Optional[float],
+    current_best_val_acc: Optional[float],
+) -> bool:
+    if candidate_val_acc is None:
+        return False
+    if current_best_val_acc is None:
+        return True
+    return float(candidate_val_acc) > float(current_best_val_acc)
 
 
 # =========================
@@ -608,6 +699,96 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
     return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
 
+def resolve_openai_client_settings(cfg: Config) -> Dict[str, Any]:
+    api_base_url = (getattr(cfg, "api_base_url", "") or "").strip()
+    azure_endpoint = (getattr(cfg, "azure_endpoint", "") or "").strip()
+    api_version = (getattr(cfg, "api_version", "") or "").strip()
+    use_azure = bool(azure_endpoint)
+    api_key = (cfg.api_key or "").strip()
+    if use_azure and not getattr(cfg, "api_key_explicit", False):
+        api_key = _env_first(
+            "AZURE_OPENAI_API_KEY",
+            "TAMU_API_KEY",
+            "TAMUS_AI_CHAT_API_KEY",
+            default=api_key,
+        )
+        if not api_version:
+            api_version = _env_first(
+                "AZURE_OPENAI_API_VERSION",
+                "OPENAI_API_VERSION",
+                "TAMU_API_VERSION",
+                default="2024-12-01-preview",
+            )
+    return {
+        "api_key": api_key,
+        "api_base_url": api_base_url,
+        "azure_endpoint": azure_endpoint,
+        "api_version": api_version,
+        "use_azure": use_azure,
+    }
+
+
+def create_openai_client(cfg: Config) -> Tuple[Any, str]:
+    settings = resolve_openai_client_settings(cfg)
+    if not settings["api_key"]:
+        raise SystemExit("OPENAI_API_KEY or TAMU_API_KEY is required.")
+
+    if settings["use_azure"]:
+        if not settings["api_version"]:
+            raise SystemExit(
+                "OPENAI_API_VERSION or TAMU_API_VERSION is required when using an Azure/TAMU endpoint."
+            )
+        return (
+            AsyncAzureOpenAI(
+                api_key=settings["api_key"],
+                azure_endpoint=settings["azure_endpoint"].rstrip("/"),
+                api_version=settings["api_version"],
+            ),
+            "azure_openai",
+        )
+
+    client_kwargs: Dict[str, Any] = {"api_key": settings["api_key"]}
+    client_type = "openai"
+    if settings["api_base_url"]:
+        client_kwargs["base_url"] = settings["api_base_url"]
+        client_type = "openai_compatible"
+    return AsyncOpenAI(**client_kwargs), client_type
+
+
+AZURE_DEPLOYMENT_ALIASES = {
+    "protected.gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
+    "gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
+}
+
+
+def resolve_openai_request_model(cfg: Config) -> str:
+    requested_model = (cfg.model or "").strip()
+    settings = resolve_openai_client_settings(cfg)
+    if not settings["use_azure"]:
+        return requested_model
+
+    explicit_deployments = _env_csv_first(
+        "AZURE_OPENAI_DEPLOYMENTS",
+        "TAMU_DEPLOYMENTS",
+        "OPENAI_DEPLOYMENTS",
+    )
+    if explicit_deployments:
+        return explicit_deployments[0]
+
+    explicit_deployment = _env_first(
+        "AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "TAMU_DEPLOYMENT",
+        "TAMU_DEPLOYMENT_NAME",
+        "OPENAI_DEPLOYMENT",
+        "OPENAI_DEPLOYMENT_NAME",
+    )
+    if explicit_deployment:
+        return explicit_deployment
+
+    return AZURE_DEPLOYMENT_ALIASES.get(requested_model, requested_model)
+
+
 # =========================
 # Runner
 # =========================
@@ -637,6 +818,7 @@ class Runner:
         self.log = logger
         self.provider = self._resolve_provider(cfg.provider, cfg.model)
         self.client: Optional[AsyncOpenAI] = None
+        self.client_type = "none"
         self.gemini_client = None
         self.anthropic_client = None
         self.hf_model = None
@@ -646,10 +828,19 @@ class Runner:
         self._anthropic_thinking_warned = False
         self._anthropic_tool_use_unhandled_warned = False
         if self.provider == "openai":
-            if not cfg.api_key:
-                raise SystemExit("OPENAI_API_KEY is required.")
-            self.client = AsyncOpenAI(api_key=cfg.api_key)
-            self.log.info("openai_provider_enabled", extra={"model": cfg.model})
+            self.client, self.client_type = create_openai_client(cfg)
+            self.log.info(
+                "openai_provider_enabled",
+                extra={
+                    "model": cfg.model,
+                    "request_model": resolve_openai_request_model(cfg),
+                    "client_type": self.client_type,
+                    "api_mode": cfg.api_mode,
+                    "has_api_base_url": bool((cfg.api_base_url or "").strip()),
+                    "has_azure_endpoint": bool((cfg.azure_endpoint or "").strip()),
+                    "api_version": (cfg.api_version or "").strip() or None,
+                },
+            )
         elif self.provider == "gemini":
             if not cfg.gemini_api_key:
                 raise SystemExit("GEMINI_API_KEY is required for Gemini models.")
@@ -763,6 +954,47 @@ class Runner:
                         chunks.append(txt)
         return "".join(chunks).strip()
 
+    @staticmethod
+    def _extract_text_from_chat_completion_response(res: Any) -> str:
+        choices = res.get("choices", []) if isinstance(res, Mapping) else getattr(res, "choices", []) or []
+        if not choices:
+            return ""
+        first = choices[0]
+        if isinstance(first, Mapping):
+            message = first.get("message") or {}
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
+                chunks: List[str] = []
+                for part in content:
+                    if isinstance(part, Mapping):
+                        text = part.get("text")
+                    else:
+                        text = getattr(part, "text", None)
+                    if isinstance(text, str) and text.strip():
+                        chunks.append(text.strip())
+                return "\n".join(chunks).strip()
+            text = first.get("text")
+            return text.strip() if isinstance(text, str) else ""
+
+        message = getattr(first, "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for part in content:
+                if isinstance(part, Mapping):
+                    text = part.get("text")
+                else:
+                    text = getattr(part, "text", None)
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+            return "\n".join(chunks).strip()
+        text = getattr(first, "text", None)
+        return text.strip() if isinstance(text, str) else ""
+
     async def _anthropic_messages_create_sdk(self, body: Dict[str, Any]) -> Any:
         if self.anthropic_client is None:
             raise RuntimeError("Anthropic client is not initialized.")
@@ -785,32 +1017,61 @@ class Runner:
                 if inspect.isawaitable(maybe_awaitable):
                     await maybe_awaitable
 
-    async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
-        prompt_text = build_user_prompt(
-            data_examples,
-            L,
-            decimal,
-            tabular,
-            strict_json_only=(self.provider == "huggingface"),
-        )
+    async def _call_once(
+        self,
+        fn: str,
+        L: int,
+        attempt_idx: int,
+        data_examples: List[str],
+        decimal: bool,
+        tabular: bool = False,
+        prompt_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if prompt_override is None:
+            prompt_text = build_user_prompt(
+                data_examples,
+                L,
+                decimal,
+                tabular,
+                strict_json_only=(self.provider == "huggingface"),
+            )
+        else:
+            prompt_text = prompt_override
         body_preview_size = len(prompt_text)
+        request_model = resolve_openai_request_model(self.cfg)
         if self.provider == "openai":
             openai_tool_choice = "auto" if self.cfg.allow_tools else "none"
-            body: Dict[str, Any] = {
-                "model": self.cfg.model,
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-                "reasoning": {"effort": self.cfg.reasoning_effort},
-                "max_output_tokens": self.cfg.max_output_tokens,
-                "tool_choice": openai_tool_choice,
-            }
-            if self.cfg.temperature is not None:
-                body["temperature"] = self.cfg.temperature
-            if self.cfg.top_p is not None:
-                body["top_p"] = self.cfg.top_p
-            if self.cfg.allow_tools and self.tools:
-                body["tools"] = self.tools
-            if self.cfg.verbosity:
-                body["text"] = {"verbosity": self.cfg.verbosity}
+            if self.cfg.api_mode == "chat_completions":
+                body = {
+                    "model": request_model,
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "max_completion_tokens": self.cfg.max_output_tokens,
+                }
+                extra_body: Dict[str, Any] = {}
+                if self.cfg.reasoning_effort:
+                    extra_body["reasoning_effort"] = self.cfg.reasoning_effort
+                if extra_body:
+                    body["extra_body"] = extra_body
+                if self.cfg.temperature is not None:
+                    body["temperature"] = self.cfg.temperature
+                if self.cfg.top_p is not None:
+                    body["top_p"] = self.cfg.top_p
+            else:
+                body = {
+                    "model": request_model,
+                    "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
+                    "reasoning": {"effort": self.cfg.reasoning_effort},
+                    "max_output_tokens": self.cfg.max_output_tokens,
+                    "tool_choice": openai_tool_choice,
+                }
+                if self.cfg.temperature is not None:
+                    body["temperature"] = self.cfg.temperature
+                if self.cfg.top_p is not None:
+                    body["top_p"] = self.cfg.top_p
+                if self.cfg.allow_tools and self.tools:
+                    body["tools"] = self.tools
+                if self.cfg.verbosity:
+                    body["text"] = {"verbosity": self.cfg.verbosity}
         elif self.provider == "gemini":
             gemini_tools: List[Dict[str, Any]] = []
             if self.cfg.tool_choice != "none":
@@ -880,36 +1141,57 @@ class Runner:
 
         async def _try_call(tag: str):
             t0 = time.perf_counter()
+            returned_model = None
             async with self.sem:
                 if self.provider == "openai":
                     if self.client is None:
                         raise RuntimeError("OpenAI client is not initialized.")
-                    res = await asyncio.wait_for(
-                        self.client.responses.create(**body),
-                        timeout=self.cfg.per_call_timeout_s,
-                    )
-                    tool_uses = 0
-                    tool_results_chars = 0
-                    for item in getattr(res, "output", []) or []:
-                        t = getattr(item, "type", None)
-                        if t == "tool_use":
-                            tool_uses += 1
-                        elif t == "tool_result":
-                            content = getattr(item, "content", None)
-                            if isinstance(content, list):
-                                for part in content:
-                                    txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
-                                    if isinstance(txt, str):
-                                        tool_results_chars += len(txt)
-                            elif isinstance(content, str):
-                                tool_results_chars += len(content)
-                    usage = normalize_usage(getattr(res, "usage", {}))
-                    out_text = (getattr(res, "output_text", "") or "").strip()
+                    if self.cfg.api_mode == "chat_completions":
+                        res = await asyncio.wait_for(
+                            self.client.chat.completions.create(**body),
+                            timeout=self.cfg.per_call_timeout_s,
+                        )
+                        tool_uses = 0
+                        tool_results_chars = 0
+                        returned_model = getattr(res, "model", None)
+                        usage = normalize_usage(getattr(res, "usage", {}))
+                        out_text = self._extract_text_from_chat_completion_response(res)
+                    else:
+                        responses_api = getattr(self.client, "responses", None)
+                        create_fn = getattr(responses_api, "create", None)
+                        if not callable(create_fn):
+                            raise RuntimeError(
+                                "OpenAI client does not support responses.create in this environment. "
+                                "Set API_MODE=chat_completions."
+                            )
+                        res = await asyncio.wait_for(
+                            create_fn(**body),
+                            timeout=self.cfg.per_call_timeout_s,
+                        )
+                        tool_uses = 0
+                        tool_results_chars = 0
+                        returned_model = getattr(res, "model", None)
+                        for item in getattr(res, "output", []) or []:
+                            t = getattr(item, "type", None)
+                            if t == "tool_use":
+                                tool_uses += 1
+                            elif t == "tool_result":
+                                content = getattr(item, "content", None)
+                                if isinstance(content, list):
+                                    for part in content:
+                                        txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+                                        if isinstance(txt, str):
+                                            tool_results_chars += len(txt)
+                                elif isinstance(content, str):
+                                    tool_results_chars += len(content)
+                        usage = normalize_usage(getattr(res, "usage", {}))
+                        out_text = (getattr(res, "output_text", "") or "").strip()
                 elif self.provider == "gemini":
                     res = await asyncio.wait_for(
                         self._gemini_generate_content(body),
                         timeout=self.cfg.per_call_timeout_s,
                     )
+                    returned_model = getattr(res, "model_version", None) or getattr(res, "model", None)
                     usage = normalize_gemini_usage(getattr(res, "usage_metadata", None))
                     out_text = self._extract_text_from_gemini_response(res)
                     tool_uses = 0
@@ -941,6 +1223,7 @@ class Runner:
                         raise RuntimeError("vLLM returned no output.")
 
                     out_text = final_output.outputs[0].text.strip()
+                    returned_model = self.cfg.model
                     if "</think>" in out_text:
                         tail = out_text.rsplit("</think>", 1)[-1].strip()
                         if tail:
@@ -985,6 +1268,7 @@ class Runner:
                             timeout=anthropic_timeout_s,
                         )
 
+                    returned_model = res.get("model") if isinstance(res, Mapping) else getattr(res, "model", None)
                     usage_obj = res.get("usage") if isinstance(res, Mapping) else getattr(res, "usage", None)
                     usage = normalize_anthropic_usage(usage_obj)
                     out_text = self._extract_text_from_anthropic_response(res)
@@ -1013,7 +1297,7 @@ class Runner:
             if self.provider == "anthropic":
                 active_tool_count = len(self.anthropic_tools)
             elif self.provider == "openai":
-                active_tool_count = len(self.tools) if self.cfg.allow_tools else 0
+                active_tool_count = len(body.get("tools") or []) if isinstance(body, dict) else 0
             else:
                 active_tool_count = len(self.tools)
             self.log.info(tag, extra={
@@ -1032,6 +1316,8 @@ class Runner:
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "prompt": prompt_text,
                 "text": out_text, "usage": usage,
+                "returned_model": returned_model,
+                "request_model": request_model if self.provider == "openai" else self.cfg.model,
                 "cached_tokens": cached, "duration_ms": dt_ms,
                 "request_body_bytes": len(json.dumps(body)),
                 "prompt_chars": len(prompt_text),
@@ -1083,7 +1369,6 @@ class Runner:
                         trial_jsonl_file = open(trial_jsonl_path, "w", encoding="utf-8")
                         
                         try:
-                            best_test_acc = -1.0
                             best_val_acc = None
                             best_row = None
                             stopped_early = False
@@ -1109,8 +1394,7 @@ class Runner:
                                         test_acc = evaluate_accuracy(fn_callable, test_lines, self.log, is_tabular)
                                         test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                         
-                                        if test_acc > best_test_acc:
-                                            best_test_acc = test_acc
+                                        if should_update_best_by_val(val_acc, best_val_acc):
                                             best_val_acc = val_acc
                                             best_row = {
                                                 **res,
@@ -1155,8 +1439,8 @@ class Runner:
                                     self.log.info("early_stop", extra={"fn": fn, "length": L, "attempt": k, "trial": trial + 1, "val_acc": val_acc, "test_acc": test_acc})
                                     break
 
-                            if best_test_acc >= 0 and best_row:
-                                trial_test_accuracies.append(best_test_acc)
+                            if best_row:
+                                trial_test_accuracies.append(float(best_row["test_acc"]))
                                 trial_val_accuracies.append(best_val_acc if best_val_acc is not None else 0.0)
                                 trial_best_rows.append(best_row)
                         finally:
@@ -1280,6 +1564,11 @@ def parse_args() -> Config:
 
     p.add_argument("--provider", choices=["auto", "openai", "gemini", "anthropic", "huggingface"], help="Inference provider (default: auto)")
     p.add_argument("--model", help="Model name (default: gpt-5)")
+    p.add_argument("--api-mode", choices=["responses", "chat_completions"], help="OpenAI-compatible API family (default: env/API_MODE or responses)")
+    p.add_argument("--api-key", help="API key override for OpenAI-compatible or TAMU/Azure endpoints")
+    p.add_argument("--api-base-url", help="OpenAI-compatible base URL override")
+    p.add_argument("--azure-endpoint", help="Azure/TAMU endpoint override")
+    p.add_argument("--api-version", help="Azure/TAMU API version override")
     p.add_argument("--temperature", type=float, help="Sampling temperature used across providers")
     p.add_argument("--top-p", type=float, help="Nucleus sampling top_p used across providers")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
@@ -1319,6 +1608,13 @@ def parse_args() -> Config:
     if args.concurrency: cfg.concurrency = args.concurrency
     if args.provider: cfg.provider = args.provider
     if args.model: cfg.model = args.model
+    if args.api_mode is not None: cfg.api_mode = args.api_mode
+    if args.api_key is not None:
+        cfg.api_key = args.api_key
+        cfg.api_key_explicit = True
+    if args.api_base_url is not None: cfg.api_base_url = args.api_base_url
+    if args.azure_endpoint is not None: cfg.azure_endpoint = args.azure_endpoint
+    if args.api_version is not None: cfg.api_version = args.api_version
     if args.temperature is not None: cfg.temperature = args.temperature
     if args.top_p is not None: cfg.top_p = args.top_p
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens

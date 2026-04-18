@@ -20,6 +20,8 @@ import torch
 import math
 import random
 import logging
+import json
+import os
 import numpy as np
 from tqdm import tqdm
 from typing import List, Dict, Any, Set, Tuple, Union, Optional
@@ -1482,6 +1484,7 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
     ]
     
     NUMERIC_INDICES = {3, 13, 14, 15, 18, 19, 20}
+    SEMANTIC_BIN_LABELS = ["very low", "low", "medium", "high", "very high"]
     
     def __init__(self, sequence_length: int, num_samples: int, device: str = 'cpu'):
         super().__init__(sequence_length, num_samples, device)
@@ -1489,13 +1492,177 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
             raise ValueError("num_samples must be even for a 50/50 split.")
         self._data_cache = None
         self._category_maps: Dict[int, Dict[str, str]] = {}
+        self._semantic_thresholds: Dict[int, List[float]] = {}
         self._maps_initialized = False
+        self._semantic_bins_initialized = False
+        self.representation = os.getenv("CDC_DIABETES_REPRESENTATION", "obfuscated").strip().lower()
+        if self.representation not in {"obfuscated", "semantic"}:
+            raise ValueError(
+                "CDC_DIABETES_REPRESENTATION must be either 'obfuscated' or 'semantic', "
+                f"got {self.representation!r}."
+            )
+        self.allow_semantic_fallback = os.getenv("CDC_DIABETES_SEMANTIC_FALLBACK", "1") != "0"
         numeric_indices_list = sorted(list(self.NUMERIC_INDICES))
         n_numeric = len(numeric_indices_list)
         self._A_diag = np.random.normal(0, 1, n_numeric)
         self._b = np.random.normal(0, 1, n_numeric)
         self._numeric_indices_list = numeric_indices_list
-        logger.info(f"CDCDiabetesDataGenerator initialized for {num_samples} samples")
+        logger.info(
+            f"CDCDiabetesDataGenerator initialized for {num_samples} samples "
+            f"(representation={self.representation})"
+        )
+
+    def _cache_dir(self) -> str:
+        cache_dir = os.path.join(os.path.dirname(__file__), '..', 'data_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        return cache_dir
+
+    def _raw_cache_path(self) -> str:
+        return os.path.join(self._cache_dir(), 'cdc_diabetes_raw.jsonl')
+
+    def _bootstrap_cache_path(self) -> str:
+        return os.path.join(self._cache_dir(), 'cdc_diabetes_transformed_bootstrap.jsonl')
+
+    def _load_cached_raw_dataset(self) -> Optional[Tuple[List[Dict[str, str]], List[Dict[str, str]], List[Dict[str, str]]]]:
+        cache_path = self._raw_cache_path()
+        if not os.path.exists(cache_path):
+            return None
+
+        all_raw_samples: List[Dict[str, str]] = []
+        positive_raw: List[Dict[str, str]] = []
+        negative_raw: List[Dict[str, str]] = []
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                features = {name: str(record.get(name, "")) for name in self.RAW_FEATURE_NAMES}
+                label = int(record["Diabetes_binary"])
+                all_raw_samples.append(features)
+                if label == 1:
+                    positive_raw.append(features)
+                else:
+                    negative_raw.append(features)
+        if not all_raw_samples:
+            return None
+        logger.info(f"Loaded cached CDC raw dataset from {cache_path}")
+        return all_raw_samples, positive_raw, negative_raw
+
+    def _save_cached_raw_dataset(
+        self,
+        all_raw_samples: List[Dict[str, str]],
+        positive_raw: List[Dict[str, str]],
+        negative_raw: List[Dict[str, str]],
+    ) -> None:
+        positive_keys = {json.dumps(sample, sort_keys=True) for sample in positive_raw}
+        cache_path = self._raw_cache_path()
+        with open(cache_path, "w", encoding="utf-8") as handle:
+            for sample in all_raw_samples:
+                key = json.dumps(sample, sort_keys=True)
+                record = dict(sample)
+                record["Diabetes_binary"] = 1 if key in positive_keys else 0
+                handle.write(json.dumps(record, ensure_ascii=False) + "\n")
+        logger.info(f"Saved CDC raw dataset cache to {cache_path}")
+
+    def _parse_transformed_line(self, line: str) -> Optional[Tuple[Dict[str, str], int]]:
+        if "->" not in line:
+            return None
+        x_raw, y_raw = line.split("->", 1)
+        sample: Dict[str, str] = {}
+        for part in x_raw.strip().split(","):
+            part = part.strip()
+            if not part or ":" not in part:
+                continue
+            key, value = part.split(":", 1)
+            sample[key.strip()] = value.strip()
+        if not sample:
+            return None
+        return sample, int(y_raw.strip())
+
+    def _load_transformed_bootstrap_cache(self) -> Optional[Tuple[List[Dict[str, str]], List[Dict[str, str]]]]:
+        cache_path = self._bootstrap_cache_path()
+        if not os.path.exists(cache_path):
+            return None
+
+        positive_samples: List[Dict[str, str]] = []
+        negative_samples: List[Dict[str, str]] = []
+        with open(cache_path, "r", encoding="utf-8") as handle:
+            for line in handle:
+                line = line.strip()
+                if not line:
+                    continue
+                record = json.loads(line)
+                sample = {k: str(v) for k, v in record["sample"].items()}
+                label = int(record["label"])
+                if label == 1:
+                    positive_samples.append(sample)
+                else:
+                    negative_samples.append(sample)
+        if not positive_samples or not negative_samples:
+            return None
+        logger.warning(f"Loaded CDC transformed bootstrap cache from {cache_path}")
+        return positive_samples, negative_samples
+
+    def _save_transformed_bootstrap_cache(
+        self,
+        positive_samples: List[Dict[str, str]],
+        negative_samples: List[Dict[str, str]],
+    ) -> None:
+        cache_path = self._bootstrap_cache_path()
+        with open(cache_path, "w", encoding="utf-8") as handle:
+            for sample in positive_samples:
+                handle.write(json.dumps({"label": 1, "sample": sample}, ensure_ascii=False) + "\n")
+            for sample in negative_samples:
+                handle.write(json.dumps({"label": 0, "sample": sample}, ensure_ascii=False) + "\n")
+        logger.warning(f"Saved CDC transformed bootstrap cache to {cache_path}")
+
+    def _bootstrap_from_existing_splits(self) -> Optional[Tuple[List[Dict[str, str]], List[Dict[str, str]]]]:
+        dataset_root = os.path.join(
+            os.path.dirname(__file__),
+            '..',
+            'program_synthesis',
+            'boosted',
+            'datasets',
+            'cdc_diabetes',
+        )
+        if not os.path.isdir(dataset_root):
+            return None
+
+        positive_samples: List[Dict[str, str]] = []
+        negative_samples: List[Dict[str, str]] = []
+        seen: Set[str] = set()
+        for root, _dirs, files in os.walk(dataset_root):
+            for filename in files:
+                if filename not in {"train.txt", "val.txt", "test.txt"}:
+                    continue
+                file_path = os.path.join(root, filename)
+                try:
+                    with open(file_path, "r", encoding="utf-8") as handle:
+                        for raw_line in handle:
+                            parsed = self._parse_transformed_line(raw_line.strip())
+                            if parsed is None:
+                                continue
+                            sample, label = parsed
+                            key = json.dumps({"label": label, "sample": sample}, sort_keys=True)
+                            if key in seen:
+                                continue
+                            seen.add(key)
+                            if label == 1:
+                                positive_samples.append(sample)
+                            else:
+                                negative_samples.append(sample)
+                except OSError:
+                    continue
+
+        if not positive_samples or not negative_samples:
+            return None
+
+        logger.warning(
+            "Bootstrapped CDC transformed cache from existing split files; this is a fallback when UCI is unavailable."
+        )
+        self._save_transformed_bootstrap_cache(positive_samples, negative_samples)
+        return positive_samples, negative_samples
     
     def _init_category_maps(self, all_samples: List[Dict[str, str]]) -> None:
         if self._maps_initialized:
@@ -1507,6 +1674,125 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                 pad_width = len(str(max_categories - 1))
                 self._category_maps[idx] = {v: f"c{i:0{pad_width}d}" for i, v in enumerate(unique_vals)}
         self._maps_initialized = True
+
+    def _init_semantic_bins(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        for idx in self._numeric_indices_list:
+            name = self.RAW_FEATURE_NAMES[idx]
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            values.sort()
+            if not values:
+                self._semantic_thresholds[idx] = []
+                continue
+            thresholds: List[float] = []
+            n = len(values)
+            for frac in (0.2, 0.4, 0.6, 0.8):
+                pos = frac * (n - 1)
+                lo = int(math.floor(pos))
+                hi = int(math.ceil(pos))
+                if lo == hi:
+                    threshold = values[lo]
+                else:
+                    weight = pos - lo
+                    threshold = values[lo] * (1.0 - weight) + values[hi] * weight
+                thresholds.append(float(threshold))
+            self._semantic_thresholds[idx] = thresholds
+        self._semantic_bins_initialized = True
+
+    def _semantic_bin(self, feature_idx: int, raw_value: str) -> str:
+        try:
+            value = float(raw_value)
+        except (TypeError, ValueError):
+            return "unknown"
+        bin_idx = 0
+        for threshold in self._semantic_thresholds.get(feature_idx, []):
+            if value > threshold:
+                bin_idx += 1
+            else:
+                break
+        bin_idx = max(0, min(bin_idx, len(self.SEMANTIC_BIN_LABELS) - 1))
+        return self.SEMANTIC_BIN_LABELS[bin_idx]
+
+    def _semantic_categorical_value(self, feature_idx: int, raw_value: str) -> str:
+        normalized = str(raw_value).strip()
+        if feature_idx == 17:
+            if normalized in {"1", "1.0"}:
+                return "male"
+            if normalized in {"0", "0.0"}:
+                return "female"
+        if normalized in {"1", "1.0", "true", "True"}:
+            return "yes"
+        if normalized in {"0", "0.0", "false", "False"}:
+            return "no"
+        return normalized or "unknown"
+
+    def _semantic_sample_from_raw(self, raw: Dict[str, str]) -> Dict[str, str]:
+        semantic: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                semantic[name] = self._semantic_bin(idx, raw_value)
+            else:
+                semantic[name] = self._semantic_categorical_value(idx, raw_value)
+        return semantic
+
+    def _init_semantic_bins_from_transformed(self, samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        pseudo_raw_samples: List[Dict[str, str]] = []
+        for sample in samples:
+            pseudo_raw: Dict[str, str] = {}
+            for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+                pseudo_raw[name] = sample.get(f"x{idx}", "")
+            pseudo_raw_samples.append(pseudo_raw)
+        self._init_semantic_bins(pseudo_raw_samples)
+
+    def _semantic_sample_from_transformed(self, sample: Dict[str, str]) -> Dict[str, str]:
+        semantic: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            value = sample.get(f"x{idx}", "")
+            if idx in self.NUMERIC_INDICES:
+                semantic[name] = self._semantic_bin(idx, value)
+            else:
+                if name == "Sex":
+                    if value == "c1":
+                        semantic[name] = "male"
+                    elif value == "c0":
+                        semantic[name] = "female"
+                    else:
+                        semantic[name] = value or "unknown"
+                elif value == "c1":
+                    semantic[name] = "yes"
+                elif value == "c0":
+                    semantic[name] = "no"
+                else:
+                    semantic[name] = value or "unknown"
+        return semantic
+
+    def _semantic_dataset_from_transformed_fallback(self) -> Optional[Tuple[List[Dict[str, str]], List[Dict[str, str]]]]:
+        transformed_cache = self._load_transformed_bootstrap_cache()
+        if transformed_cache is None:
+            transformed_cache = self._bootstrap_from_existing_splits()
+        if transformed_cache is None:
+            return None
+
+        positive_samples, negative_samples = transformed_cache
+        logger.warning(
+            "Using semantic CDC representation from transformed bootstrap cache. "
+            "This preserves feature names and bins but is not as rigorous as raw CDC semantic data."
+        )
+        all_transformed_samples = positive_samples + negative_samples
+        self._init_semantic_bins_from_transformed(all_transformed_samples)
+        return (
+            [self._semantic_sample_from_transformed(s) for s in positive_samples],
+            [self._semantic_sample_from_transformed(s) for s in negative_samples],
+        )
     
     def _transform_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         transformed = {}
@@ -1536,43 +1822,96 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
             return self._data_cache
-        
+
+        cached_raw = self._load_cached_raw_dataset()
+        if cached_raw is not None:
+            all_raw_samples, positive_raw, negative_raw = cached_raw
+            if self.representation == "semantic":
+                self._init_semantic_bins(all_raw_samples)
+                positive_samples = [self._semantic_sample_from_raw(s) for s in positive_raw]
+                negative_samples = [self._semantic_sample_from_raw(s) for s in negative_raw]
+            else:
+                self._init_category_maps(all_raw_samples)
+                positive_samples = [self._transform_sample(s) for s in positive_raw]
+                negative_samples = [self._transform_sample(s) for s in negative_raw]
+            logger.info(
+                f"Loaded and transformed cached CDC raw dataset with {len(positive_samples)} positive and {len(negative_samples)} negative samples"
+            )
+            self._data_cache = (positive_samples, negative_samples)
+            return self._data_cache
+
+        if self.representation == "semantic" and self.allow_semantic_fallback:
+            semantic_fallback = self._semantic_dataset_from_transformed_fallback()
+            if semantic_fallback is not None:
+                self._data_cache = semantic_fallback
+                return self._data_cache
+
         try:
             from ucimlrepo import fetch_ucirepo
         except ImportError:
             raise ImportError("Please install ucimlrepo: pip install ucimlrepo")
-        
-        logger.info("Fetching CDC Diabetes dataset from UCI repository...")
-        cdc_diabetes = fetch_ucirepo(id=891)
-        X = cdc_diabetes.data.features
-        y = cdc_diabetes.data.targets
-        
-        all_raw_samples = []
-        positive_raw = []
-        negative_raw = []
-        
-        for idx in range(len(X)):
-            features = {}
-            for name in self.RAW_FEATURE_NAMES:
-                if name in X.columns:
-                    features[name] = str(X.iloc[idx][name])
-            
-            label = int(y.iloc[idx]['Diabetes_binary'])
-            
-            all_raw_samples.append(features)
-            if label == 1:
-                positive_raw.append(features)
+
+        try:
+            logger.info("Fetching CDC Diabetes dataset from UCI repository...")
+            cdc_diabetes = fetch_ucirepo(id=891)
+            X = cdc_diabetes.data.features
+            y = cdc_diabetes.data.targets
+
+            all_raw_samples = []
+            positive_raw = []
+            negative_raw = []
+
+            for idx in range(len(X)):
+                features = {}
+                for name in self.RAW_FEATURE_NAMES:
+                    if name in X.columns:
+                        features[name] = str(X.iloc[idx][name])
+
+                label = int(y.iloc[idx]['Diabetes_binary'])
+
+                all_raw_samples.append(features)
+                if label == 1:
+                    positive_raw.append(features)
+                else:
+                    negative_raw.append(features)
+
+            self._save_cached_raw_dataset(all_raw_samples, positive_raw, negative_raw)
+            if self.representation == "semantic":
+                self._init_semantic_bins(all_raw_samples)
+                positive_samples = [self._semantic_sample_from_raw(s) for s in positive_raw]
+                negative_samples = [self._semantic_sample_from_raw(s) for s in negative_raw]
             else:
-                negative_raw.append(features)
-        
-        self._init_category_maps(all_raw_samples)
-        
-        positive_samples = [self._transform_sample(s) for s in positive_raw]
-        negative_samples = [self._transform_sample(s) for s in negative_raw]
-        
-        logger.info(f"Loaded and transformed {len(positive_samples)} positive and {len(negative_samples)} negative samples")
-        self._data_cache = (positive_samples, negative_samples)
-        return self._data_cache
+                self._init_category_maps(all_raw_samples)
+                positive_samples = [self._transform_sample(s) for s in positive_raw]
+                negative_samples = [self._transform_sample(s) for s in negative_raw]
+
+            logger.info(
+                f"Loaded and transformed {len(positive_samples)} positive and {len(negative_samples)} negative samples"
+            )
+            self._data_cache = (positive_samples, negative_samples)
+            return self._data_cache
+        except Exception as exc:
+            logger.warning(f"CDC UCI fetch failed: {exc}")
+
+        transformed_cache = self._load_transformed_bootstrap_cache()
+        if transformed_cache is None:
+            transformed_cache = self._bootstrap_from_existing_splits()
+        if transformed_cache is not None:
+            positive_samples, negative_samples = transformed_cache
+            if self.representation == "semantic":
+                if not self.allow_semantic_fallback:
+                    raise ConnectionError(
+                        "Semantic CDC representation requires raw CDC cache or UCI access; "
+                        "only transformed bootstrap data is available."
+                    )
+                semantic_fallback = self._semantic_dataset_from_transformed_fallback()
+                if semantic_fallback is None:
+                    raise ConnectionError("Unable to load semantic CDC fallback dataset.")
+                positive_samples, negative_samples = semantic_fallback
+            self._data_cache = (positive_samples, negative_samples)
+            return self._data_cache
+
+        raise ConnectionError("Unable to fetch CDC dataset and no local cache/bootstrap data was found.")
     
     def _generate_raw_data(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         all_positive, all_negative = self._load_dataset()
