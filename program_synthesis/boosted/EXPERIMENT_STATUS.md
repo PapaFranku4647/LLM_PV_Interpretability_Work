@@ -74,6 +74,23 @@ about 1.9 percentage points below the strongest CDC baseline but competitive
 with several core baselines. XGBoost reached 0.7037 on CDC, essentially tied
 with the current semantic CodeBoost result under this small-train setting.
 
+## Matched CodeBoost Pilot
+
+A one-trial matched CodeBoost pilot is saved in
+`program_synthesis/CODEBOOST_MATCHED_PILOT.md`, with generated artifacts under
+`program_synthesis/boosted/runs/matched_codeboost_pilot_t1_b256_s1/`.
+
+Matched pilot test accuracies:
+
+- CDC diabetes semantic: 0.7060 vs best baseline 0.7225
+- Mushroom obfuscated: 0.5755 vs best baseline 0.8528
+- HTRU2 obfuscated: 0.8830 vs best baseline 0.9340
+- Chess obfuscated: 0.5775 vs best baseline 0.9615
+
+Conclusion: full-budget experiments should continue on CDC semantic and maybe
+HTRU2 numeric. Do not spend a 5-trial budget on mushroom or chess until they
+have semantic/named feature representations.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the
