@@ -318,6 +318,7 @@ class Config:
     seed: int = int(os.getenv("GLOBAL_SEED", "42"))
     num_trials: int = int(os.getenv("NUM_TRIALS", "10"))
     dataset_dir: str = os.getenv("DATASET_DIR", "program_synthesis/datasets")
+    tabular_representation: str = os.getenv("TABULAR_REPRESENTATION", "obfuscated")
     out_jsonl: str = "program_synthesis/baseline_results.jsonl"
     out_csv: str = "program_synthesis/baseline_results.csv"
     models: List[str] = field(default_factory=lambda: [
@@ -372,6 +373,11 @@ class DatasetStore:
 
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str]]:
         target_name = FUNCTION_NAME_MAPPING[fn]
+        os.environ["TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["CDC_DIABETES_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["MUSHROOM_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["HTRU2_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["CHESS_REPRESENTATION"] = self.cfg.tabular_representation
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
 
@@ -1001,6 +1007,7 @@ class BenchmarkRunner:
             "best_params": "{}",
             "best_cv_score": None,
             "num_trials": self.cfg.num_trials,
+            "tabular_representation": self.cfg.tabular_representation,
             "train_size": self.cfg.train_size,
             "val_size": self.cfg.val_size,
             "test_size": self.cfg.test_size,
@@ -1265,6 +1272,7 @@ class BenchmarkRunner:
                                 "best_params": json.dumps(best_params_by_trial[0] if best_params_by_trial else {}),
                                 "best_cv_score": float(np.mean(val_accuracies)),
                                 "num_trials": self.cfg.num_trials,
+                                "tabular_representation": self.cfg.tabular_representation,
                                 "train_size": len(y_train),
                                 "val_size": len(y_val),
                                 "test_size": len(y_test),
@@ -1314,7 +1322,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         return
     preferred = [
         "fn", "target_name", "length", "model", "status", "error",
-        "train_size", "val_size", "test_size", "seed",
+        "tabular_representation", "train_size", "val_size", "test_size", "seed",
         "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std",
         "best_params", "best_cv_score", "num_trials", "selection_split", "mean_fit_count",
@@ -1340,6 +1348,11 @@ def parse_args() -> Config:
     p.add_argument("--seed", type=int, help="Global seed (default: 42)")
     p.add_argument("--num-trials", type=int, help="Number of trials for averaging (default: 10)")
     p.add_argument("--dataset-dir", help="Dataset split/cache directory")
+    p.add_argument(
+        "--tabular-representation",
+        choices=["obfuscated", "semantic"],
+        help="Use obfuscated or semantic/named tabular dataset rows.",
+    )
     p.add_argument("--out-jsonl", help="Output JSONL path")
     p.add_argument("--out-csv", help="Output CSV path")
     p.add_argument("--include-ga", action="store_true", help="Include the symbolic genetic-programming baseline.")
@@ -1360,6 +1373,9 @@ def parse_args() -> Config:
     if args.seed is not None: cfg.seed = args.seed
     if args.num_trials is not None: cfg.num_trials = args.num_trials
     if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
+    if args.tabular_representation: cfg.tabular_representation = args.tabular_representation
+    if cfg.tabular_representation != "obfuscated":
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, f"tabular_representation_{cfg.tabular_representation}")
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
     if args.include_ga: cfg.include_ga = True

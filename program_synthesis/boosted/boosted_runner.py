@@ -49,9 +49,53 @@ CDC_SEMANTIC_CONTEXT = textwrap.dedent(
 ).strip()
 
 
-def get_dataset_context(target_name: str, cdc_representation: str) -> Optional[str]:
+MUSHROOM_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: secondary mushroom attributes. The target output is binary: 1 means edible, 0 means poisonous.
+    Inputs are dictionaries with named mushroom morphology fields such as cap_shape, cap_surface, cap_color, gill_attachment, gill_color, stem_root, stem_surface, stem_color, has_ring, ring_type, spore_print_color, habitat, and season.
+    Numeric size fields cap_diameter, stem_height, and stem_width are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Categorical fields use readable category names such as convex, flat, smooth, sticky, brown, white, close, distant, bulbous, rooted, pendant, woods, grasses, summer, and autumn; missing values use unknown.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x["cap_shape"] == "convex"` or `x.get("stem_width") in ("high", "very high")`.
+    """
+).strip()
+
+
+HTRU2_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named numeric profile features converted to qualitative bins: very low, low, medium, high, very high.
+    Pulse profile fields include profile_mean, profile_stdev, profile_skewness, and profile_kurtosis.
+    Dispersion-measure signal-to-noise fields include dm_snr_mean, dm_snr_stdev, dm_snr_skewness, and dm_snr_kurtosis.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x["profile_skewness"] in ("high", "very high")`.
+    """
+).strip()
+
+
+CHESS_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: chess King-Rook versus King-Pawn on a7 endgames. The target output is binary: 1 means white can win, 0 means no win.
+    Inputs are dictionaries with UCI KRKPA7 feature abbreviations such as bkblk, bkon8, bkxwp, cntxt, dsopp, hdchk, katri, rimmx, rkxwp, simpl, skach, stlmt, thrsk, wkcti, wkna8, wknck, wkovl, and wkpos.
+    Most values are true/false tactical or geometric flags. A few fields use categorical values such as black, white, none, greater, or lesser.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("bkxwp") == "true"` or `x.get("wkpos") != "none"`.
+    """
+).strip()
+
+
+def get_dataset_context(
+    target_name: str,
+    cdc_representation: str,
+    tabular_representation: str = "obfuscated",
+) -> Optional[str]:
     if target_name == "cdc_diabetes" and cdc_representation == "semantic":
         return CDC_SEMANTIC_CONTEXT
+    if tabular_representation != "semantic":
+        return None
+    if target_name == "mushroom":
+        return MUSHROOM_SEMANTIC_CONTEXT
+    if target_name == "htru2":
+        return HTRU2_SEMANTIC_CONTEXT
+    if target_name == "chess":
+        return CHESS_SEMANTIC_CONTEXT
     return None
 
 
@@ -194,6 +238,7 @@ class BoostConfig:
     whole_train_mistake_frac: float = 0.7
     whole_train_recent_fix_frac: float = 0.2
     whole_train_anchor_frac: float = 0.1
+    tabular_representation: str = "obfuscated"
     cdc_representation: str = "obfuscated"
     accept_best_on_failure: bool = False
     best_fallback_max_weak_error: float = 0.499
@@ -827,7 +872,7 @@ async def run_boosting_trial(
     total_reasoning_tokens = 0
     total_estimated_cost_usd = 0.0
     fallback_model = getattr(getattr(client, "cfg", None), "model", None)
-    dataset_context = get_dataset_context(target_name, cfg.cdc_representation)
+    dataset_context = get_dataset_context(target_name, cfg.cdc_representation, cfg.tabular_representation)
 
     def add_response_accounting(res: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal total_prompt_tokens
@@ -1458,6 +1503,7 @@ async def run_boosting_trial(
         "whole_train_repair_batch_size": cfg.whole_train_repair_batch_size,
         "sample_without_replacement": cfg.sample_without_replacement,
         "strict_acceptance": cfg.strict_acceptance,
+        "tabular_representation": cfg.tabular_representation,
         "cdc_representation": cfg.cdc_representation,
         "accept_best_on_failure": cfg.accept_best_on_failure,
         "best_fallback_max_weak_error": cfg.best_fallback_max_weak_error,
@@ -1520,13 +1566,20 @@ def build_base_config(args: argparse.Namespace) -> base_runner.Config:
     cfg.val_size = args.val_size
     cfg.test_size = args.test_size
     cfg.seed = args.seed
-    cdc_representation = getattr(args, "cdc_representation", "obfuscated")
+    tabular_representation = getattr(args, "tabular_representation", "obfuscated")
+    cdc_representation = getattr(args, "cdc_representation", None) or tabular_representation
+    os.environ["TABULAR_REPRESENTATION"] = tabular_representation
+    os.environ["MUSHROOM_REPRESENTATION"] = tabular_representation
+    os.environ["HTRU2_REPRESENTATION"] = tabular_representation
+    os.environ["CHESS_REPRESENTATION"] = tabular_representation
     os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
     os.environ["CDC_DIABETES_SEMANTIC_FALLBACK"] = (
         "1" if getattr(args, "cdc_semantic_allow_transformed_fallback", True) else "0"
     )
     cfg.dataset_dir = args.dataset_dir
-    if cdc_representation != "obfuscated":
+    if tabular_representation != "obfuscated":
+        cfg.dataset_dir = os.path.join(args.dataset_dir, f"tabular_representation_{tabular_representation}")
+    elif cdc_representation != "obfuscated":
         cfg.dataset_dir = os.path.join(args.dataset_dir, f"cdc_representation_{cdc_representation}")
     cfg.model = args.model
     cfg.provider = args.provider
@@ -1561,6 +1614,8 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
     if args.strict_acceptance:
         max_weak_error = min(max_weak_error, 0.35)
         min_alpha = max(min_alpha, 0.05)
+    tabular_representation = getattr(args, "tabular_representation", "obfuscated")
+    cdc_representation = getattr(args, "cdc_representation", None) or tabular_representation
 
     return BoostConfig(
         boost_rounds=args.boost_rounds,
@@ -1585,7 +1640,8 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
         whole_train_mistake_frac=args.whole_train_mistake_frac,
         whole_train_recent_fix_frac=args.whole_train_recent_fix_frac,
         whole_train_anchor_frac=args.whole_train_anchor_frac,
-        cdc_representation=args.cdc_representation,
+        tabular_representation=tabular_representation,
+        cdc_representation=cdc_representation,
         accept_best_on_failure=args.accept_best_on_failure,
         best_fallback_max_weak_error=args.best_fallback_max_weak_error,
     )
@@ -1673,6 +1729,7 @@ async def main_async(args: argparse.Namespace) -> int:
                                 "max_weak_error": boost_cfg.max_weak_error,
                                 "min_alpha": boost_cfg.min_alpha,
                                 "strict_acceptance": boost_cfg.strict_acceptance,
+                                "tabular_representation": boost_cfg.tabular_representation,
                                 "sample_without_replacement": boost_cfg.sample_without_replacement,
                                 "repair_rounds": boost_cfg.repair_rounds,
                                 "repair_mistake_limit": boost_cfg.repair_mistake_limit,
@@ -1734,10 +1791,16 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--dataset-dir", default=DEFAULT_DATASET_DIR, help="Dataset cache directory.")
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for summaries and saved ensembles.")
     p.add_argument(
+        "--tabular-representation",
+        choices=["obfuscated", "semantic"],
+        default=os.getenv("TABULAR_REPRESENTATION", "obfuscated"),
+        help="Input representation for non-CDC tabular datasets. semantic uses named fields and readable bins/categories.",
+    )
+    p.add_argument(
         "--cdc-representation",
         choices=["obfuscated", "semantic"],
-        default=os.getenv("CDC_DIABETES_REPRESENTATION", "obfuscated"),
-        help="CDC input representation. semantic uses feature names and qualitative bins.",
+        default=os.getenv("CDC_DIABETES_REPRESENTATION"),
+        help="Optional CDC-specific representation override. Defaults to --tabular-representation.",
     )
     p.add_argument(
         "--no-cdc-semantic-transformed-fallback",

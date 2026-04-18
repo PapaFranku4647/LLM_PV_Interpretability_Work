@@ -20,7 +20,12 @@ if PROGRAM_SYNTHESIS_DIR not in sys.path:
 
 from program_synthesis import runner as base_runner  # noqa: E402
 from program_synthesis.boosted import boosted_runner  # noqa: E402
-from src.data_handler import CDCDiabetesDataGenerator  # noqa: E402
+from src.data_handler import (  # noqa: E402
+    CDCDiabetesDataGenerator,
+    ChessDataGenerator,
+    HTRU2DataGenerator,
+    MushroomDataGenerator,
+)
 
 
 class BoostedMathTests(unittest.TestCase):
@@ -188,6 +193,21 @@ class BoostedMathTests(unittest.TestCase):
         self.assertIn("HighBP:yes,BMI:high,Age:medium -> 1", prompt)
         self.assertIn('{"code": "<python function>"}', prompt)
 
+    def test_non_cdc_semantic_contexts_are_selected_by_tabular_representation(self) -> None:
+        self.assertIn(
+            "secondary mushroom",
+            boosted_runner.get_dataset_context("mushroom", "obfuscated", "semantic"),
+        )
+        self.assertIn(
+            "HTRU2 pulsar",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "semantic"),
+        )
+        self.assertIn(
+            "King-Rook",
+            boosted_runner.get_dataset_context("chess", "obfuscated", "semantic"),
+        )
+        self.assertIsNone(boosted_runner.get_dataset_context("mushroom", "obfuscated", "obfuscated"))
+
     def test_accept_best_on_failure_keeps_best_valid_retry(self) -> None:
         class StubClient:
             def __init__(self) -> None:
@@ -308,6 +328,76 @@ class BoostedMathTests(unittest.TestCase):
         self.assertIn(positive_samples[0]["BMI"], CDCDiabetesDataGenerator.SEMANTIC_BIN_LABELS)
         self.assertIn(negative_samples[0]["Age"], CDCDiabetesDataGenerator.SEMANTIC_BIN_LABELS)
         self.assertIn(positive_samples[0]["Sex"], {"female", "male"})
+
+    def test_semantic_mushroom_generator_uses_named_features_categories_and_bins(self) -> None:
+        raw = [
+            {
+                "cap-diameter": str(1 + idx),
+                "cap-shape": "x" if idx % 2 else "f",
+                "cap-surface": "s",
+                "cap-color": "n",
+                "does-bruise-or-bleed": "t" if idx % 2 else "f",
+                "gill-attachment": "a",
+                "gill-spacing": "c",
+                "gill-color": "w",
+                "stem-height": str(2 + idx),
+                "stem-width": str(3 + idx),
+                "stem-root": "b",
+                "stem-surface": "s",
+                "stem-color": "w",
+                "veil-type": "u",
+                "veil-color": "w",
+                "has-ring": "t",
+                "ring-type": "p",
+                "spore-print-color": "k",
+                "habitat": "d",
+                "season": "u",
+            }
+            for idx in range(10)
+        ]
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "semantic"}):
+            generator = MushroomDataGenerator(sequence_length=20, num_samples=2)
+            generator._init_semantic_bins(raw)
+            sample = generator._semantic_sample(raw[0])
+
+        self.assertIn("cap_diameter", sample)
+        self.assertNotIn("x0", sample)
+        self.assertIn(sample["cap_diameter"], ["very low", "low", "medium", "high", "very high"])
+        self.assertEqual(sample["cap_shape"], "flat")
+        self.assertEqual(sample["has_ring"], "yes")
+        self.assertEqual(sample["habitat"], "woods")
+
+    def test_semantic_htru2_generator_uses_named_binned_features(self) -> None:
+        raw = [
+            {name: str(idx + feat_idx) for feat_idx, name in enumerate(HTRU2DataGenerator.RAW_FEATURE_NAMES)}
+            for idx in range(10)
+        ]
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "semantic"}):
+            generator = HTRU2DataGenerator(sequence_length=8, num_samples=2)
+            generator._init_semantic_bins(raw)
+            sample = generator._semantic_sample(raw[0])
+
+        self.assertIn("profile_mean", sample)
+        self.assertIn("dm_snr_kurtosis", sample)
+        self.assertNotIn("x0", sample)
+        self.assertIn(sample["profile_mean"], ["very low", "low", "medium", "high", "very high"])
+
+    def test_semantic_chess_generator_uses_uci_names_and_readable_values(self) -> None:
+        raw = {name: "t" for name in ChessDataGenerator.RAW_FEATURE_NAMES}
+        raw["dsopp"] = "g"
+        raw["hdchk"] = "w"
+        raw["wkpos"] = "n"
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "semantic"}):
+            generator = ChessDataGenerator(sequence_length=35, num_samples=2)
+            sample = generator._semantic_sample(raw)
+
+        self.assertEqual(sample["bkblk"], "true")
+        self.assertEqual(sample["dsopp"], "greater")
+        self.assertEqual(sample["hdchk"], "white")
+        self.assertEqual(sample["wkpos"], "none")
 
     def test_run_boosting_trial_stops_on_perfect_train(self) -> None:
         class StubClient:

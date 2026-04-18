@@ -55,5 +55,35 @@ python program_synthesis/boosted/tamu_api_smoke.py \
 
 - `--val-size` defaults to `0`, so the dataset split is train/test only.
 - If you later set `--val-size > 0`, the runner will log validation metrics as well.
+- `--tabular-representation semantic` enables named features and readable bins/categories for mushroom, HTRU2, chess, and CDC.
+- `--cdc-representation semantic` remains available as a CDC-specific override; by default CDC follows `--tabular-representation`.
 - Batch-size sweeps plus the per-round attempt logs are intended to support plotting train/test accuracy against boosting round `T`.
 - This reuses the provider and dataset machinery from `program_synthesis/runner.py`, but keeps outputs isolated under `program_synthesis/boosted/`.
+
+## Semantic Pilot Commands
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --api-mode chat_completions \
+  --functions fn_n \
+  --lengths 20 \
+  --train-size 256 \
+  --val-size 256 \
+  --test-size 2000 \
+  --batch-sizes 256 \
+  --boost-rounds 1 \
+  --num-trials 1 \
+  --round-retries 8 \
+  --sample-without-replacement \
+  --tabular-representation semantic \
+  --max-weak-error 0.3025 \
+  --accept-best-on-failure \
+  --best-fallback-max-weak-error 0.499 \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/semantic_mushroom_pilot_t1_b256_s1
+```
+
+Swap `fn_n --lengths 20` for `fn_p --lengths 8` or `fn_q --lengths 35` to run HTRU2 or chess with the same semantic representation.

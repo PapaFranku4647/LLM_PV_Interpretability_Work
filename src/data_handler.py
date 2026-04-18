@@ -33,6 +33,59 @@ from .target_functions import TARGET_FUNCTIONS
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
+SEMANTIC_BIN_LABELS = ["very low", "low", "medium", "high", "very high"]
+
+
+def _get_tabular_representation(env_name: str) -> str:
+    representation = os.getenv(env_name, os.getenv("TABULAR_REPRESENTATION", "obfuscated")).strip().lower()
+    if representation not in {"obfuscated", "semantic"}:
+        raise ValueError(f"{env_name} must be either 'obfuscated' or 'semantic', got {representation!r}.")
+    return representation
+
+
+def _is_missing_value(value: Any) -> bool:
+    normalized = str(value).strip().lower()
+    return normalized in {"", "?", "nan", "none", "null"}
+
+
+def _semantic_token(value: Any) -> str:
+    normalized = str(value).strip().lower().replace(" ", "_").replace("-", "_")
+    return normalized if normalized and normalized not in {"?", "nan", "none", "null"} else "unknown"
+
+
+def _quantile_thresholds(values: List[float]) -> List[float]:
+    values = sorted(values)
+    if not values:
+        return []
+    thresholds: List[float] = []
+    n = len(values)
+    for frac in (0.2, 0.4, 0.6, 0.8):
+        pos = frac * (n - 1)
+        lo = int(math.floor(pos))
+        hi = int(math.ceil(pos))
+        if lo == hi:
+            threshold = values[lo]
+        else:
+            weight = pos - lo
+            threshold = values[lo] * (1.0 - weight) + values[hi] * weight
+        thresholds.append(float(threshold))
+    return thresholds
+
+
+def _semantic_bin_from_thresholds(raw_value: Any, thresholds: List[float]) -> str:
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return "unknown"
+    bin_idx = 0
+    for threshold in thresholds:
+        if value > threshold:
+            bin_idx += 1
+        else:
+            break
+    bin_idx = max(0, min(bin_idx, len(SEMANTIC_BIN_LABELS) - 1))
+    return SEMANTIC_BIN_LABELS[bin_idx]
+
 # Optional dependency handling for performance
 try:
     from sympy import nextprime, isprime
@@ -1937,16 +1990,45 @@ class HTRU2DataGenerator(BaseDataGenerator):
         'Profile_mean', 'Profile_stdev', 'Profile_skewness', 'Profile_kurtosis',
         'DM_mean', 'DM_stdev', 'DM_skewness', 'DM_kurtosis'
     ]
+    SEMANTIC_FEATURE_NAMES = [
+        "profile_mean", "profile_stdev", "profile_skewness", "profile_kurtosis",
+        "dm_snr_mean", "dm_snr_stdev", "dm_snr_skewness", "dm_snr_kurtosis",
+    ]
     
     def __init__(self, sequence_length: int, num_samples: int, device: str = 'cpu'):
         super().__init__(sequence_length, num_samples, device)
         if num_samples % 2 != 0:
             raise ValueError("num_samples must be even for a 50/50 split.")
         self._data_cache = None
+        self.representation = _get_tabular_representation("HTRU2_REPRESENTATION")
+        self._semantic_thresholds: Dict[int, List[float]] = {}
+        self._semantic_bins_initialized = False
         n_numeric = len(self.RAW_FEATURE_NAMES)
         self._A_diag = np.random.normal(0, 1, n_numeric)
         self._b = np.random.normal(0, 1, n_numeric)
-        logger.info(f"HTRU2DataGenerator initialized for {num_samples} samples")
+        logger.info(f"HTRU2DataGenerator initialized for {num_samples} samples (representation={self.representation})")
+
+    def _init_semantic_bins(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._semantic_thresholds[idx] = _quantile_thresholds(values)
+        self._semantic_bins_initialized = True
+
+    def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        return {
+            self.SEMANTIC_FEATURE_NAMES[idx]: _semantic_bin_from_thresholds(
+                raw.get(name, ""),
+                self._semantic_thresholds.get(idx, []),
+            )
+            for idx, name in enumerate(self.RAW_FEATURE_NAMES)
+        }
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -1981,28 +2063,37 @@ class HTRU2DataGenerator(BaseDataGenerator):
             all_raw_samples.append(features)
             labels.append(label)
         
-        numeric_values_list = []
-        for sample in all_raw_samples:
-            numeric_values = [float(sample[name]) for name in self.RAW_FEATURE_NAMES]
-            numeric_values_list.append(numeric_values)
-        
-        numeric_array = np.array(numeric_values_list)
-        transformed_numeric = numeric_array * self._A_diag + self._b
-        
         positive_samples = []
         negative_samples = []
-        
+
+        if self.representation == "semantic":
+            self._init_semantic_bins(all_raw_samples)
+        else:
+            numeric_values_list = []
+            for sample in all_raw_samples:
+                numeric_values = [float(sample[name]) for name in self.RAW_FEATURE_NAMES]
+                numeric_values_list.append(numeric_values)
+
+            numeric_array = np.array(numeric_values_list)
+            transformed_numeric = numeric_array * self._A_diag + self._b
+
         for sample_idx, raw_sample in enumerate(all_raw_samples):
-            features = {}
-            for feat_idx, name in enumerate(self.RAW_FEATURE_NAMES):
-                features[f"x{feat_idx}"] = f"{transformed_numeric[sample_idx][feat_idx]:.2f}"
-            
+            if self.representation == "semantic":
+                features = self._semantic_sample(raw_sample)
+            else:
+                features = {}
+                for feat_idx, name in enumerate(self.RAW_FEATURE_NAMES):
+                    features[f"x{feat_idx}"] = f"{transformed_numeric[sample_idx][feat_idx]:.2f}"
+
             if labels[sample_idx] == 1:
                 positive_samples.append(features)
             else:
                 negative_samples.append(features)
         
-        logger.info(f"Loaded and transformed {len(positive_samples)} positive (pulsar) and {len(negative_samples)} negative (non-pulsar) samples")
+        logger.info(
+            f"Loaded and transformed {len(positive_samples)} positive (pulsar) and "
+            f"{len(negative_samples)} negative (non-pulsar) samples"
+        )
         self._data_cache = (positive_samples, negative_samples)
         return self._data_cache
     
@@ -2026,7 +2117,22 @@ class HTRU2DataGenerator(BaseDataGenerator):
 
 class ChessDataGenerator(BaseDataGenerator):
     
-    RAW_FEATURE_NAMES = [f'f{i}' for i in range(35)]
+    RAW_FEATURE_NAMES = [
+        'bkblk', 'bknwy', 'bkon8', 'bkona', 'bkspr', 'bkxbq', 'bkxcr',
+        'bkxwp', 'blxwp', 'bxqsq', 'cntxt', 'dsopp', 'dwipd', 'hdchk',
+        'katri', 'mulch', 'qxmsq', 'r2ar8', 'reskd', 'reskr', 'rimmx',
+        'rkxwp', 'rxmsq', 'simpl', 'skach', 'skewr', 'skrxp', 'spcop',
+        'stlmt', 'thrsk', 'wkcti', 'wkna8', 'wknck', 'wkovl', 'wkpos',
+    ]
+    SEMANTIC_VALUE_LABELS = {
+        "t": "true",
+        "f": "false",
+        "n": "none",
+        "b": "black",
+        "w": "white",
+        "g": "greater",
+        "l": "lesser",
+    }
     
     NUMERIC_INDICES = set()
     
@@ -2035,9 +2141,10 @@ class ChessDataGenerator(BaseDataGenerator):
         if num_samples % 2 != 0:
             raise ValueError("num_samples must be even for a 50/50 split.")
         self._data_cache = None
+        self.representation = _get_tabular_representation("CHESS_REPRESENTATION")
         self._category_maps: Dict[int, Dict[str, str]] = {}
         self._maps_initialized = False
-        logger.info(f"ChessDataGenerator initialized for {num_samples} samples")
+        logger.info(f"ChessDataGenerator initialized for {num_samples} samples (representation={self.representation})")
     
     def _init_category_maps(self, all_samples: List[Dict[str, str]]) -> None:
         if self._maps_initialized:
@@ -2060,6 +2167,12 @@ class ChessDataGenerator(BaseDataGenerator):
                 val = raw[name]
                 transformed[new_key] = self._category_maps[idx].get(val, "c_unk")
         return transformed
+
+    def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        return {
+            name: self.SEMANTIC_VALUE_LABELS.get(_semantic_token(raw.get(name, "")), _semantic_token(raw.get(name, "")))
+            for name in self.RAW_FEATURE_NAMES
+        }
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -2130,10 +2243,13 @@ class ChessDataGenerator(BaseDataGenerator):
                 elif label_str == 'nowin':
                     negative_raw.append(features)
         
-        self._init_category_maps(all_raw_samples)
-        
-        positive_samples = [self._transform_sample(s) for s in positive_raw]
-        negative_samples = [self._transform_sample(s) for s in negative_raw]
+        if self.representation == "semantic":
+            positive_samples = [self._semantic_sample(s) for s in positive_raw]
+            negative_samples = [self._semantic_sample(s) for s in negative_raw]
+        else:
+            self._init_category_maps(all_raw_samples)
+            positive_samples = [self._transform_sample(s) for s in positive_raw]
+            negative_samples = [self._transform_sample(s) for s in negative_raw]
         
         logger.info(f"Loaded and transformed {len(positive_samples)} positive (won) and {len(negative_samples)} negative (nowin) samples")
         self._data_cache = (positive_samples, negative_samples)
@@ -2168,20 +2284,82 @@ class MushroomDataGenerator(BaseDataGenerator):
     ]
     
     NUMERIC_INDICES = {0, 8, 9}
+    SEMANTIC_FEATURE_NAMES = [name.replace("-", "_") for name in RAW_FEATURE_NAMES]
+    CATEGORY_VALUE_LABELS = {
+        "cap-shape": {
+            "b": "bell", "c": "conical", "f": "flat", "o": "other",
+            "p": "spherical", "s": "sunken", "x": "convex",
+        },
+        "cap-surface": {
+            "d": "dry", "e": "fleshy", "g": "grooved", "h": "shiny",
+            "i": "fibrous", "k": "silky", "l": "leathery", "s": "smooth",
+            "t": "sticky", "w": "wrinkled", "y": "scaly",
+        },
+        "cap-color": {
+            "b": "buff", "e": "red", "g": "gray", "k": "black",
+            "l": "blue", "n": "brown", "o": "orange", "p": "pink",
+            "r": "green", "u": "purple", "w": "white", "y": "yellow",
+        },
+        "does-bruise-or-bleed": {"t": "yes", "f": "no"},
+        "gill-attachment": {
+            "a": "adnate", "d": "decurrent", "e": "free", "f": "none",
+            "p": "pores", "s": "sinuate", "x": "adnexed",
+        },
+        "gill-spacing": {"c": "close", "d": "distant", "f": "none"},
+        "gill-color": {
+            "b": "buff", "e": "red", "f": "none", "g": "gray",
+            "k": "black", "n": "brown", "o": "orange", "p": "pink",
+            "r": "green", "u": "purple", "w": "white", "y": "yellow",
+        },
+        "stem-root": {
+            "b": "bulbous", "c": "club", "f": "none", "r": "rooted", "s": "swollen",
+        },
+        "stem-surface": {
+            "f": "none", "g": "grooved", "h": "shiny", "i": "fibrous",
+            "k": "silky", "s": "smooth", "t": "sticky", "y": "scaly",
+        },
+        "stem-color": {
+            "b": "buff", "e": "red", "f": "none", "g": "gray",
+            "k": "black", "l": "blue", "n": "brown", "o": "orange",
+            "p": "pink", "r": "green", "u": "purple", "w": "white", "y": "yellow",
+        },
+        "veil-type": {"u": "universal"},
+        "veil-color": {
+            "e": "red", "k": "black", "n": "brown", "u": "purple",
+            "w": "white", "y": "yellow",
+        },
+        "has-ring": {"t": "yes", "f": "no"},
+        "ring-type": {
+            "e": "evanescent", "f": "flaring", "g": "grooved", "l": "large",
+            "m": "movable", "p": "pendant", "r": "zone", "z": "none",
+        },
+        "spore-print-color": {
+            "g": "gray", "k": "black", "n": "brown", "p": "pink",
+            "r": "green", "u": "purple", "w": "white",
+        },
+        "habitat": {
+            "d": "woods", "g": "grasses", "h": "heaths", "l": "leaves",
+            "m": "meadows", "p": "paths", "u": "urban", "w": "waste",
+        },
+        "season": {"a": "autumn", "s": "spring", "u": "summer", "w": "winter"},
+    }
     
     def __init__(self, sequence_length: int, num_samples: int, device: str = 'cpu'):
         super().__init__(sequence_length, num_samples, device)
         if num_samples % 2 != 0:
             raise ValueError("num_samples must be even for a 50/50 split.")
         self._data_cache = None
+        self.representation = _get_tabular_representation("MUSHROOM_REPRESENTATION")
         self._category_maps: Dict[int, Dict[str, str]] = {}
+        self._semantic_thresholds: Dict[int, List[float]] = {}
         self._maps_initialized = False
+        self._semantic_bins_initialized = False
         numeric_indices_list = sorted(list(self.NUMERIC_INDICES))
         n_numeric = len(numeric_indices_list)
         self._A_diag = np.random.normal(0, 1, n_numeric)
         self._b = np.random.normal(0, 1, n_numeric)
         self._numeric_indices_list = numeric_indices_list
-        logger.info(f"MushroomDataGenerator initialized for {num_samples} samples")
+        logger.info(f"MushroomDataGenerator initialized for {num_samples} samples (representation={self.representation})")
     
     def _init_category_maps(self, all_samples: List[Dict[str, str]]) -> None:
         if self._maps_initialized:
@@ -2193,6 +2371,40 @@ class MushroomDataGenerator(BaseDataGenerator):
                 pad_width = len(str(max_categories - 1))
                 self._category_maps[idx] = {v: f"c{i:0{pad_width}d}" for i, v in enumerate(unique_vals)}
         self._maps_initialized = True
+
+    def _init_semantic_bins(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        for idx in self._numeric_indices_list:
+            name = self.RAW_FEATURE_NAMES[idx]
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._semantic_thresholds[idx] = _quantile_thresholds(values)
+        self._semantic_bins_initialized = True
+
+    def _semantic_categorical_value(self, feature_name: str, raw_value: str) -> str:
+        if _is_missing_value(raw_value):
+            return "unknown"
+        value_key = str(raw_value).strip().lower()
+        return self.CATEGORY_VALUE_LABELS.get(feature_name, {}).get(value_key, _semantic_token(value_key))
+
+    def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        semantic: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                semantic[semantic_name] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+            else:
+                semantic[semantic_name] = self._semantic_categorical_value(name, raw_value)
+        return semantic
     
     def _transform_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         transformed = {}
@@ -2260,10 +2472,14 @@ class MushroomDataGenerator(BaseDataGenerator):
             else:
                 negative_raw.append(features)
         
-        self._init_category_maps(all_raw_samples)
-        
-        positive_samples = [self._transform_sample(s) for s in positive_raw]
-        negative_samples = [self._transform_sample(s) for s in negative_raw]
+        if self.representation == "semantic":
+            self._init_semantic_bins(all_raw_samples)
+            positive_samples = [self._semantic_sample(s) for s in positive_raw]
+            negative_samples = [self._semantic_sample(s) for s in negative_raw]
+        else:
+            self._init_category_maps(all_raw_samples)
+            positive_samples = [self._transform_sample(s) for s in positive_raw]
+            negative_samples = [self._transform_sample(s) for s in negative_raw]
         
         logger.info(f"Loaded and transformed {len(positive_samples)} positive and {len(negative_samples)} negative samples")
         self._data_cache = (positive_samples, negative_samples)

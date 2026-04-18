@@ -102,6 +102,20 @@ The 5-trial matched follow-up is saved in
 - HTRU2 obfuscated: mean test 0.9032, std 0.0204, best trial 0.9300, best
   baseline 0.9340.
 
+Status update: semantic/named tabular representations are now wired for mushroom,
+HTRU2, and chess through `--tabular-representation semantic`. This creates:
+
+- Mushroom rows with fields like `cap_shape`, `gill_color`, `stem_width`,
+  readable category names, and binned numeric size fields.
+- HTRU2 rows with fields like `profile_skewness` and `dm_snr_kurtosis`, all
+  binned into qualitative levels.
+- Chess rows with UCI KRKPA7 feature names such as `bkblk`, `bkxwp`, `wkpos`,
+  and readable values like true/false/none/white.
+
+Next experiment: rerun one-trial semantic pilots for `fn_n`, `fn_p`, and `fn_q`
+using `--tabular-representation semantic`; only run 5-trial aggregates where the
+pilot closes a meaningful part of the current baseline gap.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the
