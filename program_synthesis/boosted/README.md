@@ -149,3 +149,8 @@ python program_synthesis/boosted/boosted_runner.py \
   --no-tools \
   --output-dir program_synthesis/boosted/runs/semantic_cdc_stratified_diverse_t4_b64_b128_s1
 ```
+
+This batch-64/128 pilot has been run. Results are summarized in
+`program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`; it did not improve
+over the current `T=1` CDC semantic result, and batch accuracy was not predictive
+of full-train/test accuracy.

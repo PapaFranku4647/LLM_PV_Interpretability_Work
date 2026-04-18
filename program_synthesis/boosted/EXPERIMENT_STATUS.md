@@ -175,9 +175,25 @@ feature-diverse fill after each accepted learner. It also supports validation
 early stopping through `--early-stop-val-patience` and
 `--restore-best-val-ensemble`.
 
-Next pilot: CDC semantic with a 10k local train split, 2k validation split,
-10k test split, `T=4`, batch sizes 64 and 128, strict full-train weak-error gate
-at 0.45, and validation early stopping.
+The CDC stratified-diverse pilot is now saved in
+`program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`, with aggregate CSV at
+`program_synthesis/codeboost_semantic_cdc_stratified_diverse_t4_b64_b128_s1.csv`.
+
+CDC stratified-diverse pilot test accuracies:
+
+- Batch 64: final test 0.7076, final val 0.6985, kept 1 round after
+  best-validation restoration.
+- Batch 128: final test 0.6902, final val 0.6800, kept 1 round after
+  best-validation restoration.
+
+Batch accuracy was not predictive in this pilot: across 11 candidates, the
+batch/train correlation was about 0.06 and batch/test correlation was about
+0.13. Do not optimize prompt-batch accuracy alone.
+
+Conclusion: the sampler machinery is useful and preserved, but small-batch
+sequential residual boosting did not improve CDC. Next sampler work should use
+batch 256 or a candidate-library selection loop that generates several weak
+programs and chooses by full-train/validation behavior.
 
 ## Deferred Sampler Design
 

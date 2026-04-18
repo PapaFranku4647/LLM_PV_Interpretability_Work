@@ -33,6 +33,8 @@ and what currently looks strongest.
 - Matched 5-trial CodeBoost follow-up: `program_synthesis/CODEBOOST_MATCHED_RESULTS.md`
 - Non-CDC semantic pilot: `program_synthesis/CODEBOOST_SEMANTIC_PILOT.md`
 - Hybrid non-CDC pilot: `program_synthesis/CODEBOOST_HYBRID_PILOT.md`
+- CDC stratified diverse sampler pilot:
+  `program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`
 - Running status and cleanup warnings: `program_synthesis/boosted/EXPERIMENT_STATUS.md`
 - Baseline raw outputs:
   - `program_synthesis/baseline_results_core.csv`
@@ -44,6 +46,7 @@ and what currently looks strongest.
   - `program_synthesis/codeboost_matched_t1_b256_s5.csv`
   - `program_synthesis/codeboost_semantic_pilot_t1_b256_s1.csv`
   - `program_synthesis/codeboost_hybrid_pilot_t1_b256_s1.csv`
+  - `program_synthesis/codeboost_semantic_cdc_stratified_diverse_t4_b64_b128_s1.csv`
 
 Large generated run directories are intentionally ignored by git. Do not delete
 these without first saving the useful summaries:
@@ -124,6 +127,18 @@ Chess hybrid was not run because the previous chess semantic pilot was already
 far from the baseline and hybrid code tokens do not add the missing chess-domain
 feature descriptions.
 
+CDC stratified diverse sampler pilot:
+
+| Batch | Train size | Val size | Test size | Kept rounds | Final val | Final test | Attempts | Cost | Takeaway |
+| ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
+| 64 | 10000 | 2000 | 10000 | 1 | 0.6985 | 0.7076 | 6 | $0.3033 | Later residual learners failed the strict gate or hurt validation. |
+| 128 | 10000 | 2000 | 10000 | 1 | 0.6800 | 0.6902 | 5 | $0.2848 | Validation restoration trimmed back to the first learner. |
+
+Across the 11 attempted candidates, batch accuracy had low correlation with
+full-train accuracy, about 0.06, and test accuracy, about 0.13. In this pilot,
+raising prompt-batch accuracy was not a reliable route to higher overall
+accuracy.
+
 ## Other Saved Run Families
 
 These are generated from the `summary.csv` files under
@@ -200,15 +215,16 @@ Implementation status:
   acceptance.
 - Validation early stopping is wired through `--early-stop-val-patience` and
   `--restore-best-val-ensemble`.
-- The next test is whether this sampler makes `T>1` CDC semantic boosting beat
-  the current strong `T=1` semantic result.
+- The first batch-64/128 CDC sampler pilot did not beat the current strong `T=1`
+  semantic result. Next sampler work should use a candidate-library selection
+  loop or batch 256, not more small-batch blind sequential boosting.
 
 ## Next Runs
 
-Do not run a full hybrid budget from the current pilot. The next run should test
-the stratified diverse/residual sampler on CDC first, then HTRU2 if CDC improves.
+Do not run a full hybrid budget from the current pilot. The first CDC
+stratified-diverse sampler pilot is complete and did not improve on `T=1`.
 
-Planned CDC sampler pilot:
+Completed CDC sampler pilot:
 
 ```bash
 python program_synthesis/boosted/boosted_runner.py \
