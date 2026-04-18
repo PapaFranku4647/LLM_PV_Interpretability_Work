@@ -58,7 +58,9 @@ results needed for the paper table.
 The first core baseline matrix has been saved in
 `program_synthesis/BASELINE_RESULTS.md`, with raw outputs in
 `program_synthesis/baseline_results_core.csv` and
-`program_synthesis/baseline_results_core.jsonl`.
+`program_synthesis/baseline_results_core.jsonl`. A corrected rerun with XGBoost
+installed is saved in `program_synthesis/baseline_results_core_xgboost.csv` and
+`program_synthesis/baseline_results_core_xgboost.jsonl`.
 
 Best test accuracies from that run:
 
@@ -69,8 +71,8 @@ Best test accuracies from that run:
 
 The current best semantic CodeBoost CDC result, 0.70321 mean test accuracy, is
 about 1.9 percentage points below the strongest CDC baseline but competitive
-with several core baselines. XGBoost did not run in this snapshot because it was
-not installed.
+with several core baselines. XGBoost reached 0.7037 on CDC, essentially tied
+with the current semantic CodeBoost result under this small-train setting.
 
 ## Deferred Sampler Design
 
