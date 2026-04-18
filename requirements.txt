@@ -12,6 +12,7 @@ safetensors
 
 # --- API Clients for LLM Services ---
 openai
+litellm
 google-genai
 anthropic
 httpx

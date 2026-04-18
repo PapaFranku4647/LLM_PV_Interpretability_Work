@@ -37,6 +37,12 @@ class BoostedMathTests(unittest.TestCase):
         self.assertAlmostEqual(float(cost["estimated_output_cost_usd"]), 0.028, places=10)
         self.assertAlmostEqual(float(cost["estimated_total_cost_usd"]), 0.02975, places=10)
 
+    def test_estimate_cost_usd_leaves_gpt_5_4_unknown(self) -> None:
+        cost = boosted_runner.estimate_cost_usd("gpt-5.4", 1000, 2000)
+
+        self.assertIsNone(cost["pricing_model"])
+        self.assertIsNone(cost["estimated_total_cost_usd"])
+
     def test_update_distribution_upweights_misclassified_examples(self) -> None:
         weights = [0.25, 0.25, 0.25, 0.25]
         labels_pm = [1, 1, -1, -1]
@@ -1238,6 +1244,21 @@ class TamuClientConfigTests(unittest.TestCase):
         self.assertEqual(client_type, "openai_compatible")
         self.assertEqual(client.kwargs["base_url"], cfg.api_base_url)
 
+    def test_azure_api_version_defaults_match_api_mode(self) -> None:
+        cfg = base_runner.Config()
+        cfg.api_key = "key"
+        cfg.azure_endpoint = "https://example.openai.azure.com/"
+        cfg.api_version = ""
+        cfg.api_base_url = ""
+
+        cfg.api_mode = "responses"
+        responses_settings = base_runner.resolve_openai_client_settings(cfg)
+        self.assertEqual(responses_settings["api_version"], "2025-03-01-preview")
+
+        cfg.api_mode = "chat_completions"
+        chat_settings = base_runner.resolve_openai_client_settings(cfg)
+        self.assertEqual(chat_settings["api_version"], "2024-12-01-preview")
+
     def test_create_openai_client_prefers_azure_key_when_endpoint_present(self) -> None:
         class DummyAzureClient:
             def __init__(self, **kwargs) -> None:
@@ -1268,6 +1289,15 @@ class TamuClientConfigTests(unittest.TestCase):
         resolved = base_runner.resolve_openai_request_model(cfg)
 
         self.assertEqual(resolved, "gpt-5.2-deep-learning-fundamentals")
+
+    def test_resolve_openai_request_model_maps_gpt_5_4_aliases(self) -> None:
+        cfg = base_runner.Config()
+        cfg.model = "protected.gpt-5.4-nano"
+        cfg.azure_endpoint = "https://example.openai.azure.com/"
+
+        resolved = base_runner.resolve_openai_request_model(cfg)
+
+        self.assertEqual(resolved, "gpt-5.4-nano")
 
     def test_resolve_openai_request_model_prefers_explicit_deployment_env(self) -> None:
         cfg = base_runner.Config()

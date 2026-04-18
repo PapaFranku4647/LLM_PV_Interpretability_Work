@@ -713,11 +713,16 @@ def resolve_openai_client_settings(cfg: Config) -> Dict[str, Any]:
             default=api_key,
         )
         if not api_version:
+            default_api_version = (
+                AZURE_RESPONSES_API_VERSION
+                if (getattr(cfg, "api_mode", "") or "").strip() == "responses"
+                else AZURE_CHAT_API_VERSION
+            )
             api_version = _env_first(
                 "AZURE_OPENAI_API_VERSION",
                 "OPENAI_API_VERSION",
                 "TAMU_API_VERSION",
-                default="2024-12-01-preview",
+                default=default_api_version,
             )
     return {
         "api_key": api_key,
@@ -755,10 +760,23 @@ def create_openai_client(cfg: Config) -> Tuple[Any, str]:
     return AsyncOpenAI(**client_kwargs), client_type
 
 
+AZURE_CHAT_API_VERSION = "2024-12-01-preview"
+AZURE_RESPONSES_API_VERSION = "2025-03-01-preview"
+
 AZURE_DEPLOYMENT_ALIASES = {
     "protected.gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
     "gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
+    "protected.gpt-5.4": "gpt-5.4",
+    "gpt-5.4": "gpt-5.4",
+    "protected.gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "protected.gpt-5.4-nano": "gpt-5.4-nano",
+    "gpt-5.4-nano": "gpt-5.4-nano",
 }
+
+
+def _is_azure_gpt_54_family(model_name: str) -> bool:
+    return "gpt-5.4" in (model_name or "").strip().lower()
 
 
 def resolve_openai_request_model(cfg: Config) -> str:
@@ -827,8 +845,11 @@ class Runner:
         self._anthropic_timeout_logged = False
         self._anthropic_thinking_warned = False
         self._anthropic_tool_use_unhandled_warned = False
+        self._openai_chat_reasoning_ignored_warned = False
+        self._openai_responses_sampling_ignored_warned = False
         if self.provider == "openai":
             self.client, self.client_type = create_openai_client(cfg)
+            openai_settings = resolve_openai_client_settings(cfg)
             self.log.info(
                 "openai_provider_enabled",
                 extra={
@@ -838,7 +859,7 @@ class Runner:
                     "api_mode": cfg.api_mode,
                     "has_api_base_url": bool((cfg.api_base_url or "").strip()),
                     "has_azure_endpoint": bool((cfg.azure_endpoint or "").strip()),
-                    "api_version": (cfg.api_version or "").strip() or None,
+                    "api_version": openai_settings.get("api_version") or None,
                 },
             )
         elif self.provider == "gemini":
@@ -995,6 +1016,52 @@ class Runner:
         text = getattr(first, "text", None)
         return text.strip() if isinstance(text, str) else ""
 
+    @staticmethod
+    def _extract_text_from_responses_response(res: Any) -> str:
+        output_text = res.get("output_text", "") if isinstance(res, Mapping) else getattr(res, "output_text", "")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = res.get("output", []) if isinstance(res, Mapping) else getattr(res, "output", []) or []
+        chunks: List[str] = []
+        for item in output:
+            item_type = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
+            if item_type == "message":
+                content = item.get("content", []) if isinstance(item, Mapping) else getattr(item, "content", []) or []
+                for block in content:
+                    block_type = block.get("type") if isinstance(block, Mapping) else getattr(block, "type", None)
+                    if block_type in {"output_text", "text"}:
+                        text = block.get("text") if isinstance(block, Mapping) else getattr(block, "text", None)
+                        if isinstance(text, str) and text.strip():
+                            chunks.append(text.strip())
+            elif item_type in {"output_text", "text"}:
+                text = item.get("text") if isinstance(item, Mapping) else getattr(item, "text", None)
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+        return "\n".join(chunks).strip()
+
+    def _openai_responses_create_via_litellm_sync(self, body: Dict[str, Any]) -> Any:
+        settings = resolve_openai_client_settings(self.cfg)
+        if not settings["use_azure"]:
+            raise RuntimeError("LiteLLM Responses fallback is only wired for Azure/TAMU endpoints.")
+        try:
+            import litellm
+        except ImportError as exc:
+            raise RuntimeError(
+                "Azure Responses is unavailable through the installed OpenAI SDK and LiteLLM is not installed. "
+                "Install dependencies from requirements.txt or run `python -m pip install litellm`."
+            ) from exc
+
+        kwargs = dict(body)
+        kwargs["model"] = f"azure/{body['model']}"
+        kwargs["api_key"] = settings["api_key"]
+        kwargs["api_base"] = settings["azure_endpoint"].rstrip("/")
+        kwargs["api_version"] = settings["api_version"]
+        return litellm.responses(**kwargs)
+
+    async def _openai_responses_create_via_litellm(self, body: Dict[str, Any]) -> Any:
+        return await asyncio.to_thread(self._openai_responses_create_via_litellm_sync, body)
+
     async def _anthropic_messages_create_sdk(self, body: Dict[str, Any]) -> Any:
         if self.anthropic_client is None:
             raise RuntimeError("Anthropic client is not initialized.")
@@ -1048,8 +1115,14 @@ class Runner:
                     "max_completion_tokens": self.cfg.max_output_tokens,
                 }
                 extra_body: Dict[str, Any] = {}
-                if self.cfg.reasoning_effort:
+                if self.cfg.reasoning_effort and not _is_azure_gpt_54_family(request_model):
                     extra_body["reasoning_effort"] = self.cfg.reasoning_effort
+                elif self.cfg.reasoning_effort and _is_azure_gpt_54_family(request_model) and not self._openai_chat_reasoning_ignored_warned:
+                    self.log.warning(
+                        "openai_chat_reasoning_ignored_for_gpt_5_4",
+                        extra={"model": request_model, "reasoning_effort": self.cfg.reasoning_effort},
+                    )
+                    self._openai_chat_reasoning_ignored_warned = True
                 if extra_body:
                     body["extra_body"] = extra_body
                 if self.cfg.temperature is not None:
@@ -1060,15 +1133,30 @@ class Runner:
                 body = {
                     "model": request_model,
                     "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-                    "reasoning": {"effort": self.cfg.reasoning_effort},
                     "max_output_tokens": self.cfg.max_output_tokens,
-                    "tool_choice": openai_tool_choice,
                 }
-                if self.cfg.temperature is not None:
+                if self.cfg.reasoning_effort:
+                    body["reasoning"] = {"effort": self.cfg.reasoning_effort}
+                if self.cfg.reasoning_effort and (
+                    self.cfg.temperature is not None or self.cfg.top_p is not None
+                ):
+                    if not self._openai_responses_sampling_ignored_warned:
+                        self.log.warning(
+                            "openai_responses_sampling_ignored_for_reasoning",
+                            extra={
+                                "model": request_model,
+                                "reasoning_effort": self.cfg.reasoning_effort,
+                                "temperature_set": self.cfg.temperature is not None,
+                                "top_p_set": self.cfg.top_p is not None,
+                            },
+                        )
+                        self._openai_responses_sampling_ignored_warned = True
+                elif self.cfg.temperature is not None:
                     body["temperature"] = self.cfg.temperature
-                if self.cfg.top_p is not None:
+                if not self.cfg.reasoning_effort and self.cfg.top_p is not None:
                     body["top_p"] = self.cfg.top_p
                 if self.cfg.allow_tools and self.tools:
+                    body["tool_choice"] = openai_tool_choice
                     body["tools"] = self.tools
                 if self.cfg.verbosity:
                     body["text"] = {"verbosity": self.cfg.verbosity}
@@ -1159,24 +1247,26 @@ class Runner:
                     else:
                         responses_api = getattr(self.client, "responses", None)
                         create_fn = getattr(responses_api, "create", None)
-                        if not callable(create_fn):
-                            raise RuntimeError(
-                                "OpenAI client does not support responses.create in this environment. "
-                                "Set API_MODE=chat_completions."
+                        if callable(create_fn):
+                            res = await asyncio.wait_for(
+                                create_fn(**body),
+                                timeout=self.cfg.per_call_timeout_s,
                             )
-                        res = await asyncio.wait_for(
-                            create_fn(**body),
-                            timeout=self.cfg.per_call_timeout_s,
-                        )
+                        else:
+                            res = await asyncio.wait_for(
+                                self._openai_responses_create_via_litellm(body),
+                                timeout=self.cfg.per_call_timeout_s,
+                            )
                         tool_uses = 0
                         tool_results_chars = 0
-                        returned_model = getattr(res, "model", None)
-                        for item in getattr(res, "output", []) or []:
-                            t = getattr(item, "type", None)
+                        returned_model = res.get("model") if isinstance(res, Mapping) else getattr(res, "model", None)
+                        output_items = res.get("output", []) if isinstance(res, Mapping) else getattr(res, "output", []) or []
+                        for item in output_items:
+                            t = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
                             if t == "tool_use":
                                 tool_uses += 1
                             elif t == "tool_result":
-                                content = getattr(item, "content", None)
+                                content = item.get("content") if isinstance(item, Mapping) else getattr(item, "content", None)
                                 if isinstance(content, list):
                                     for part in content:
                                         txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
@@ -1184,8 +1274,9 @@ class Runner:
                                             tool_results_chars += len(txt)
                                 elif isinstance(content, str):
                                     tool_results_chars += len(content)
-                        usage = normalize_usage(getattr(res, "usage", {}))
-                        out_text = (getattr(res, "output_text", "") or "").strip()
+                        usage_obj = res.get("usage", {}) if isinstance(res, Mapping) else getattr(res, "usage", {})
+                        usage = normalize_usage(usage_obj)
+                        out_text = self._extract_text_from_responses_response(res)
                 elif self.provider == "gemini":
                     res = await asyncio.wait_for(
                         self._gemini_generate_content(body),
@@ -1577,7 +1668,7 @@ def parse_args() -> Config:
     p.add_argument("--no-tools", dest="allow_tools", action="store_false", help="Disable all tool use for OpenAI provider")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
-    p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
+    p.add_argument("--reasoning-effort", choices=["minimal","low","medium","high","xhigh"], help="reasoning.effort (default: high)")
     p.add_argument("--thinking-level", choices=["minimal","low","medium","high"], help="Gemini thinking level (default: high)")
     p.add_argument("--hf-device-map", help="Hugging Face device_map (default: auto)")
     p.add_argument("--hf-torch-dtype", choices=["auto", "float16", "bfloat16", "float32"], help="Hugging Face torch_dtype (default: auto)")

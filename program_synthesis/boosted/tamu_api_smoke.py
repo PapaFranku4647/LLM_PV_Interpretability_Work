@@ -55,6 +55,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-output-tokens", type=int, default=256, help="Max output tokens.")
     parser.add_argument("--timeout", type=float, default=60.0, help="Request timeout seconds.")
     parser.add_argument(
+        "--reasoning-effort",
+        default=os.getenv("REASONING_EFFORT", "high"),
+        help="Responses API reasoning effort: low, medium, high, or xhigh.",
+    )
+    parser.add_argument(
         "--prompt",
         default='Return a compact JSON object exactly like {"ok": true}.',
         help="Prompt used for the smoke test.",
@@ -69,7 +74,10 @@ def parse_args() -> argparse.Namespace:
 async def main_async(args: argparse.Namespace) -> int:
     cfg = base_runner.Config()
     cfg.model = args.model
+    cfg.api_mode = args.api_mode
     cfg.per_call_timeout_s = args.timeout
+    cfg.max_output_tokens = args.max_output_tokens
+    cfg.reasoning_effort = args.reasoning_effort
     if args.api_key is not None:
         cfg.api_key = args.api_key
         cfg.api_key_explicit = True
@@ -92,39 +100,46 @@ async def main_async(args: argparse.Namespace) -> int:
     usage: Dict[str, Any] = {}
     try:
         if args.api_mode == "responses":
+            response_kwargs = {
+                "model": request_model,
+                "input": [{"role": "user", "content": [{"type": "input_text", "text": args.prompt}]}],
+                "max_output_tokens": args.max_output_tokens,
+            }
+            if args.reasoning_effort:
+                response_kwargs["reasoning"] = {"effort": args.reasoning_effort}
             responses_api = getattr(client, "responses", None)
-            if responses_api is None:
-                print(
-                    json.dumps(
-                        {
-                            "ok": False,
-                            "client_type": client_type,
-                            "api_mode": args.api_mode,
-                            "requested_model": args.model,
-                            "request_model": request_model,
-                            "error_type": "UnsupportedApiMode",
-                            "error": (
-                                "The installed OpenAI SDK does not expose the Responses API on this Azure client. "
-                                "Use --api-mode chat_completions for the current repo setup."
-                            ),
-                        },
-                        ensure_ascii=False,
-                        indent=2,
-                    )
+            create_fn = getattr(responses_api, "create", None)
+            if callable(create_fn):
+                response = await asyncio.wait_for(
+                    create_fn(**response_kwargs),
+                    timeout=args.timeout,
                 )
-                return 1
-
-            response = await asyncio.wait_for(
-                responses_api.create(
-                    model=request_model,
-                    input=[{"role": "user", "content": [{"type": "input_text", "text": args.prompt}]}],
-                    max_output_tokens=args.max_output_tokens,
-                ),
-                timeout=args.timeout,
-            )
-            response_model = getattr(response, "model", None) or request_model
-            text = (getattr(response, "output_text", "") or "").strip()
-            usage = base_runner.normalize_usage(getattr(response, "usage", {}))
+            else:
+                settings = base_runner.resolve_openai_client_settings(cfg)
+                if not settings["use_azure"]:
+                    raise RuntimeError(
+                        "The installed OpenAI SDK does not expose responses.create for this client."
+                    )
+                try:
+                    import litellm
+                except ImportError as exc:
+                    raise RuntimeError(
+                        "The installed OpenAI SDK does not expose Azure responses.create and LiteLLM is not installed."
+                    ) from exc
+                litellm_kwargs = dict(response_kwargs)
+                litellm_kwargs["model"] = f"azure/{request_model}"
+                litellm_kwargs["api_key"] = settings["api_key"]
+                litellm_kwargs["api_base"] = settings["azure_endpoint"].rstrip("/")
+                litellm_kwargs["api_version"] = settings["api_version"]
+                response = await asyncio.wait_for(
+                    asyncio.to_thread(litellm.responses, **litellm_kwargs),
+                    timeout=args.timeout,
+                )
+            response_model = response.get("model") if isinstance(response, dict) else getattr(response, "model", None)
+            response_model = response_model or request_model
+            text = base_runner.Runner._extract_text_from_responses_response(response)
+            usage_obj = response.get("usage", {}) if isinstance(response, dict) else getattr(response, "usage", {})
+            usage = base_runner.normalize_usage(usage_obj)
         else:
             response = await asyncio.wait_for(
                 client.chat.completions.create(
@@ -144,6 +159,7 @@ async def main_async(args: argparse.Namespace) -> int:
                     "ok": bool(text),
                     "client_type": client_type,
                     "api_mode": args.api_mode,
+                    "reasoning_effort": args.reasoning_effort,
                     "requested_model": args.model,
                     "request_model": request_model,
                     "model": response_model,
@@ -162,6 +178,7 @@ async def main_async(args: argparse.Namespace) -> int:
                     "ok": False,
                     "client_type": client_type,
                     "api_mode": args.api_mode,
+                    "reasoning_effort": args.reasoning_effort,
                     "requested_model": args.model,
                     "request_model": request_model,
                     "error_type": type(exc).__name__,

@@ -27,6 +27,13 @@ The runner writes:
 TAMU / Azure-compatible access:
 - The boosted runner accepts `--api-key`, `--api-base-url`, `--azure-endpoint`, and `--api-version`.
 - Environment aliases also work: `TAMU_API_KEY`, `TAMU_AZURE_ENDPOINT`, and `TAMU_API_VERSION`.
+- Azure deployment aliases are wired for `gpt-5.4`, `gpt-5.4-mini`, and
+  `gpt-5.4-nano`, plus the existing `protected.gpt-5.2` alias.
+- Use `--api-mode responses --reasoning-effort medium` for 5.4 reasoning runs.
+  Responses mode defaults to Azure API version `2025-03-01-preview` when no API
+  version is provided; chat completions defaults to `2024-12-01-preview`.
+- If the installed OpenAI SDK does not expose Azure `responses.create`, the
+  runner falls back to LiteLLM. Install dependencies from `requirements.txt`.
 - A lightweight smoke checker lives at `program_synthesis/boosted/tamu_api_smoke.py`.
 
 ## Example
@@ -47,9 +54,42 @@ python program_synthesis/boosted/boosted_runner.py \
 
 ```bash
 python program_synthesis/boosted/tamu_api_smoke.py \
-  --model gpt-5 \
-  --api-mode responses
+  --model gpt-5.4 \
+  --api-mode responses \
+  --reasoning-effort medium
 ```
+
+## CDC Model Comparison
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --model gpt-5.4 \
+  --api-mode responses \
+  --functions fn_o \
+  --lengths 21 \
+  --train-size 256 \
+  --val-size 256 \
+  --test-size 2000 \
+  --seed 42 \
+  --batch-sizes 256 \
+  --boost-rounds 1 \
+  --num-trials 5 \
+  --round-retries 8 \
+  --sample-without-replacement \
+  --tabular-representation semantic \
+  --max-weak-error 0.3025 \
+  --accept-best-on-failure \
+  --best-fallback-max-weak-error 0.499 \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/model_compare_cdc_semantic_t1_b256_s5/gpt_5_4_medium_final
+```
+
+This 5-trial `gpt-5.4` comparison has been run. Results are summarized in
+`program_synthesis/CODEBOOST_MODEL_COMPARISON.md`; mean test accuracy was
+0.6995, below the existing 5.2 matched CDC semantic row at 0.7173.
 
 ## Notes
 

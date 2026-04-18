@@ -168,6 +168,8 @@ def get_model_pricing(model_name: Optional[str]) -> Optional[Dict[str, float | s
     lowered = (model_name or "").strip().lower()
     if not lowered:
         return None
+    if "gpt-5.4" in lowered:
+        return None
     if "gpt-5.2" in lowered:
         return {"name": "gpt-5.2", "input": 1.75, "output": 14.00}
     if "gpt-5.1" in lowered:
@@ -1383,6 +1385,7 @@ def summarize_response_accounting(
     return {
         "request_model": request_model,
         "returned_model": returned_model,
+        "pricing_known": cost_info["pricing_model"] is not None,
         "prompt_tokens": int(prompt_tokens or 0),
         "completion_tokens": int(completion_tokens or 0),
         "reasoning_tokens": int(reasoning_tokens or 0),
@@ -1433,6 +1436,7 @@ async def run_boosting_trial(
     total_completion_tokens = 0
     total_reasoning_tokens = 0
     total_estimated_cost_usd = 0.0
+    total_estimated_cost_pricing_known = True
     fallback_model = getattr(getattr(client, "cfg", None), "model", None)
     dataset_context = get_dataset_context(target_name, cfg.cdc_representation, cfg.tabular_representation)
     feature_matrix = (
@@ -1446,10 +1450,13 @@ async def run_boosting_trial(
         nonlocal total_completion_tokens
         nonlocal total_reasoning_tokens
         nonlocal total_estimated_cost_usd
+        nonlocal total_estimated_cost_pricing_known
         accounting = summarize_response_accounting(res, fallback_model)
         total_prompt_tokens += int(accounting["prompt_tokens"] or 0)
         total_completion_tokens += int(accounting["completion_tokens"] or 0)
         total_reasoning_tokens += int(accounting["reasoning_tokens"] or 0)
+        if not accounting.get("pricing_known", False):
+            total_estimated_cost_pricing_known = False
         total_estimated_cost_usd += float(accounting["estimated_total_cost_usd"] or 0.0)
         return accounting
 
@@ -2254,11 +2261,31 @@ async def run_boosting_trial(
     final_train_acc = evaluate_ensemble_accuracy(learners, train_examples)
     final_val_acc = evaluate_ensemble_accuracy(learners, val_examples) if val_examples else None
     final_test_acc = evaluate_ensemble_accuracy(learners, test_examples)
+    client_provider = getattr(client, "provider", None)
+    openai_settings = (
+        base_runner.resolve_openai_client_settings(client.cfg)
+        if client_provider == "openai"
+        else {}
+    )
+    request_model = (
+        base_runner.resolve_openai_request_model(client.cfg)
+        if client_provider == "openai"
+        else getattr(client.cfg, "model", None)
+    )
 
     summary = {
         "fn": fn,
         "target_name": target_name,
         "length": length,
+        "model": getattr(client.cfg, "model", None),
+        "provider": client_provider,
+        "client_type": getattr(client, "client_type", None),
+        "api_mode": getattr(client.cfg, "api_mode", None),
+        "api_version": openai_settings.get("api_version") or getattr(client.cfg, "api_version", None),
+        "request_model": request_model,
+        "reasoning_effort": getattr(client.cfg, "reasoning_effort", None),
+        "max_output_tokens": getattr(client.cfg, "max_output_tokens", None),
+        "allow_tools": getattr(client.cfg, "allow_tools", None),
         "batch_size": batch_size,
         "trial": trial_idx,
         "accepted_rounds": len(learners),
@@ -2298,6 +2325,7 @@ async def run_boosting_trial(
         "total_completion_tokens": total_completion_tokens,
         "total_reasoning_tokens": total_reasoning_tokens,
         "total_estimated_cost_usd": total_estimated_cost_usd,
+        "total_estimated_cost_pricing_known": total_estimated_cost_pricing_known,
         "stopped_reason": stopped_reason,
     }
     return summary, attempt_rows, accepted_rounds
@@ -2517,6 +2545,21 @@ async def main_async(args: argparse.Namespace) -> int:
                             "config": {
                                 "model": base_cfg.model,
                                 "provider": client.provider,
+                                "client_type": getattr(client, "client_type", None),
+                                "api_mode": base_cfg.api_mode,
+                                "api_version": (
+                                    base_runner.resolve_openai_client_settings(base_cfg).get("api_version")
+                                    if client.provider == "openai"
+                                    else base_cfg.api_version
+                                ),
+                                "request_model": (
+                                    base_runner.resolve_openai_request_model(base_cfg)
+                                    if client.provider == "openai"
+                                    else base_cfg.model
+                                ),
+                                "reasoning_effort": base_cfg.reasoning_effort,
+                                "max_output_tokens": base_cfg.max_output_tokens,
+                                "allow_tools": base_cfg.allow_tools,
                                 "train_size": base_cfg.train_size,
                                 "val_size": base_cfg.val_size,
                                 "test_size": base_cfg.test_size,
