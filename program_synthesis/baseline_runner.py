@@ -373,8 +373,9 @@ class DatasetStore:
 
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str]]:
         target_name = FUNCTION_NAME_MAPPING[fn]
+        cdc_representation = "semantic" if self.cfg.tabular_representation in {"semantic", "hybrid"} else "obfuscated"
         os.environ["TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
-        os.environ["CDC_DIABETES_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
         os.environ["MUSHROOM_REPRESENTATION"] = self.cfg.tabular_representation
         os.environ["HTRU2_REPRESENTATION"] = self.cfg.tabular_representation
         os.environ["CHESS_REPRESENTATION"] = self.cfg.tabular_representation
@@ -1350,8 +1351,8 @@ def parse_args() -> Config:
     p.add_argument("--dataset-dir", help="Dataset split/cache directory")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic"],
-        help="Use obfuscated or semantic/named tabular dataset rows.",
+        choices=["obfuscated", "semantic", "hybrid"],
+        help="Use obfuscated, semantic/named, or hybrid named plus numeric tabular dataset rows.",
     )
     p.add_argument("--out-jsonl", help="Output JSONL path")
     p.add_argument("--out-csv", help="Output CSV path")

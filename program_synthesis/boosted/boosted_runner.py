@@ -81,6 +81,39 @@ CHESS_SEMANTIC_CONTEXT = textwrap.dedent(
 ).strip()
 
 
+MUSHROOM_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: secondary mushroom attributes. The target output is binary: 1 means edible, 0 means poisonous.
+    Inputs are dictionaries with named mushroom morphology fields. Numeric size fields are represented twice: cap_diameter_bin, stem_height_bin, stem_width_bin use qualitative bins, and cap_diameter_z, stem_height_z, stem_width_z are numeric z-scores centered on the dataset.
+    Categorical fields use compact readable strings that preserve the original code and missingness, e.g. convex|missing_no|code_x or unknown|missing_yes|code_missing.
+    Prefer rules that combine readable categories with numeric z-score thresholds, e.g. x.get("cap_shape", "").startswith("convex") or float(x.get("stem_width_z", 0)) > 1.0.
+    """
+).strip()
+
+
+HTRU2_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named pulse-profile and dispersion-measure features. Each numeric feature has a qualitative bin field ending in _bin and a numeric z-score field ending in _z.
+    Pulse profile fields include profile_mean, profile_stdev, profile_skewness, and profile_kurtosis. Dispersion-measure signal-to-noise fields include dm_snr_mean, dm_snr_stdev, dm_snr_skewness, and dm_snr_kurtosis.
+    Prefer rules that threshold z-scores while using bins for readable guards, e.g. float(x.get("profile_skewness_z", 0)) > 1.0 or x.get("dm_snr_kurtosis_bin") in ("high", "very high").
+    """
+).strip()
+
+
+CHESS_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: chess King-Rook versus King-Pawn on a7 endgames. The target output is binary: 1 means white can win, 0 means no win.
+    Inputs are dictionaries with UCI KRKPA7 feature abbreviations. Values preserve both readable labels and original UCI codes, e.g. true|code_t, false|code_f, none|code_n, greater|code_g, lesser|code_l.
+    Write rules against the readable prefix or the code token, e.g. x.get("bkxwp", "").startswith("true") or "code_t" in x.get("skach", "").
+    """
+).strip()
+
+
+def default_cdc_representation(tabular_representation: str) -> str:
+    return "semantic" if tabular_representation in {"semantic", "hybrid"} else "obfuscated"
+
+
 def get_dataset_context(
     target_name: str,
     cdc_representation: str,
@@ -88,14 +121,21 @@ def get_dataset_context(
 ) -> Optional[str]:
     if target_name == "cdc_diabetes" and cdc_representation == "semantic":
         return CDC_SEMANTIC_CONTEXT
-    if tabular_representation != "semantic":
+    if tabular_representation == "semantic":
+        if target_name == "mushroom":
+            return MUSHROOM_SEMANTIC_CONTEXT
+        if target_name == "htru2":
+            return HTRU2_SEMANTIC_CONTEXT
+        if target_name == "chess":
+            return CHESS_SEMANTIC_CONTEXT
+    if tabular_representation == "hybrid":
+        if target_name == "mushroom":
+            return MUSHROOM_HYBRID_CONTEXT
+        if target_name == "htru2":
+            return HTRU2_HYBRID_CONTEXT
+        if target_name == "chess":
+            return CHESS_HYBRID_CONTEXT
         return None
-    if target_name == "mushroom":
-        return MUSHROOM_SEMANTIC_CONTEXT
-    if target_name == "htru2":
-        return HTRU2_SEMANTIC_CONTEXT
-    if target_name == "chess":
-        return CHESS_SEMANTIC_CONTEXT
     return None
 
 
@@ -1567,7 +1607,7 @@ def build_base_config(args: argparse.Namespace) -> base_runner.Config:
     cfg.test_size = args.test_size
     cfg.seed = args.seed
     tabular_representation = getattr(args, "tabular_representation", "obfuscated")
-    cdc_representation = getattr(args, "cdc_representation", None) or tabular_representation
+    cdc_representation = getattr(args, "cdc_representation", None) or default_cdc_representation(tabular_representation)
     os.environ["TABULAR_REPRESENTATION"] = tabular_representation
     os.environ["MUSHROOM_REPRESENTATION"] = tabular_representation
     os.environ["HTRU2_REPRESENTATION"] = tabular_representation
@@ -1615,7 +1655,7 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
         max_weak_error = min(max_weak_error, 0.35)
         min_alpha = max(min_alpha, 0.05)
     tabular_representation = getattr(args, "tabular_representation", "obfuscated")
-    cdc_representation = getattr(args, "cdc_representation", None) or tabular_representation
+    cdc_representation = getattr(args, "cdc_representation", None) or default_cdc_representation(tabular_representation)
 
     return BoostConfig(
         boost_rounds=args.boost_rounds,
@@ -1792,15 +1832,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for summaries and saved ensembles.")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic"],
+        choices=["obfuscated", "semantic", "hybrid"],
         default=os.getenv("TABULAR_REPRESENTATION", "obfuscated"),
-        help="Input representation for non-CDC tabular datasets. semantic uses named fields and readable bins/categories.",
+        help="Input representation for non-CDC tabular datasets. semantic uses named fields; hybrid keeps names plus z-scores/code tokens.",
     )
     p.add_argument(
         "--cdc-representation",
         choices=["obfuscated", "semantic"],
         default=os.getenv("CDC_DIABETES_REPRESENTATION"),
-        help="Optional CDC-specific representation override. Defaults to --tabular-representation.",
+        help="Optional CDC-specific representation override. Defaults to semantic when --tabular-representation is semantic or hybrid.",
     )
     p.add_argument(
         "--no-cdc-semantic-transformed-fallback",

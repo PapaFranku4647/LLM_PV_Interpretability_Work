@@ -5,6 +5,8 @@ Last updated: 2026-04-18.
 This note preserves the current experimental state before repository cleanup. Large run
 artifacts are intentionally kept on disk and ignored by git; this file records the
 important locations and conclusions so we do not lose the experiment context.
+The consolidated index is now `program_synthesis/EXPERIMENT_LEDGER.md`; keep
+that file updated when adding new result docs or run families.
 
 ## Current Focus
 
@@ -12,6 +14,8 @@ important locations and conclusions so we do not lose the experiment context.
 - Strongest current method: semantic CDC rows with named features and qualitative
   bins, one synthesized program (`T=1`), batch size 256, full-train weak-error
   gate, and best-valid fallback.
+- Current non-CDC method under test: hybrid rows with named fields, qualitative
+  bins, z-score numeric features, category code tokens, and missingness markers.
 - Best robust saved aggregate:
   `program_synthesis/boosted/runs/semantic_cdc_t1_quality_gate_e03025_fallback_s30`
   - 30 seeds
@@ -130,6 +134,27 @@ Conclusion: semantic rows help, but mushroom/chess are still not ready for
 5-trial runs. HTRU2 remains the only plausible non-CDC secondary dataset, but a
 hybrid named-feature plus numeric-value representation may be better than bins
 only.
+
+Hybrid tabular representation is now wired for mushroom, HTRU2, and chess
+through `--tabular-representation hybrid`. This creates:
+
+- Mushroom numeric size fields as `cap_diameter_bin` plus `cap_diameter_z`
+  style pairs, while categorical values preserve readable labels, missingness,
+  and original code tokens such as `convex|missing_no|code_x`.
+- HTRU2 numeric fields as named `_bin` and `_z` pairs, e.g.
+  `profile_skewness_bin` and `profile_skewness_z`.
+- Chess values as readable labels plus UCI code tokens, e.g. `true|code_t`.
+
+Validation completed before API pilots:
+
+- `python -m py_compile src\data_handler.py program_synthesis\boosted\boosted_runner.py program_synthesis\baseline_runner.py`
+- `python -m unittest discover program_synthesis\tests` passed 36 tests.
+- Hybrid baseline smoke passed for mushroom, HTRU2, and chess using 20/10/20
+  splits with a decision tree.
+
+Next experiment: run one-trial hybrid pilots for HTRU2 and mushroom. Do not run
+a full 5-trial aggregate unless one of those pilots closes a meaningful part of
+the current baseline gap.
 
 ## Deferred Sampler Design
 

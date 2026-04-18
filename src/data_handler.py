@@ -38,8 +38,8 @@ SEMANTIC_BIN_LABELS = ["very low", "low", "medium", "high", "very high"]
 
 def _get_tabular_representation(env_name: str) -> str:
     representation = os.getenv(env_name, os.getenv("TABULAR_REPRESENTATION", "obfuscated")).strip().lower()
-    if representation not in {"obfuscated", "semantic"}:
-        raise ValueError(f"{env_name} must be either 'obfuscated' or 'semantic', got {representation!r}.")
+    if representation not in {"obfuscated", "semantic", "hybrid"}:
+        raise ValueError(f"{env_name} must be obfuscated, semantic, or hybrid, got {representation!r}.")
     return representation
 
 
@@ -85,6 +85,25 @@ def _semantic_bin_from_thresholds(raw_value: Any, thresholds: List[float]) -> st
             break
     bin_idx = max(0, min(bin_idx, len(SEMANTIC_BIN_LABELS) - 1))
     return SEMANTIC_BIN_LABELS[bin_idx]
+
+
+def _numeric_stats(values: List[float]) -> Tuple[float, float]:
+    if not values:
+        return 0.0, 1.0
+    mean = float(np.mean(values))
+    std = float(np.std(values))
+    if not np.isfinite(std) or std < 1e-12:
+        std = 1.0
+    return mean, std
+
+
+def _z_score(raw_value: Any, stats: Tuple[float, float]) -> str:
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return "0.00"
+    mean, std = stats
+    return f"{((value - mean) / std):.2f}"
 
 # Optional dependency handling for performance
 try:
@@ -2003,6 +2022,8 @@ class HTRU2DataGenerator(BaseDataGenerator):
         self.representation = _get_tabular_representation("HTRU2_REPRESENTATION")
         self._semantic_thresholds: Dict[int, List[float]] = {}
         self._semantic_bins_initialized = False
+        self._numeric_stats: Dict[int, Tuple[float, float]] = {}
+        self._numeric_stats_initialized = False
         n_numeric = len(self.RAW_FEATURE_NAMES)
         self._A_diag = np.random.normal(0, 1, n_numeric)
         self._b = np.random.normal(0, 1, n_numeric)
@@ -2021,6 +2042,19 @@ class HTRU2DataGenerator(BaseDataGenerator):
             self._semantic_thresholds[idx] = _quantile_thresholds(values)
         self._semantic_bins_initialized = True
 
+    def _init_numeric_stats(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._numeric_stats_initialized:
+            return
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._numeric_stats[idx] = _numeric_stats(values)
+        self._numeric_stats_initialized = True
+
     def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         return {
             self.SEMANTIC_FEATURE_NAMES[idx]: _semantic_bin_from_thresholds(
@@ -2029,6 +2063,21 @@ class HTRU2DataGenerator(BaseDataGenerator):
             )
             for idx, name in enumerate(self.RAW_FEATURE_NAMES)
         }
+
+    def _hybrid_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        hybrid: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            hybrid[f"{semantic_name}_bin"] = _semantic_bin_from_thresholds(
+                raw_value,
+                self._semantic_thresholds.get(idx, []),
+            )
+            hybrid[f"{semantic_name}_z"] = _z_score(
+                raw_value,
+                self._numeric_stats.get(idx, (0.0, 1.0)),
+            )
+        return hybrid
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -2066,8 +2115,10 @@ class HTRU2DataGenerator(BaseDataGenerator):
         positive_samples = []
         negative_samples = []
 
-        if self.representation == "semantic":
+        if self.representation in {"semantic", "hybrid"}:
             self._init_semantic_bins(all_raw_samples)
+            if self.representation == "hybrid":
+                self._init_numeric_stats(all_raw_samples)
         else:
             numeric_values_list = []
             for sample in all_raw_samples:
@@ -2080,6 +2131,8 @@ class HTRU2DataGenerator(BaseDataGenerator):
         for sample_idx, raw_sample in enumerate(all_raw_samples):
             if self.representation == "semantic":
                 features = self._semantic_sample(raw_sample)
+            elif self.representation == "hybrid":
+                features = self._hybrid_sample(raw_sample)
             else:
                 features = {}
                 for feat_idx, name in enumerate(self.RAW_FEATURE_NAMES):
@@ -2173,6 +2226,14 @@ class ChessDataGenerator(BaseDataGenerator):
             name: self.SEMANTIC_VALUE_LABELS.get(_semantic_token(raw.get(name, "")), _semantic_token(raw.get(name, "")))
             for name in self.RAW_FEATURE_NAMES
         }
+
+    def _hybrid_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        hybrid: Dict[str, str] = {}
+        for name in self.RAW_FEATURE_NAMES:
+            code = _semantic_token(raw.get(name, ""))
+            label = self.SEMANTIC_VALUE_LABELS.get(code, code)
+            hybrid[name] = f"{label}|code_{code}"
+        return hybrid
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -2246,6 +2307,9 @@ class ChessDataGenerator(BaseDataGenerator):
         if self.representation == "semantic":
             positive_samples = [self._semantic_sample(s) for s in positive_raw]
             negative_samples = [self._semantic_sample(s) for s in negative_raw]
+        elif self.representation == "hybrid":
+            positive_samples = [self._hybrid_sample(s) for s in positive_raw]
+            negative_samples = [self._hybrid_sample(s) for s in negative_raw]
         else:
             self._init_category_maps(all_raw_samples)
             positive_samples = [self._transform_sample(s) for s in positive_raw]
@@ -2352,8 +2416,10 @@ class MushroomDataGenerator(BaseDataGenerator):
         self.representation = _get_tabular_representation("MUSHROOM_REPRESENTATION")
         self._category_maps: Dict[int, Dict[str, str]] = {}
         self._semantic_thresholds: Dict[int, List[float]] = {}
+        self._numeric_stats: Dict[int, Tuple[float, float]] = {}
         self._maps_initialized = False
         self._semantic_bins_initialized = False
+        self._numeric_stats_initialized = False
         numeric_indices_list = sorted(list(self.NUMERIC_INDICES))
         n_numeric = len(numeric_indices_list)
         self._A_diag = np.random.normal(0, 1, n_numeric)
@@ -2386,11 +2452,32 @@ class MushroomDataGenerator(BaseDataGenerator):
             self._semantic_thresholds[idx] = _quantile_thresholds(values)
         self._semantic_bins_initialized = True
 
+    def _init_numeric_stats(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._numeric_stats_initialized:
+            return
+        for idx in self._numeric_indices_list:
+            name = self.RAW_FEATURE_NAMES[idx]
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._numeric_stats[idx] = _numeric_stats(values)
+        self._numeric_stats_initialized = True
+
     def _semantic_categorical_value(self, feature_name: str, raw_value: str) -> str:
         if _is_missing_value(raw_value):
             return "unknown"
         value_key = str(raw_value).strip().lower()
         return self.CATEGORY_VALUE_LABELS.get(feature_name, {}).get(value_key, _semantic_token(value_key))
+
+    def _hybrid_categorical_value(self, feature_name: str, raw_value: str) -> str:
+        if _is_missing_value(raw_value):
+            return "unknown|missing_yes|code_missing"
+        code = _semantic_token(raw_value)
+        label = self._semantic_categorical_value(feature_name, raw_value)
+        return f"{label}|missing_no|code_{code}"
 
     def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         semantic: Dict[str, str] = {}
@@ -2405,6 +2492,24 @@ class MushroomDataGenerator(BaseDataGenerator):
             else:
                 semantic[semantic_name] = self._semantic_categorical_value(name, raw_value)
         return semantic
+
+    def _hybrid_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        hybrid: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                hybrid[f"{semantic_name}_bin"] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+                hybrid[f"{semantic_name}_z"] = _z_score(
+                    raw_value,
+                    self._numeric_stats.get(idx, (0.0, 1.0)),
+                )
+            else:
+                hybrid[semantic_name] = self._hybrid_categorical_value(name, raw_value)
+        return hybrid
     
     def _transform_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         transformed = {}
@@ -2476,6 +2581,11 @@ class MushroomDataGenerator(BaseDataGenerator):
             self._init_semantic_bins(all_raw_samples)
             positive_samples = [self._semantic_sample(s) for s in positive_raw]
             negative_samples = [self._semantic_sample(s) for s in negative_raw]
+        elif self.representation == "hybrid":
+            self._init_semantic_bins(all_raw_samples)
+            self._init_numeric_stats(all_raw_samples)
+            positive_samples = [self._hybrid_sample(s) for s in positive_raw]
+            negative_samples = [self._hybrid_sample(s) for s in negative_raw]
         else:
             self._init_category_maps(all_raw_samples)
             positive_samples = [self._transform_sample(s) for s in positive_raw]

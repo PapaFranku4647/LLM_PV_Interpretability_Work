@@ -207,6 +207,15 @@ class BoostedMathTests(unittest.TestCase):
             boosted_runner.get_dataset_context("chess", "obfuscated", "semantic"),
         )
         self.assertIsNone(boosted_runner.get_dataset_context("mushroom", "obfuscated", "obfuscated"))
+        self.assertIn(
+            "z-score",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "hybrid"),
+        )
+        self.assertIn(
+            "code_",
+            boosted_runner.get_dataset_context("mushroom", "obfuscated", "hybrid"),
+        )
+        self.assertEqual(boosted_runner.default_cdc_representation("hybrid"), "semantic")
 
     def test_accept_best_on_failure_keeps_best_valid_retry(self) -> None:
         class StubClient:
@@ -368,6 +377,47 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(sample["has_ring"], "yes")
         self.assertEqual(sample["habitat"], "woods")
 
+    def test_hybrid_mushroom_generator_uses_named_bins_z_scores_and_code_tokens(self) -> None:
+        raw = [
+            {
+                "cap-diameter": str(1 + idx),
+                "cap-shape": "x" if idx % 2 else "f",
+                "cap-surface": "nan" if idx == 0 else "s",
+                "cap-color": "n",
+                "does-bruise-or-bleed": "t" if idx % 2 else "f",
+                "gill-attachment": "a",
+                "gill-spacing": "c",
+                "gill-color": "w",
+                "stem-height": str(2 + idx),
+                "stem-width": str(3 + idx),
+                "stem-root": "b",
+                "stem-surface": "s",
+                "stem-color": "w",
+                "veil-type": "u",
+                "veil-color": "w",
+                "has-ring": "t",
+                "ring-type": "p",
+                "spore-print-color": "k",
+                "habitat": "d",
+                "season": "u",
+            }
+            for idx in range(10)
+        ]
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "hybrid", "MUSHROOM_REPRESENTATION": "hybrid"}):
+            generator = MushroomDataGenerator(sequence_length=20, num_samples=2)
+            generator._init_semantic_bins(raw)
+            generator._init_numeric_stats(raw)
+            sample = generator._hybrid_sample(raw[0])
+
+        self.assertIn("cap_diameter_bin", sample)
+        self.assertIn("cap_diameter_z", sample)
+        self.assertNotIn("x0", sample)
+        self.assertIn(sample["cap_diameter_bin"], ["very low", "low", "medium", "high", "very high"])
+        self.assertIsInstance(float(sample["cap_diameter_z"]), float)
+        self.assertEqual(sample["cap_shape"], "flat|missing_no|code_f")
+        self.assertEqual(sample["cap_surface"], "unknown|missing_yes|code_missing")
+
     def test_semantic_htru2_generator_uses_named_binned_features(self) -> None:
         raw = [
             {name: str(idx + feat_idx) for feat_idx, name in enumerate(HTRU2DataGenerator.RAW_FEATURE_NAMES)}
@@ -384,6 +434,25 @@ class BoostedMathTests(unittest.TestCase):
         self.assertNotIn("x0", sample)
         self.assertIn(sample["profile_mean"], ["very low", "low", "medium", "high", "very high"])
 
+    def test_hybrid_htru2_generator_uses_named_bins_and_z_scores(self) -> None:
+        raw = [
+            {name: str(idx + feat_idx) for feat_idx, name in enumerate(HTRU2DataGenerator.RAW_FEATURE_NAMES)}
+            for idx in range(10)
+        ]
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "hybrid", "HTRU2_REPRESENTATION": "hybrid"}):
+            generator = HTRU2DataGenerator(sequence_length=8, num_samples=2)
+            generator._init_semantic_bins(raw)
+            generator._init_numeric_stats(raw)
+            sample = generator._hybrid_sample(raw[0])
+
+        self.assertIn("profile_mean_bin", sample)
+        self.assertIn("profile_mean_z", sample)
+        self.assertIn("dm_snr_kurtosis_bin", sample)
+        self.assertIn("dm_snr_kurtosis_z", sample)
+        self.assertNotIn("x0", sample)
+        self.assertIsInstance(float(sample["profile_mean_z"]), float)
+
     def test_semantic_chess_generator_uses_uci_names_and_readable_values(self) -> None:
         raw = {name: "t" for name in ChessDataGenerator.RAW_FEATURE_NAMES}
         raw["dsopp"] = "g"
@@ -398,6 +467,21 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(sample["dsopp"], "greater")
         self.assertEqual(sample["hdchk"], "white")
         self.assertEqual(sample["wkpos"], "none")
+
+    def test_hybrid_chess_generator_preserves_readable_values_and_codes(self) -> None:
+        raw = {name: "t" for name in ChessDataGenerator.RAW_FEATURE_NAMES}
+        raw["dsopp"] = "g"
+        raw["hdchk"] = "w"
+        raw["wkpos"] = "n"
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "hybrid", "CHESS_REPRESENTATION": "hybrid"}):
+            generator = ChessDataGenerator(sequence_length=35, num_samples=2)
+            sample = generator._hybrid_sample(raw)
+
+        self.assertEqual(sample["bkblk"], "true|code_t")
+        self.assertEqual(sample["dsopp"], "greater|code_g")
+        self.assertEqual(sample["hdchk"], "white|code_w")
+        self.assertEqual(sample["wkpos"], "none|code_n")
 
     def test_run_boosting_trial_stops_on_perfect_train(self) -> None:
         class StubClient:

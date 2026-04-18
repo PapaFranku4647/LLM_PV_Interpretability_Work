@@ -56,7 +56,8 @@ python program_synthesis/boosted/tamu_api_smoke.py \
 - `--val-size` defaults to `0`, so the dataset split is train/test only.
 - If you later set `--val-size > 0`, the runner will log validation metrics as well.
 - `--tabular-representation semantic` enables named features and readable bins/categories for mushroom, HTRU2, chess, and CDC.
-- `--cdc-representation semantic` remains available as a CDC-specific override; by default CDC follows `--tabular-representation`.
+- `--tabular-representation hybrid` keeps named fields while adding numeric z-scores and category code tokens for non-CDC tabular datasets. CDC defaults to semantic when this flag is used.
+- `--cdc-representation semantic` remains available as a CDC-specific override.
 - Batch-size sweeps plus the per-round attempt logs are intended to support plotting train/test accuracy against boosting round `T`.
 - This reuses the provider and dataset machinery from `program_synthesis/runner.py`, but keeps outputs isolated under `program_synthesis/boosted/`.
 
@@ -87,3 +88,32 @@ python program_synthesis/boosted/boosted_runner.py \
 ```
 
 Swap `fn_n --lengths 20` for `fn_p --lengths 8` or `fn_q --lengths 35` to run HTRU2 or chess with the same semantic representation.
+
+## Hybrid Pilot Command
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --api-mode chat_completions \
+  --functions fn_p \
+  --lengths 8 \
+  --train-size 256 \
+  --val-size 256 \
+  --test-size 2000 \
+  --seed 42 \
+  --batch-sizes 256 \
+  --boost-rounds 1 \
+  --num-trials 1 \
+  --round-retries 8 \
+  --sample-without-replacement \
+  --tabular-representation hybrid \
+  --max-weak-error 0.3025 \
+  --accept-best-on-failure \
+  --best-fallback-max-weak-error 0.499 \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_p_htru2
+```
+
+Swap `fn_p --lengths 8` for `fn_n --lengths 20` to run mushroom. Chess hybrid is wired, but should stay deprioritized until the chess feature abbreviations get stronger domain descriptions.
