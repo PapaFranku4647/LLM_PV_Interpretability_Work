@@ -168,6 +168,17 @@ accuracy lever. Do not run a 5-trial hybrid aggregate from these numbers. The
 next serious method step should be the diverse/residual sampler, or stronger
 task-specific feature descriptions for chess.
 
+The diverse/residual sampler is now wired as `--sampling-strategy
+stratified_diverse`. It uses semantic prompts but selects batches from
+high-weight mistakes, low-margin boundary examples, correct anchors, and
+feature-diverse fill after each accepted learner. It also supports validation
+early stopping through `--early-stop-val-patience` and
+`--restore-best-val-ensemble`.
+
+Next pilot: CDC semantic with a 10k local train split, 2k validation split,
+10k test split, `T=4`, batch sizes 64 and 128, strict full-train weak-error gate
+at 0.45, and validation early stopping.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the

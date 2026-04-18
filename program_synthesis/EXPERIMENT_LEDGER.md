@@ -190,19 +190,50 @@ Proposed sampler:
 6. Still evaluate every proposed learner on full weighted train before accepting
    it.
 
-Expected implementation shape:
+Implementation status:
 
-- Add `--sampling-strategy` to `program_synthesis/boosted/boosted_runner.py`.
-- Start with `weighted_random`, `weighted_without_replacement`,
-  `mistake_clustered`, and `stratified_diverse`.
-- Reuse the existing full-train evaluation, acceptance gate, and repair plumbing.
-- This is feasible, but it is a second-phase change after hybrid pilots and
-  baseline comparison tables are stable.
+- `--sampling-strategy stratified_diverse` is now implemented. It starts with
+  label-balanced diverse sampling before any learner exists, then mixes
+  high-weight mistakes, low-margin boundary examples, correct anchors, and
+  diverse fill after accepted rounds.
+- Candidate programs are still evaluated on full weighted train before
+  acceptance.
+- Validation early stopping is wired through `--early-stop-val-patience` and
+  `--restore-best-val-ensemble`.
+- The next test is whether this sampler makes `T>1` CDC semantic boosting beat
+  the current strong `T=1` semantic result.
 
 ## Next Runs
 
 Do not run a full hybrid budget from the current pilot. The next run should test
-the deferred diverse/residual sampler on CDC first, then HTRU2 if CDC improves.
+the stratified diverse/residual sampler on CDC first, then HTRU2 if CDC improves.
+
+Planned CDC sampler pilot:
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --api-mode chat_completions \
+  --functions fn_o \
+  --lengths 21 \
+  --train-size 10000 \
+  --val-size 2000 \
+  --test-size 10000 \
+  --seed 42 \
+  --batch-sizes 64 128 \
+  --boost-rounds 4 \
+  --round-retries 3 \
+  --resample-each-retry \
+  --sampling-strategy stratified_diverse \
+  --tabular-representation semantic \
+  --max-weak-error 0.45 \
+  --early-stop-val-patience 2 \
+  --restore-best-val-ensemble \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/semantic_cdc_stratified_diverse_t4_b64_b128_s1
+```
 
 The already-run hybrid HTRU2 command was:
 

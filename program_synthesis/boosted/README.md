@@ -58,6 +58,8 @@ python program_synthesis/boosted/tamu_api_smoke.py \
 - `--tabular-representation semantic` enables named features and readable bins/categories for mushroom, HTRU2, chess, and CDC.
 - `--tabular-representation hybrid` keeps named fields while adding numeric z-scores and category code tokens for non-CDC tabular datasets. CDC defaults to semantic when this flag is used.
 - `--cdc-representation semantic` remains available as a CDC-specific override.
+- `--sampling-strategy stratified_diverse` builds prompt batches from high-weight mistakes, low-margin boundary examples, correct anchors, and feature-diverse fill. Candidate programs are still accepted only after full weighted-train evaluation.
+- `--early-stop-val-patience N --restore-best-val-ensemble` stops on validation stagnation and saves the best-validation ensemble prefix.
 - Batch-size sweeps plus the per-round attempt logs are intended to support plotting train/test accuracy against boosting round `T`.
 - This reuses the provider and dataset machinery from `program_synthesis/runner.py`, but keeps outputs isolated under `program_synthesis/boosted/`.
 
@@ -120,3 +122,30 @@ This pilot has been run for HTRU2 and mushroom. Results are summarized in
 `program_synthesis/CODEBOOST_HYBRID_PILOT.md`; hybrid did not beat the semantic
 pilot on either dataset. Chess hybrid is wired, but should stay deprioritized
 until the chess feature abbreviations get stronger domain descriptions.
+
+## Stratified Diverse CDC Pilot
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --api-mode chat_completions \
+  --functions fn_o \
+  --lengths 21 \
+  --train-size 10000 \
+  --val-size 2000 \
+  --test-size 10000 \
+  --seed 42 \
+  --batch-sizes 64 128 \
+  --boost-rounds 4 \
+  --round-retries 3 \
+  --resample-each-retry \
+  --sampling-strategy stratified_diverse \
+  --tabular-representation semantic \
+  --max-weak-error 0.45 \
+  --early-stop-val-patience 2 \
+  --restore-best-val-ensemble \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/semantic_cdc_stratified_diverse_t4_b64_b128_s1
+```

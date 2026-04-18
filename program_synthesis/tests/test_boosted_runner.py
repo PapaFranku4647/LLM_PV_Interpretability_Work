@@ -146,6 +146,48 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(len(set(indices)), 6)
         self.assertEqual(len(lines), 6)
 
+    def test_stratified_diverse_sampler_tracks_residual_components(self) -> None:
+        examples = [
+            boosted_runner.Example(
+                line=f"feature:{idx},group:{idx % 3} -> {idx % 2}",
+                x={"feature": str(idx), "group": str(idx % 3)},
+                y01=idx % 2,
+                ypm=1 if idx % 2 else -1,
+            )
+            for idx in range(20)
+        ]
+        weights = [0.02 for _ in examples]
+        weights[1] = 0.2
+        weights[3] = 0.18
+        weights[8] = 0.16
+
+        def weak_rule(x):
+            return 1 if int(x["feature"]) < 10 else 0
+
+        learners = [{"alpha": 0.7, "callable": weak_rule}]
+        vectors = boosted_runner.build_feature_matrix(examples)
+
+        indices, lines, metadata = boosted_runner.sample_stratified_diverse_batch(
+            examples,
+            weights,
+            batch_size=8,
+            rng=random.Random(11),
+            learners=learners,
+            vectors=vectors,
+            mistake_frac=0.5,
+            boundary_frac=0.25,
+            anchor_frac=0.25,
+            pool_multiplier=4,
+        )
+
+        self.assertEqual(len(indices), 8)
+        self.assertEqual(len(set(indices)), 8)
+        self.assertEqual(len(lines), 8)
+        self.assertEqual(metadata["sampling_strategy"], "stratified_diverse")
+        self.assertGreater(metadata["sampling_mistake_count"], 0)
+        self.assertGreater(metadata["sampling_anchor_count"], 0)
+        self.assertEqual(metadata["sampling_positive_count"] + metadata["sampling_negative_count"], 8)
+
     def test_build_boost_config_strict_acceptance_clamps_thresholds(self) -> None:
         args = argparse.Namespace(
             boost_rounds=8,
@@ -173,12 +215,22 @@ class BoostedMathTests(unittest.TestCase):
             cdc_representation="obfuscated",
             accept_best_on_failure=False,
             best_fallback_max_weak_error=0.499,
+            sampling_strategy="stratified_diverse",
+            sampler_mistake_frac=0.6,
+            sampler_boundary_frac=0.2,
+            sampler_anchor_frac=0.2,
+            sampler_pool_multiplier=8,
+            early_stop_val_patience=2,
+            early_stop_val_min_delta=0.001,
+            restore_best_val_ensemble=True,
         )
 
         cfg = boosted_runner.build_boost_config(args)
 
         self.assertAlmostEqual(cfg.max_weak_error, 0.35, places=10)
         self.assertAlmostEqual(cfg.min_alpha, 0.05, places=10)
+        self.assertEqual(cfg.sampling_strategy, "stratified_diverse")
+        self.assertEqual(cfg.early_stop_val_patience, 2)
 
     def test_semantic_generation_prompt_includes_cdc_context(self) -> None:
         prompt = boosted_runner.build_generation_prompt(
