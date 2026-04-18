@@ -289,6 +289,9 @@ class BoostConfig:
     sampler_boundary_frac: float = 0.2
     sampler_anchor_frac: float = 0.2
     sampler_pool_multiplier: int = 8
+    sampler_feature_hash_dim: int = 256
+    candidate_selection: str = "first_acceptable"
+    ensemble_val_drop_tolerance: float = 1.0
     early_stop_val_patience: int = 0
     early_stop_val_min_delta: float = 0.0
     restore_best_val_ensemble: bool = False
@@ -446,51 +449,37 @@ def _as_float(value: Any) -> Optional[float]:
     return result
 
 
-def build_feature_matrix(examples: Sequence[Example]) -> np.ndarray:
+def _hashed_bucket(token: str, hash_dim: int) -> Tuple[int, float]:
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    raw = int.from_bytes(digest[:8], "big")
+    bucket = raw % hash_dim
+    sign = 1.0 if (digest[8] & 1) == 0 else -1.0
+    return bucket, sign
+
+
+def build_feature_matrix(examples: Sequence[Example], hash_dim: int = 256) -> np.ndarray:
     if not examples:
         return np.zeros((0, 0), dtype=np.float32)
+    hash_dim = max(1, int(hash_dim))
+    matrix = np.zeros((len(examples), hash_dim), dtype=np.float32)
 
-    if all(isinstance(example.x, dict) for example in examples):
-        feature_names: List[str] = []
-        for example in examples:
-            for name in example.x:
-                if name not in feature_names:
-                    feature_names.append(name)
-
-        numeric_features: List[str] = []
-        categorical_features: List[str] = []
-        for name in feature_names:
-            values = [str(example.x.get(name, "")).strip() for example in examples]
-            non_missing = [value for value in values if value.lower() not in {"", "?", "nan", "none", "null"}]
-            if non_missing and all(_as_float(value) is not None for value in non_missing):
-                numeric_features.append(name)
-            else:
-                categorical_features.append(name)
-
-        categorical_values: Dict[str, List[str]] = {
-            name: sorted({str(example.x.get(name, "?")).strip() for example in examples})
-            for name in categorical_features
-        }
-        rows: List[List[float]] = []
-        for example in examples:
-            row: List[float] = []
-            for name in numeric_features:
-                row.append(_as_float(example.x.get(name, "")) or 0.0)
-            for name in categorical_features:
-                value = str(example.x.get(name, "?")).strip()
-                row.extend(1.0 if value == known else 0.0 for known in categorical_values[name])
-            rows.append(row)
-        matrix = np.asarray(rows, dtype=np.float32)
-    else:
-        token_ids: Dict[str, int] = {}
-        for example in examples:
-            for token in str(example.x):
-                if token not in token_ids:
-                    token_ids[token] = len(token_ids)
-        matrix = np.zeros((len(examples), max(1, len(token_ids))), dtype=np.float32)
-        for row_idx, example in enumerate(examples):
-            for token in str(example.x):
-                matrix[row_idx, token_ids[token]] += 1.0
+    for row_idx, example in enumerate(examples):
+        if isinstance(example.x, dict):
+            for name, raw_value in example.x.items():
+                value = str(raw_value).strip()
+                numeric_value = _as_float(value)
+                if numeric_value is not None:
+                    bucket, sign = _hashed_bucket(f"num:{name}", hash_dim)
+                    matrix[row_idx, bucket] += sign * float(numeric_value)
+                else:
+                    normalized = value.lower() if value else "?"
+                    bucket, sign = _hashed_bucket(f"cat:{name}={normalized}", hash_dim)
+                    matrix[row_idx, bucket] += sign
+        else:
+            text = str(example.x)
+            for pos, token in enumerate(text):
+                bucket, sign = _hashed_bucket(f"char:{pos}:{token}", hash_dim)
+                matrix[row_idx, bucket] += sign
 
     if matrix.size == 0:
         return matrix
@@ -774,6 +763,67 @@ def sample_stratified_diverse_batch(
     return selected, [examples[idx].line for idx in selected], metadata
 
 
+def sample_feature_diverse_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    pool_multiplier: int,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    target_size = min(batch_size, len(examples))
+    selected = _select_weighted_diverse_indices(
+        list(range(len(examples))),
+        target_size,
+        rng,
+        vectors,
+        weights,
+        pool_multiplier=pool_multiplier,
+    )
+    metadata = {
+        "sampling_strategy": "feature_diverse",
+        "sampling_mistake_count": None,
+        "sampling_boundary_count": None,
+        "sampling_anchor_count": None,
+        "sampling_fill_count": len(selected),
+        "sampling_positive_count": sum(1 for idx in selected if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in selected if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": None,
+    }
+    return selected, [examples[idx].line for idx in selected], metadata
+
+
+def sample_label_balanced_diverse_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    pool_multiplier: int,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    target_size = min(batch_size, len(examples))
+    selected = _select_label_balanced_diverse_indices(
+        list(range(len(examples))),
+        target_size,
+        rng,
+        vectors,
+        weights,
+        examples,
+        pool_multiplier=pool_multiplier,
+    )
+    metadata = {
+        "sampling_strategy": "label_balanced_diverse",
+        "sampling_mistake_count": None,
+        "sampling_boundary_count": None,
+        "sampling_anchor_count": None,
+        "sampling_fill_count": len(selected),
+        "sampling_positive_count": sum(1 for idx in selected if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in selected if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": None,
+    }
+    return selected, [examples[idx].line for idx in selected], metadata
+
+
 def sample_training_batch(
     examples: Sequence[Example],
     weights: Sequence[float],
@@ -783,9 +833,31 @@ def sample_training_batch(
     learners: Sequence[Dict[str, Any]],
     vectors: Optional[np.ndarray] = None,
 ) -> Tuple[List[int], List[str], Dict[str, Any]]:
-    if cfg.sampling_strategy == "stratified_diverse":
+    if cfg.sampling_strategy in {"feature_diverse", "label_balanced_diverse", "stratified_diverse"}:
         if vectors is None:
-            vectors = build_feature_matrix(examples)
+            vectors = build_feature_matrix(examples, cfg.sampler_feature_hash_dim)
+
+    if cfg.sampling_strategy == "feature_diverse":
+        return sample_feature_diverse_batch(
+            examples,
+            weights,
+            batch_size,
+            rng,
+            vectors,
+            cfg.sampler_pool_multiplier,
+        )
+
+    if cfg.sampling_strategy == "label_balanced_diverse":
+        return sample_label_balanced_diverse_batch(
+            examples,
+            weights,
+            batch_size,
+            rng,
+            vectors,
+            cfg.sampler_pool_multiplier,
+        )
+
+    if cfg.sampling_strategy == "stratified_diverse":
         return sample_stratified_diverse_batch(
             examples,
             weights,
@@ -1312,7 +1384,11 @@ async def run_boosting_trial(
     total_estimated_cost_usd = 0.0
     fallback_model = getattr(getattr(client, "cfg", None), "model", None)
     dataset_context = get_dataset_context(target_name, cfg.cdc_representation, cfg.tabular_representation)
-    feature_matrix = build_feature_matrix(train_examples) if cfg.sampling_strategy == "stratified_diverse" else None
+    feature_matrix = (
+        build_feature_matrix(train_examples, cfg.sampler_feature_hash_dim)
+        if cfg.sampling_strategy in {"feature_diverse", "label_balanced_diverse", "stratified_diverse"}
+        else None
+    )
 
     def add_response_accounting(res: Dict[str, Any]) -> Dict[str, Any]:
         nonlocal total_prompt_tokens
@@ -1325,6 +1401,23 @@ async def run_boosting_trial(
         total_reasoning_tokens += int(accounting["reasoning_tokens"] or 0)
         total_estimated_cost_usd += float(accounting["estimated_total_cost_usd"] or 0.0)
         return accounting
+
+    def update_validation_progress(ensemble_val_acc: Optional[float], learner_count: int) -> None:
+        nonlocal best_val_acc
+        nonlocal best_val_round_count
+        nonlocal val_rounds_without_improvement
+        nonlocal stopped_reason
+        if ensemble_val_acc is None or cfg.early_stop_val_patience <= 0:
+            return
+        current_val_acc = float(ensemble_val_acc)
+        if current_val_acc > best_val_acc + cfg.early_stop_val_min_delta:
+            best_val_acc = current_val_acc
+            best_val_round_count = learner_count
+            val_rounds_without_improvement = 0
+        else:
+            val_rounds_without_improvement += 1
+            if val_rounds_without_improvement >= cfg.early_stop_val_patience:
+                stopped_reason = "val_early_stop"
 
     for round_idx in range(1, cfg.boost_rounds + 1):
         sampled_indices, sampled_lines, sample_metadata = sample_training_batch(
@@ -1339,6 +1432,12 @@ async def run_boosting_trial(
         sampled_unique = len(set(sampled_indices))
         accepted_this_round = False
         best_fallback: Optional[Dict[str, Any]] = None
+        round_candidates: List[Dict[str, Any]] = []
+        baseline_ensemble_val_acc = (
+            evaluate_ensemble_accuracy(learners, val_examples)
+            if learners and val_examples
+            else None
+        )
 
         for retry_idx in range(1, cfg.round_retries + 1):
             if retry_idx > 1 and cfg.resample_each_retry:
@@ -1453,6 +1552,13 @@ async def run_boosting_trial(
                 "repair_final_batch_acc": None,
                 "repair_history": None,
                 "whole_train_repair_rounds_requested": cfg.whole_train_repair_rounds,
+                "candidate_selection": cfg.candidate_selection,
+                "candidate_selected": False,
+                "candidate_reject_reason": None,
+                "candidate_ensemble_train_acc": None,
+                "candidate_ensemble_val_acc": None,
+                "candidate_ensemble_test_acc": None,
+                "candidate_ensemble_val_drop": None,
             }
 
             if not code_str:
@@ -1828,9 +1934,7 @@ async def run_boosting_trial(
                     }
                 )
 
-                if weighted_error <= cfg.max_weak_error and alpha >= cfg.min_alpha:
-                    weights = update_distribution(weights, labels_pm, train_preds_pm, alpha)
-                    learner = {
+                learner = {
                         "round": round_idx,
                         "retry": retry_idx,
                         "alpha": alpha,
@@ -1841,7 +1945,50 @@ async def run_boosting_trial(
                         "train_acc": train_acc,
                         "val_acc": val_acc,
                         "test_acc": test_acc,
+                }
+                candidate_learners = learners + [learner]
+                candidate_ensemble_train_acc = evaluate_ensemble_accuracy(candidate_learners, train_examples)
+                candidate_ensemble_val_acc = (
+                    evaluate_ensemble_accuracy(candidate_learners, val_examples) if val_examples else None
+                )
+                candidate_ensemble_test_acc = evaluate_ensemble_accuracy(candidate_learners, test_examples)
+                candidate_ensemble_val_drop = (
+                    max(0.0, float(baseline_ensemble_val_acc) - float(candidate_ensemble_val_acc))
+                    if baseline_ensemble_val_acc is not None and candidate_ensemble_val_acc is not None
+                    else None
+                )
+                row.update(
+                    {
+                        "candidate_ensemble_train_acc": candidate_ensemble_train_acc,
+                        "candidate_ensemble_val_acc": candidate_ensemble_val_acc,
+                        "candidate_ensemble_test_acc": candidate_ensemble_test_acc,
+                        "candidate_ensemble_val_drop": candidate_ensemble_val_drop,
                     }
+                )
+
+                valid_weak_learner = weighted_error <= cfg.max_weak_error and alpha >= cfg.min_alpha
+                valid_val_drop = (
+                    candidate_ensemble_val_drop is None
+                    or candidate_ensemble_val_drop <= cfg.ensemble_val_drop_tolerance
+                )
+                if valid_weak_learner and valid_val_drop:
+                    if cfg.candidate_selection != "first_acceptable":
+                        serialized_row = serialize_attempt_row(row)
+                        round_candidates.append(
+                            {
+                                "attempt_row_index": len(attempt_rows),
+                                "row": serialized_row,
+                                "learner": learner,
+                                "train_preds_pm": train_preds_pm,
+                                "ensemble_train_acc": candidate_ensemble_train_acc,
+                                "ensemble_val_acc": candidate_ensemble_val_acc,
+                                "ensemble_test_acc": candidate_ensemble_test_acc,
+                            }
+                        )
+                        attempt_rows.append(serialized_row)
+                        continue
+
+                    weights = update_distribution(weights, labels_pm, train_preds_pm, alpha)
                     learners.append(learner)
                     accepted_rounds.append(
                         {
@@ -1850,28 +1997,20 @@ async def run_boosting_trial(
                     )
 
                     row["accepted"] = True
-                    row["ensemble_train_acc"] = evaluate_ensemble_accuracy(learners, train_examples)
-                    row["ensemble_val_acc"] = (
-                        evaluate_ensemble_accuracy(learners, val_examples) if val_examples else None
-                    )
-                    row["ensemble_test_acc"] = evaluate_ensemble_accuracy(learners, test_examples)
+                    row["candidate_selected"] = True
+                    row["ensemble_train_acc"] = candidate_ensemble_train_acc
+                    row["ensemble_val_acc"] = candidate_ensemble_val_acc
+                    row["ensemble_test_acc"] = candidate_ensemble_test_acc
                     attempt_rows.append(serialize_attempt_row(row))
                     accepted_this_round = True
 
-                    if val_examples and cfg.early_stop_val_patience > 0:
-                        current_val_acc = float(row["ensemble_val_acc"] or 0.0)
-                        if current_val_acc > best_val_acc + cfg.early_stop_val_min_delta:
-                            best_val_acc = current_val_acc
-                            best_val_round_count = len(learners)
-                            val_rounds_without_improvement = 0
-                        else:
-                            val_rounds_without_improvement += 1
-                            if val_rounds_without_improvement >= cfg.early_stop_val_patience:
-                                stopped_reason = "val_early_stop"
+                    update_validation_progress(candidate_ensemble_val_acc, len(learners))
 
                     if cfg.stop_on_perfect_train and row["ensemble_train_acc"] >= 1.0:
                         stopped_reason = "perfect_train_acc"
                     break
+                if valid_weak_learner and not valid_val_drop:
+                    row["candidate_reject_reason"] = "ensemble_val_drop"
 
                 serialized_row = serialize_attempt_row(row)
                 if (
@@ -1904,7 +2043,53 @@ async def run_boosting_trial(
                 attempt_rows.append(serialize_attempt_row(row))
 
         if not accepted_this_round:
-            if best_fallback is not None:
+            if round_candidates:
+                if cfg.candidate_selection == "best_weighted_error":
+                    selected_candidate = min(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["learner"]["weighted_error"]),
+                            -float(item["ensemble_val_acc"] if item["ensemble_val_acc"] is not None else item["ensemble_train_acc"]),
+                        ),
+                    )
+                elif cfg.candidate_selection == "best_val_acc":
+                    selected_candidate = max(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["learner"]["val_acc"] if item["learner"]["val_acc"] is not None else item["learner"]["train_acc"]),
+                            -float(item["learner"]["weighted_error"]),
+                        ),
+                    )
+                else:
+                    selected_candidate = max(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["ensemble_val_acc"] if item["ensemble_val_acc"] is not None else item["ensemble_train_acc"]),
+                            -float(item["learner"]["weighted_error"]),
+                        ),
+                    )
+
+                weights = update_distribution(
+                    weights,
+                    labels_pm,
+                    selected_candidate["train_preds_pm"],
+                    float(selected_candidate["learner"]["alpha"]),
+                )
+                learner = selected_candidate["learner"]
+                learners.append(learner)
+                accepted_rounds.append({k: v for k, v in learner.items() if k != "callable"})
+                row_idx = int(selected_candidate["attempt_row_index"])
+                attempt_rows[row_idx]["accepted"] = True
+                attempt_rows[row_idx]["candidate_selected"] = True
+                attempt_rows[row_idx]["ensemble_train_acc"] = selected_candidate["ensemble_train_acc"]
+                attempt_rows[row_idx]["ensemble_val_acc"] = selected_candidate["ensemble_val_acc"]
+                attempt_rows[row_idx]["ensemble_test_acc"] = selected_candidate["ensemble_test_acc"]
+                accepted_this_round = True
+                stopped_reason = "max_rounds_reached"
+                update_validation_progress(selected_candidate["ensemble_val_acc"], len(learners))
+                if cfg.stop_on_perfect_train and selected_candidate["ensemble_train_acc"] >= 1.0:
+                    stopped_reason = "perfect_train_acc"
+            elif best_fallback is not None:
                 weights = update_distribution(
                     weights,
                     labels_pm,
@@ -1995,6 +2180,9 @@ async def run_boosting_trial(
         "sampler_boundary_frac": cfg.sampler_boundary_frac,
         "sampler_anchor_frac": cfg.sampler_anchor_frac,
         "sampler_pool_multiplier": cfg.sampler_pool_multiplier,
+        "sampler_feature_hash_dim": cfg.sampler_feature_hash_dim,
+        "candidate_selection": cfg.candidate_selection,
+        "ensemble_val_drop_tolerance": cfg.ensemble_val_drop_tolerance,
         "early_stop_val_patience": cfg.early_stop_val_patience,
         "early_stop_val_min_delta": cfg.early_stop_val_min_delta,
         "restore_best_val_ensemble": cfg.restore_best_val_ensemble,
@@ -2142,6 +2330,9 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
         sampler_boundary_frac=args.sampler_boundary_frac,
         sampler_anchor_frac=args.sampler_anchor_frac,
         sampler_pool_multiplier=args.sampler_pool_multiplier,
+        sampler_feature_hash_dim=args.sampler_feature_hash_dim,
+        candidate_selection=args.candidate_selection,
+        ensemble_val_drop_tolerance=args.ensemble_val_drop_tolerance,
         early_stop_val_patience=args.early_stop_val_patience,
         early_stop_val_min_delta=args.early_stop_val_min_delta,
         restore_best_val_ensemble=args.restore_best_val_ensemble,
@@ -2322,14 +2513,28 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--sample-without-replacement", action="store_true", help="Sample weighted train batches without replacement.")
     p.add_argument(
         "--sampling-strategy",
-        choices=["weighted_random", "weighted_without_replacement", "stratified_diverse"],
+        choices=[
+            "weighted_random",
+            "weighted_without_replacement",
+            "feature_diverse",
+            "label_balanced_diverse",
+            "stratified_diverse",
+        ],
         default=os.getenv("SAMPLING_STRATEGY", "weighted_random"),
-        help="How to choose prompt batches. stratified_diverse mixes high-weight mistakes, boundary cases, anchors, and diverse fill.",
+        help="How to choose prompt batches. Diverse strategies use hashed feature vectors so they work across tabular tasks.",
     )
     p.add_argument("--sampler-mistake-frac", type=float, default=0.6, help="Target fraction of stratified_diverse batches from current ensemble mistakes.")
     p.add_argument("--sampler-boundary-frac", type=float, default=0.2, help="Target fraction of stratified_diverse batches from low-margin boundary examples.")
     p.add_argument("--sampler-anchor-frac", type=float, default=0.2, help="Target fraction of stratified_diverse batches from currently correct anchors.")
     p.add_argument("--sampler-pool-multiplier", type=int, default=8, help="Candidate pool multiplier for diverse farthest-point sampling.")
+    p.add_argument("--sampler-feature-hash-dim", type=int, default=256, help="Fixed hashed feature dimension for sampler-only diversity vectors.")
+    p.add_argument(
+        "--candidate-selection",
+        choices=["first_acceptable", "best_weighted_error", "best_val_acc", "best_ensemble_val"],
+        default=os.getenv("CANDIDATE_SELECTION", "first_acceptable"),
+        help="How to choose among valid retries in a boosting round.",
+    )
+    p.add_argument("--ensemble-val-drop-tolerance", type=float, default=1.0, help="Reject otherwise valid learners if ensemble validation drops by more than this tolerance. Set near 0 for strict validation-preserving boosting.")
     p.add_argument("--stop-on-perfect-train", action="store_true", help="Stop a trial once ensemble train accuracy reaches 1.0.")
     p.add_argument("--early-stop-val-patience", type=int, default=0, help="Stop after this many accepted rounds without validation improvement. Disabled at 0.")
     p.add_argument("--early-stop-val-min-delta", type=float, default=0.0, help="Minimum validation improvement needed to reset early-stop patience.")

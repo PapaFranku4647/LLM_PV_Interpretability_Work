@@ -58,7 +58,8 @@ python program_synthesis/boosted/tamu_api_smoke.py \
 - `--tabular-representation semantic` enables named features and readable bins/categories for mushroom, HTRU2, chess, and CDC.
 - `--tabular-representation hybrid` keeps named fields while adding numeric z-scores and category code tokens for non-CDC tabular datasets. CDC defaults to semantic when this flag is used.
 - `--cdc-representation semantic` remains available as a CDC-specific override.
-- `--sampling-strategy stratified_diverse` builds prompt batches from high-weight mistakes, low-margin boundary examples, correct anchors, and feature-diverse fill. Candidate programs are still accepted only after full weighted-train evaluation.
+- `--sampling-strategy` supports `weighted_random`, `weighted_without_replacement`, `feature_diverse`, `label_balanced_diverse`, and `stratified_diverse`. Diverse strategies use fixed-size hashed feature vectors internally, so they work across tabular tasks with arbitrary feature counts and categorical cardinalities.
+- `--candidate-selection best_ensemble_val` evaluates all retries in a round and selects by the candidate's full-train/validation ensemble behavior instead of accepting the first valid weak learner.
 - `--early-stop-val-patience N --restore-best-val-ensemble` stops on validation stagnation and saves the best-validation ensemble prefix.
 - Batch-size sweeps plus the per-round attempt logs are intended to support plotting train/test accuracy against boosting round `T`.
 - This reuses the provider and dataset machinery from `program_synthesis/runner.py`, but keeps outputs isolated under `program_synthesis/boosted/`.
@@ -154,3 +155,35 @@ This batch-64/128 pilot has been run. Results are summarized in
 `program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`; it did not improve
 over the current `T=1` CDC semantic result, and batch accuracy was not predictive
 of full-train/test accuracy.
+
+## Batch-256 Sampler Comparison
+
+```bash
+python program_synthesis/boosted/boosted_runner.py \
+  --provider openai \
+  --api-mode chat_completions \
+  --functions fn_o \
+  --lengths 21 \
+  --train-size 10000 \
+  --val-size 2000 \
+  --test-size 10000 \
+  --seed 42 \
+  --batch-sizes 256 \
+  --boost-rounds 4 \
+  --round-retries 4 \
+  --resample-each-retry \
+  --sampling-strategy stratified_diverse \
+  --candidate-selection best_ensemble_val \
+  --ensemble-val-drop-tolerance 0.0025 \
+  --tabular-representation semantic \
+  --max-weak-error 0.49 \
+  --early-stop-val-patience 2 \
+  --restore-best-val-ensemble \
+  --reasoning-effort medium \
+  --max-output-tokens 20000 \
+  --no-tools \
+  --output-dir program_synthesis/boosted/runs/semantic_cdc_sampler_compare_b256_s1/stratified_diverse
+```
+
+Repeat with `--sampling-strategy feature_diverse` and
+`--sampling-strategy label_balanced_diverse` to compare generic sampler methods.

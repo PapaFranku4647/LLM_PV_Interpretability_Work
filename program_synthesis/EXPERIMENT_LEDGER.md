@@ -211,6 +211,13 @@ Implementation status:
   label-balanced diverse sampling before any learner exists, then mixes
   high-weight mistakes, low-margin boundary examples, correct anchors, and
   diverse fill after accepted rounds.
+- Generic sampler variants `feature_diverse` and `label_balanced_diverse` are
+  also wired. The diversity vectorizer now uses fixed-size hashed features, so
+  sampler methods can run on arbitrary tabular feature counts and categorical
+  cardinalities without a dense one-hot blowup.
+- Candidate-library selection is wired through `--candidate-selection`; use
+  `best_ensemble_val` to evaluate all retries in a round and select locally by
+  full-train/validation ensemble behavior.
 - Candidate programs are still evaluated on full weighted train before
   acceptance.
 - Validation early stopping is wired through `--early-stop-val-patience` and

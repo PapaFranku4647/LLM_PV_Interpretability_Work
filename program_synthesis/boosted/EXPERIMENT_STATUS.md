@@ -195,6 +195,12 @@ sequential residual boosting did not improve CDC. Next sampler work should use
 batch 256 or a candidate-library selection loop that generates several weak
 programs and chooses by full-train/validation behavior.
 
+Generic sampler update: sampler diversity vectors now use fixed-size hashed
+features, so they are not tied to CDC's feature count. Added
+`feature_diverse`, `label_balanced_diverse`, and candidate-library selection via
+`--candidate-selection best_ensemble_val`. Next run should compare those methods
+at batch 256 before spending on larger sweeps.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the

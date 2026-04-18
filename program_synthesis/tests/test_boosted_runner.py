@@ -220,6 +220,9 @@ class BoostedMathTests(unittest.TestCase):
             sampler_boundary_frac=0.2,
             sampler_anchor_frac=0.2,
             sampler_pool_multiplier=8,
+            sampler_feature_hash_dim=128,
+            candidate_selection="best_ensemble_val",
+            ensemble_val_drop_tolerance=0.01,
             early_stop_val_patience=2,
             early_stop_val_min_delta=0.001,
             restore_best_val_ensemble=True,
@@ -230,6 +233,8 @@ class BoostedMathTests(unittest.TestCase):
         self.assertAlmostEqual(cfg.max_weak_error, 0.35, places=10)
         self.assertAlmostEqual(cfg.min_alpha, 0.05, places=10)
         self.assertEqual(cfg.sampling_strategy, "stratified_diverse")
+        self.assertEqual(cfg.sampler_feature_hash_dim, 128)
+        self.assertEqual(cfg.candidate_selection, "best_ensemble_val")
         self.assertEqual(cfg.early_stop_val_patience, 2)
 
     def test_semantic_generation_prompt_includes_cdc_context(self) -> None:
@@ -1037,6 +1042,77 @@ class BoostedMathTests(unittest.TestCase):
         self.assertIsNotNone(client.prompt_overrides[0])
         self.assertIn("Dataset: CDC diabetes indicators", client.prompt_overrides[0])
         self.assertIn("HighBP:yes,BMI:medium,Age:high -> 1", client.prompt_overrides[0])
+
+    def test_candidate_library_selection_evaluates_all_retries_before_accepting(self) -> None:
+        class StubClient:
+            def __init__(self) -> None:
+                self.cfg = type("Cfg", (), {"seed": 7, "model": "gpt-5"})()
+                self.calls = 0
+
+            async def _call_once(self, fn, L, attempt_idx, data_examples, decimal, tabular=False, prompt_override=None):
+                self.calls += 1
+                if self.calls == 1:
+                    code = "def f(x):\n    return 1 if float(x['x0']) > 0 else 0\n"
+                else:
+                    code = "def f(x):\n    return 1 if float(x['x0']) > 1.5 else 0\n"
+                return {
+                    "fn": fn,
+                    "length": L,
+                    "attempt": attempt_idx,
+                    "text": json.dumps({"code": code}),
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "duration_ms": 1,
+                    "tool_uses": 0,
+                }
+
+        train_lines = [
+            "x0:1 -> 1",
+            "x0:2 -> 1",
+            "x0:-1 -> 0",
+            "x0:-2 -> 0",
+        ]
+        cfg = boosted_runner.BoostConfig(
+            boost_rounds=1,
+            batch_sizes=[4],
+            round_retries=2,
+            max_weak_error=0.499,
+            min_alpha=1e-6,
+            num_trials=1,
+            stop_on_perfect_train=False,
+            resample_each_retry=False,
+            output_dir="unused",
+            candidate_selection="best_weighted_error",
+        )
+        log = logging.getLogger("boosted_runner_test")
+        log.handlers[:] = [logging.NullHandler()]
+        log.propagate = False
+        client = StubClient()
+
+        summary, attempt_rows, accepted_rounds = self._run_async(
+            boosted_runner.run_boosting_trial(
+                client=client,
+                log=log,
+                fn="fn_o",
+                length=21,
+                target_name="cdc_diabetes",
+                train_lines=train_lines,
+                val_lines=[],
+                test_lines=list(train_lines),
+                is_decimal=False,
+                is_tabular=True,
+                cfg=cfg,
+                batch_size=4,
+                trial_idx=1,
+            )
+        )
+
+        self.assertEqual(client.calls, 2)
+        self.assertEqual(summary["accepted_rounds"], 1)
+        self.assertEqual(len(attempt_rows), 2)
+        self.assertTrue(attempt_rows[0]["accepted"])
+        self.assertTrue(attempt_rows[0]["candidate_selected"])
+        self.assertFalse(attempt_rows[1]["accepted"])
+        self.assertEqual(accepted_rounds[0]["retry"], 1)
 
     @staticmethod
     def _run_async(awaitable):
