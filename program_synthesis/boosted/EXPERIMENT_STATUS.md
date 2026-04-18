@@ -91,6 +91,17 @@ Conclusion: full-budget experiments should continue on CDC semantic and maybe
 HTRU2 numeric. Do not spend a 5-trial budget on mushroom or chess until they
 have semantic/named feature representations.
 
+The 5-trial matched follow-up is saved in
+`program_synthesis/CODEBOOST_MATCHED_RESULTS.md`, with aggregate CSV at
+`program_synthesis/codeboost_matched_t1_b256_s5.csv`.
+
+5-trial matched results:
+
+- CDC diabetes semantic: mean test 0.7173, std 0.0102, best trial 0.7300,
+  best baseline 0.7225.
+- HTRU2 obfuscated: mean test 0.9032, std 0.0204, best trial 0.9300, best
+  baseline 0.9340.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the
