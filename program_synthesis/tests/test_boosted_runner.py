@@ -1113,6 +1113,45 @@ class BoostedMathTests(unittest.TestCase):
         self.assertTrue(attempt_rows[0]["candidate_selected"])
         self.assertFalse(attempt_rows[1]["accepted"])
         self.assertEqual(accepted_rounds[0]["retry"], 1)
+        self.assertIn("float(x['x0']) > 0", attempt_rows[0]["candidate_code"])
+        self.assertIn("float(x['x0']) > 1.5", attempt_rows[1]["candidate_code"])
+        self.assertEqual(attempt_rows[0]["candidate_source_count"], 1)
+        self.assertEqual(attempt_rows[1]["candidate_source_count"], 1)
+        self.assertEqual(attempt_rows[0]["candidate_source_history"][0]["stage"], "initial")
+        self.assertEqual(attempt_rows[1]["candidate_source_history"][0]["stage"], "initial")
+        self.assertEqual(
+            attempt_rows[0]["candidate_code_sha256"],
+            boosted_runner._hash_text(attempt_rows[0]["candidate_code"]),
+        )
+
+    def test_write_csv_omits_heavy_candidate_source_fields(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp_dir:
+            path = os.path.join(tmp_dir, "attempts.csv")
+            boosted_runner.write_csv(
+                path,
+                [
+                    {
+                        "attempt": 1,
+                        "candidate_code": "def f(x):\n    return 1\n",
+                        "candidate_source_history": [
+                            {
+                                "stage": "initial",
+                                "code": "def f(x):\n    return 1\n",
+                            }
+                        ],
+                        "candidate_code_sha256": "abc",
+                    }
+                ],
+            )
+
+            with open(path, encoding="utf-8") as handle:
+                contents = handle.read()
+
+        header_fields = contents.splitlines()[0].split(",")
+        self.assertNotIn("candidate_code", header_fields)
+        self.assertNotIn("candidate_source_history", header_fields)
+        self.assertIn("candidate_code_sha256", header_fields)
+        self.assertNotIn("return 1", contents)
 
     @staticmethod
     def _run_async(awaitable):

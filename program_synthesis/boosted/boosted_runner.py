@@ -30,6 +30,7 @@ import runner as base_runner  # noqa: E402
 
 DEFAULT_DATASET_DIR = os.path.join("program_synthesis", "boosted", "datasets")
 DEFAULT_OUTPUT_DIR = os.path.join("program_synthesis", "boosted", "outputs")
+CSV_EXCLUDED_FIELDS = {"candidate_code", "candidate_source_history"}
 
 CDC_FEATURE_NAMES = [
     "HighBP", "HighChol", "CholCheck", "BMI", "Smoker", "Stroke",
@@ -338,6 +339,56 @@ def _stable_seed(*parts: Any) -> int:
     key = "|".join(str(p) for p in parts)
     digest = hashlib.sha256(key.encode("utf-8")).digest()
     return int.from_bytes(digest[:8], "big") & 0x7FFFFFFF
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def append_candidate_source_event(
+    history: List[Dict[str, Any]],
+    *,
+    stage: str,
+    api_attempt: int,
+    code: Optional[str],
+    response_text: str,
+    status: Optional[str] = None,
+) -> None:
+    event: Dict[str, Any] = {
+        "stage": stage,
+        "api_attempt": api_attempt,
+        "status": status or ("code_found" if code else "no_code_found"),
+        "response_chars": len(response_text),
+    }
+    if code:
+        event.update(
+            {
+                "code": code,
+                "code_chars": len(code),
+                "code_sha256": _hash_text(code),
+            }
+        )
+    history.append(event)
+
+
+def set_candidate_source_metadata(
+    row: Dict[str, Any],
+    *,
+    final_code: Optional[str],
+    source_history: Sequence[Dict[str, Any]],
+) -> None:
+    source_events = [event for event in source_history if event.get("code")]
+    row["candidate_source_count"] = len(source_events)
+    row["candidate_source_stages"] = ",".join(str(event.get("stage") or "") for event in source_events)
+    row["candidate_source_history"] = list(source_history)
+    if final_code:
+        row["candidate_code"] = final_code
+        row["candidate_code_chars"] = len(final_code)
+        row["candidate_code_sha256"] = _hash_text(final_code)
+    else:
+        row["candidate_code"] = None
+        row["candidate_code_chars"] = 0
+        row["candidate_code_sha256"] = None
 
 
 def parse_examples(lines: Sequence[str], is_tabular: bool) -> List[Example]:
@@ -1481,7 +1532,8 @@ async def run_boosting_trial(
                     tabular=is_tabular,
                 )
 
-            code_str = base_runner.extract_code_from_output(res.get("text") or "")
+            response_text = res.get("text") or ""
+            code_str = base_runner.extract_code_from_output(response_text)
             first_accounting = add_response_accounting(res)
             chain_prompt_tokens = int(first_accounting["prompt_tokens"] or 0)
             chain_completion_tokens = int(first_accounting["completion_tokens"] or 0)
@@ -1498,6 +1550,14 @@ async def run_boosting_trial(
             output_rate_per_million = first_accounting["output_rate_per_million"]
             batch_examples = [train_examples[idx] for idx in sampled_indices]
             repair_history: List[Dict[str, Any]] = []
+            candidate_source_history: List[Dict[str, Any]] = []
+            append_candidate_source_event(
+                candidate_source_history,
+                stage="initial",
+                api_attempt=api_attempt_start,
+                code=code_str,
+                response_text=response_text,
+            )
             row: Dict[str, Any] = {
                 "fn": fn,
                 "target_name": target_name,
@@ -1559,10 +1619,21 @@ async def run_boosting_trial(
                 "candidate_ensemble_val_acc": None,
                 "candidate_ensemble_test_acc": None,
                 "candidate_ensemble_val_drop": None,
+                "candidate_code_sha256": None,
+                "candidate_code_chars": 0,
+                "candidate_source_count": 0,
+                "candidate_source_stages": None,
+                "candidate_code": None,
+                "candidate_source_history": [],
             }
 
             if not code_str:
                 row["compile_error"] = "no_code_found"
+                set_candidate_source_metadata(
+                    row,
+                    final_code=None,
+                    source_history=candidate_source_history,
+                )
                 attempt_rows.append(serialize_attempt_row(row))
                 continue
 
@@ -1651,6 +1722,13 @@ async def run_boosting_trial(
 
                         repair_text = repair_res.get("text") or ""
                         repaired_code = base_runner.extract_code_from_output(repair_text)
+                        append_candidate_source_event(
+                            candidate_source_history,
+                            stage="batch_repair",
+                            api_attempt=attempt_counter,
+                            code=repaired_code,
+                            response_text=repair_text,
+                        )
                         repair_status = "repair"
                         if not repaired_code:
                             repair_history.append(
@@ -1697,6 +1775,13 @@ async def run_boosting_trial(
 
                             fallback_text = fallback_res.get("text") or ""
                             repaired_code = base_runner.extract_code_from_output(fallback_text)
+                            append_candidate_source_event(
+                                candidate_source_history,
+                                stage="batch_repair_fallback",
+                                api_attempt=attempt_counter,
+                                code=repaired_code,
+                                response_text=fallback_text,
+                            )
                             repair_status = "fallback_repair"
                             if not repaired_code:
                                 repair_history.append(
@@ -1819,6 +1904,13 @@ async def run_boosting_trial(
 
                     whole_text = whole_res.get("text") or ""
                     whole_code = base_runner.extract_code_from_output(whole_text)
+                    append_candidate_source_event(
+                        candidate_source_history,
+                        stage="whole_train_repair",
+                        api_attempt=attempt_counter,
+                        code=whole_code,
+                        response_text=whole_text,
+                    )
                     history_step = cfg.repair_rounds + repair_step
                     if not whole_code:
                         repair_history.append(
@@ -1933,6 +2025,11 @@ async def run_boosting_trial(
                         "repair_history": json.dumps(repair_history, ensure_ascii=False),
                     }
                 )
+                set_candidate_source_metadata(
+                    row,
+                    final_code=code_str,
+                    source_history=candidate_source_history,
+                )
 
                 learner = {
                         "round": round_idx,
@@ -2040,6 +2137,11 @@ async def run_boosting_trial(
                 attempt_rows.append(serialized_row)
             except Exception as exc:
                 row["compile_error"] = str(exc)
+                set_candidate_source_metadata(
+                    row,
+                    final_code=code_str,
+                    source_history=candidate_source_history,
+                )
                 attempt_rows.append(serialize_attempt_row(row))
 
         if not accepted_this_round:
@@ -2210,8 +2312,12 @@ def write_csv(path: str, rows: Sequence[Dict[str, Any]]) -> None:
     if not rows:
         _safe_write_text(path, "")
         return
+    csv_rows = [
+        {k: v for k, v in row.items() if k not in CSV_EXCLUDED_FIELDS}
+        for row in rows
+    ]
     fieldnames: List[str] = []
-    for row in rows:
+    for row in csv_rows:
         for key in row.keys():
             if key not in fieldnames:
                 fieldnames.append(key)
@@ -2225,7 +2331,7 @@ def write_csv(path: str, rows: Sequence[Dict[str, Any]]) -> None:
     ) as tmp:
         writer = csv.DictWriter(tmp, fieldnames=fieldnames)
         writer.writeheader()
-        writer.writerows(rows)
+        writer.writerows(csv_rows)
         tmp_path = tmp.name
     os.replace(tmp_path, path)
 

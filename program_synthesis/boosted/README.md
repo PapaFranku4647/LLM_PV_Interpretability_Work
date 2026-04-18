@@ -192,3 +192,51 @@ foreach ($method in $methods) {
 This comparison has been run. Results are summarized in
 `program_synthesis/CODEBOOST_SAMPLER_COMPARE_B256.md`; the best test result was
 `stratified_diverse` at 0.7046, and all methods restored to one saved learner.
+
+## Candidate Source Logging
+
+Attempt JSONL artifacts now preserve source for every generated candidate:
+
+- `candidate_code`
+- `candidate_code_sha256`
+- `candidate_code_chars`
+- `candidate_source_count`
+- `candidate_source_stages`
+- `candidate_source_history`
+
+The CSV artifacts omit the full source blobs to stay readable, but keep source
+hashes and sizes.
+
+## Larger Candidate-Library CDC Sweep
+
+```bash
+python program_synthesis\boosted\boosted_runner.py `
+  --provider openai `
+  --api-mode chat_completions `
+  --functions fn_o `
+  --lengths 21 `
+  --train-size 10000 `
+  --val-size 2000 `
+  --test-size 10000 `
+  --seed 42 `
+  --batch-sizes 256 `
+  --boost-rounds 4 `
+  --num-trials 1 `
+  --round-retries 10 `
+  --resample-each-retry `
+  --sampling-strategy stratified_diverse `
+  --candidate-selection best_ensemble_val `
+  --ensemble-val-drop-tolerance 0.005 `
+  --tabular-representation semantic `
+  --max-weak-error 0.49 `
+  --early-stop-val-patience 3 `
+  --restore-best-val-ensemble `
+  --reasoning-effort medium `
+  --max-output-tokens 20000 `
+  --no-tools `
+  --output-dir program_synthesis\boosted\runs\semantic_cdc_candidate_library_b256_r10_s1\stratified_diverse
+```
+
+This sweep has been run. Results are summarized in
+`program_synthesis/CODEBOOST_CANDIDATE_LIBRARY_B256_R10.md`. It logged source
+for all 40 candidates, but restored to one saved learner with final test 0.7027.

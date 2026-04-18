@@ -217,6 +217,35 @@ semantic `T=1` 5-trial mean of 0.7173 and best of 0.7300. Next sampler work
 should add candidate source logging, then build a larger offline candidate
 library for local validation/greedy ensemble selection.
 
+Candidate source logging is now implemented. Attempt JSONL artifacts include
+full candidate source through `candidate_code` and `candidate_source_history`;
+CSV artifacts keep hashes/counts/sizes but omit full source blobs.
+
+The larger CDC candidate-library sweep is now saved in
+`program_synthesis/CODEBOOST_CANDIDATE_LIBRARY_B256_R10.md`, with raw artifacts
+under
+`program_synthesis/boosted/runs/semantic_cdc_candidate_library_b256_r10_s1/`.
+
+Configuration: CDC semantic, 10000/2000/10000 train/val/test, batch 256, one
+seed, 4 rounds, 10 retries per round, `stratified_diverse`,
+`best_ensemble_val`, weak-error gate 0.49, validation drop tolerance 0.005,
+early-stop patience 3, restore best-validation ensemble.
+
+Results:
+
+- Final train/val/test: 0.7031 / 0.6950 / 0.7027.
+- API attempts: 40.
+- Candidates with logged source: 40.
+- Estimated cost: $2.9969.
+- Saved rounds after restoration: 1.
+- Selected candidates before restoration: 4.
+- Best individual test candidate: round 2 retry 3, test 0.7097, val 0.6940.
+
+Conclusion: increasing retries from 3 to 10 did not solve CDC boosting. The
+source-logging artifact problem is fixed, but the next method step should be
+post-hoc local ensemble selection over the saved candidate library rather than
+more online AdaBoost rounds.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the

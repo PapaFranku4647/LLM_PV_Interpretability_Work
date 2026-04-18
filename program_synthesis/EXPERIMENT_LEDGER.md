@@ -319,3 +319,38 @@ the best-validation restored ensemble kept only the first learner. Before larger
 sweeps, add candidate-program logging for every attempt so we preserve rejected
 and later-restored learner source, then try larger candidate libraries and
 post-hoc local ensemble selection.
+
+## Candidate Source Logging and Larger Candidate Library
+
+Candidate source logging is now implemented in `boosted_runner.py`. Attempt
+JSONL artifacts include full candidate source through `candidate_code` and
+`candidate_source_history`. CSV artifacts omit those large blobs but keep source
+hashes, sizes, counts, and stages.
+
+The larger CDC candidate-library sweep is saved in
+`program_synthesis/CODEBOOST_CANDIDATE_LIBRARY_B256_R10.md`, with aggregate CSV
+at `program_synthesis/codeboost_candidate_library_b256_r10_s1.csv` and raw
+artifacts under
+`program_synthesis/boosted/runs/semantic_cdc_candidate_library_b256_r10_s1/`.
+
+Configuration: CDC semantic, 10000/2000/10000 train/val/test, batch 256, one
+seed, 4 rounds, 10 retries per round, `stratified_diverse`,
+`best_ensemble_val`, validation drop tolerance 0.005, max weak error 0.49,
+early-stop patience 3, restore best-validation ensemble.
+
+Results:
+
+- Final train/val/test: 0.7031 / 0.6950 / 0.7027.
+- API attempts: 40.
+- Candidates with logged source: 40.
+- Estimated cost: $2.9969.
+- Saved rounds after restoration: 1.
+- Selected candidates before restoration: 4.
+- Best individual test candidate: round 2 retry 3, train/val/test
+  0.7124 / 0.6940 / 0.7097.
+
+Conclusion: the candidate library has useful alternatives, but online
+AdaBoost-style selection still does not extract a better CDC ensemble. The next
+step should be post-hoc local ensemble selection over logged candidates, plus a
+library-generation mode that collects candidates without committing weights after
+each selected round.
