@@ -116,6 +116,21 @@ Next experiment: rerun one-trial semantic pilots for `fn_n`, `fn_p`, and `fn_q`
 using `--tabular-representation semantic`; only run 5-trial aggregates where the
 pilot closes a meaningful part of the current baseline gap.
 
+The non-CDC semantic pilot is now saved in
+`program_synthesis/CODEBOOST_SEMANTIC_PILOT.md`, with aggregate CSV at
+`program_synthesis/codeboost_semantic_pilot_t1_b256_s1.csv`.
+
+Semantic pilot test accuracies:
+
+- Mushroom semantic: 0.6380 vs obfuscated pilot 0.5755 and best baseline 0.8528.
+- HTRU2 semantic: 0.8950 vs obfuscated pilot 0.8830 and best baseline 0.9340.
+- Chess semantic: 0.6310 vs obfuscated pilot 0.5775 and best baseline 0.9615.
+
+Conclusion: semantic rows help, but mushroom/chess are still not ready for
+5-trial runs. HTRU2 remains the only plausible non-CDC secondary dataset, but a
+hybrid named-feature plus numeric-value representation may be better than bins
+only.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the
