@@ -116,4 +116,7 @@ python program_synthesis/boosted/boosted_runner.py \
   --output-dir program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_p_htru2
 ```
 
-Swap `fn_p --lengths 8` for `fn_n --lengths 20` to run mushroom. Chess hybrid is wired, but should stay deprioritized until the chess feature abbreviations get stronger domain descriptions.
+This pilot has been run for HTRU2 and mushroom. Results are summarized in
+`program_synthesis/CODEBOOST_HYBRID_PILOT.md`; hybrid did not beat the semantic
+pilot on either dataset. Chess hybrid is wired, but should stay deprioritized
+until the chess feature abbreviations get stronger domain descriptions.

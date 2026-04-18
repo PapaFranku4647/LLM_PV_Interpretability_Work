@@ -22,9 +22,9 @@ and what currently looks strongest.
 - Mushroom and chess improved with semantic rows, but they remain far below
   classical baselines. Do not spend full 5-trial API budgets on them unless a
   pilot closes the gap.
-- The current new method is `hybrid`: named features plus qualitative bins and
-  normalized numeric values for numeric columns, and readable labels plus code
-  tokens/missingness for categorical columns.
+- Hybrid is implemented and saved as an ablation, but the first pilot did not
+  improve accuracy. The next serious accuracy lever is sampler diversity or
+  stronger task-specific feature descriptions, not another blind hybrid sweep.
 
 ## Source Notes And Raw Files
 
@@ -32,6 +32,7 @@ and what currently looks strongest.
 - Matched one-trial CodeBoost pilot: `program_synthesis/CODEBOOST_MATCHED_PILOT.md`
 - Matched 5-trial CodeBoost follow-up: `program_synthesis/CODEBOOST_MATCHED_RESULTS.md`
 - Non-CDC semantic pilot: `program_synthesis/CODEBOOST_SEMANTIC_PILOT.md`
+- Hybrid non-CDC pilot: `program_synthesis/CODEBOOST_HYBRID_PILOT.md`
 - Running status and cleanup warnings: `program_synthesis/boosted/EXPERIMENT_STATUS.md`
 - Baseline raw outputs:
   - `program_synthesis/baseline_results_core.csv`
@@ -42,6 +43,7 @@ and what currently looks strongest.
   - `program_synthesis/codeboost_matched_pilot_t1_b256_s1.csv`
   - `program_synthesis/codeboost_matched_t1_b256_s5.csv`
   - `program_synthesis/codeboost_semantic_pilot_t1_b256_s1.csv`
+  - `program_synthesis/codeboost_hybrid_pilot_t1_b256_s1.csv`
 
 Large generated run directories are intentionally ignored by git. Do not delete
 these without first saving the useful summaries:
@@ -82,7 +84,7 @@ Best matched baselines:
 | Obfuscated | `x0:1.23,x1:c2,...` with random numeric affine transforms and anonymous categorical codes. | Poor for mushroom/chess; okay for HTRU2 numeric; useful as raw ablation. |
 | CDC semantic | CDC feature names with yes/no fields and five qualitative bins for numeric/ordinal fields. | Strongest current story; best matched trial beats the best CDC baseline. |
 | Non-CDC semantic | Mushroom/HTRU2/chess feature names, readable categories, and bins for numeric features. | Helps mushroom/chess relative to obfuscated, but not enough. HTRU2 may lose threshold detail. |
-| Hybrid | Numeric fields expose both `_bin` and `_z`; categorical fields expose readable labels plus `code_*` and missingness. | Implemented for mushroom, HTRU2, and chess. Next API pilot. |
+| Hybrid | Numeric fields expose both `_bin` and `_z`; categorical fields expose readable labels plus `code_*` and missingness. | Implemented for mushroom, HTRU2, and chess. First pilot did not improve accuracy. |
 
 ## CodeBoost Results
 
@@ -110,6 +112,17 @@ Non-CDC semantic one-trial pilot:
 | `fn_n` | mushroom | 0.6380 | 0.5755 | 0.8528 | -0.2148 | 2 | $0.1665 |
 | `fn_p` | HTRU2 | 0.8950 | 0.8830 | 0.9340 | -0.0390 | 1 | $0.0522 |
 | `fn_q` | chess | 0.6310 | 0.5775 | 0.9615 | -0.3305 | 8 | $0.7695 |
+
+Hybrid one-trial pilot:
+
+| Function | Dataset | Hybrid test | Semantic pilot | Prior obfuscated pilot | Best baseline | Gap | Attempts | Cost |
+| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `fn_n` | mushroom | 0.6115 | 0.6380 | 0.5755 | 0.8528 | -0.2413 | 2 | $0.2828 |
+| `fn_p` | HTRU2 | 0.8770 | 0.8950 | 0.8830 | 0.9340 | -0.0570 | 1 | $0.1016 |
+
+Chess hybrid was not run because the previous chess semantic pilot was already
+far from the baseline and hybrid code tokens do not add the missing chess-domain
+feature descriptions.
 
 ## Other Saved Run Families
 
@@ -146,11 +159,10 @@ These are generated from the `summary.csv` files under
 - Repair prompts sometimes improve the best individual run, but they cost a lot
   and have not improved the mean enough to justify broad use.
 - Semantic context matters more than round count on the current pipeline.
-- For HTRU2, pure bins probably throw away useful thresholds; hybrid `_z` fields
-  are the right next test.
-- For mushroom, readable categories helped, but we should preserve original code
-  tokens and missingness so generated code can use both semantic and exact-value
-  signals.
+- For HTRU2, pure bins may throw away useful thresholds, but the first hybrid
+  `_z` pilot was worse than semantic and obfuscated one-trial pilots.
+- For mushroom, preserving original code tokens and missingness did not improve
+  over readable semantic categories.
 - For chess, UCI abbreviations are still too opaque. A proper chess semantic
   context would need Shapiro KRKPA7 feature descriptions; until then chess is a
   weak paper target.
@@ -189,7 +201,10 @@ Expected implementation shape:
 
 ## Next Runs
 
-Start with one-trial hybrid pilots, not a full budget:
+Do not run a full hybrid budget from the current pilot. The next run should test
+the deferred diverse/residual sampler on CDC first, then HTRU2 if CDC improves.
+
+The already-run hybrid HTRU2 command was:
 
 ```bash
 python program_synthesis/boosted/boosted_runner.py \
@@ -216,5 +231,7 @@ python program_synthesis/boosted/boosted_runner.py \
   --output-dir program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_p_htru2
 ```
 
-Run mushroom next with `fn_n --lengths 20`. Skip chess unless a new chess feature
-description prompt is added or the budget is explicitly worth spending.
+The mushroom command was the same with `fn_n --lengths 20` and output directory
+`program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_n_mushroom`.
+Skip chess unless a new chess feature-description prompt is added or the budget
+is explicitly worth spending.

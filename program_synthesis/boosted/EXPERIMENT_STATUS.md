@@ -152,9 +152,21 @@ Validation completed before API pilots:
 - Hybrid baseline smoke passed for mushroom, HTRU2, and chess using 20/10/20
   splits with a decision tree.
 
-Next experiment: run one-trial hybrid pilots for HTRU2 and mushroom. Do not run
-a full 5-trial aggregate unless one of those pilots closes a meaningful part of
-the current baseline gap.
+The hybrid pilot is now saved in
+`program_synthesis/CODEBOOST_HYBRID_PILOT.md`, with aggregate CSV at
+`program_synthesis/codeboost_hybrid_pilot_t1_b256_s1.csv`.
+
+Hybrid pilot test accuracies:
+
+- Mushroom hybrid: 0.6115 vs semantic pilot 0.6380, obfuscated pilot 0.5755,
+  and best baseline 0.8528.
+- HTRU2 hybrid: 0.8770 vs semantic pilot 0.8950, obfuscated pilot 0.8830, and
+  best baseline 0.9340.
+
+Conclusion: hybrid is worth preserving as an ablation, but it is not the next
+accuracy lever. Do not run a 5-trial hybrid aggregate from these numbers. The
+next serious method step should be the diverse/residual sampler, or stronger
+task-specific feature descriptions for chess.
 
 ## Deferred Sampler Design
 
