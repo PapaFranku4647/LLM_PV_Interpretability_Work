@@ -53,6 +53,25 @@ results needed for the paper table.
 - The likely paper story is interpretability plus competitive/reasonable accuracy,
   not necessarily state-of-the-art accuracy against every tabular method.
 
+## Baseline Snapshot
+
+The first core baseline matrix has been saved in
+`program_synthesis/BASELINE_RESULTS.md`, with raw outputs in
+`program_synthesis/baseline_results_core.csv` and
+`program_synthesis/baseline_results_core.jsonl`.
+
+Best test accuracies from that run:
+
+- CDC diabetes: logistic regression, 0.7225
+- Mushroom: extra trees, 0.8528
+- HTRU2: hist gradient boosting, 0.9340
+- Chess: hist gradient boosting, 0.9615
+
+The current best semantic CodeBoost CDC result, 0.70321 mean test accuracy, is
+about 1.9 percentage points below the strongest CDC baseline but competitive
+with several core baselines. XGBoost did not run in this snapshot because it was
+not installed.
+
 ## Deferred Sampler Design
 
 Do not implement this during the initial cleanup pass, but preserve it for the
@@ -83,4 +102,3 @@ Expected implementation shape:
 - Start with `weighted_random`, `weighted_without_replacement`,
   `mistake_clustered`, and `stratified_diverse`.
 - Reuse the existing full-train evaluation and whole-train repair plumbing.
-
