@@ -24,6 +24,11 @@ and what currently looks strongest.
   0.9032 mean test accuracy with obfuscated numeric rows and 0.9001 in the
   5-trial semantic follow-up, versus the best matched baseline at 0.9340.
   Semantic bins did not improve HTRU2, likely because threshold detail matters.
+- The 2026-04-20 HTRU2 second-dataset push tried named raw numeric features,
+  calibrated threshold hints, 5.4 full/nano, 512-example prompts, and local
+  post-hoc selection. None beat the 0.9340 baseline; best new comparable row was
+  the partial obfuscated 5.2 library at 0.9230. The prior 0.9300 HTRU2 best
+  trial remains the strongest CodeBoost HTRU2 result.
 - Mushroom and chess improved with semantic rows, but they remain far below
   classical baselines. Do not spend full 5-trial API budgets on them unless a
   pilot closes the gap.
@@ -38,6 +43,7 @@ and what currently looks strongest.
 - Matched 5-trial CodeBoost follow-up: `program_synthesis/CODEBOOST_MATCHED_RESULTS.md`
 - CDC model comparison: `program_synthesis/CODEBOOST_MODEL_COMPARISON.md`
 - Non-CDC semantic pilot: `program_synthesis/CODEBOOST_SEMANTIC_PILOT.md`
+- HTRU2 second-dataset push: `program_synthesis/CODEBOOST_HTRU2_SECOND_DATASET_PUSH.md`
 - Hybrid non-CDC pilot: `program_synthesis/CODEBOOST_HYBRID_PILOT.md`
 - CDC stratified diverse sampler pilot:
   `program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`
@@ -95,6 +101,7 @@ Best matched baselines:
 | CDC semantic | CDC feature names with yes/no fields and five qualitative bins for numeric/ordinal fields. | Strongest current story; best matched trial beats the best CDC baseline. |
 | Non-CDC semantic | Mushroom/HTRU2/chess feature names, readable categories, and bins for numeric features. | Helps mushroom/chess relative to obfuscated, but not enough. HTRU2 may lose threshold detail. |
 | Hybrid | Numeric fields expose both `_bin` and `_z`; categorical fields expose readable labels plus `code_*` and missingness. | Implemented for mushroom, HTRU2, and chess. First pilot did not improve accuracy. |
+| Named numeric | HTRU2 semantic feature names with compact raw numeric values. | Added for the second-dataset push. It preserved thresholds better than bins, but did not beat the HTRU2 baseline. |
 
 ## CodeBoost Results
 
@@ -115,6 +122,17 @@ Matched 5-trial follow-up:
 | `fn_o` | CDC diabetes | semantic | 0.7173 | 0.0102 | 0.7020 | 0.7300 | 0.7225 | -0.0052 | 6 | $0.4465 |
 | `fn_p` | HTRU2 | obfuscated | 0.9032 | 0.0204 | 0.8795 | 0.9300 | 0.9340 | -0.0308 | 5 | $0.7939 |
 | `fn_p` | HTRU2 | semantic | 0.9001 | 0.0089 | 0.8875 | 0.9120 | 0.9340 | -0.0339 | 5 | $0.3541 |
+
+HTRU2 second-dataset push:
+
+| Method | Representation | Model / selection | Test accuracy | Takeaway |
+| --- | --- | --- | ---: | --- |
+| Prior best trial | obfuscated | `protected.gpt-5.2` | 0.9300 | Still the best HTRU2 CodeBoost result. |
+| Named numeric posthoc | named numeric | 10 saved 5.2 candidates, uniform greedy | 0.9155 | Posthoc helped, but not enough. |
+| Partial obfuscated library | obfuscated | 5.2 candidate library, endpoint failure after first good candidate | 0.9230 | Best new comparable result. |
+| 5.4 full named numeric | named numeric | 3 retries, best validation candidate | 0.9175 | Full 5.4 did not improve HTRU2. |
+| 5.4 nano named numeric | named numeric | 10 retries attempted | 0.8945 | Nano was not useful here. |
+| Calibrated named numeric | named numeric + threshold hints | 5.2, 3 retries | 0.9025 | Threshold hints did not fix it. |
 
 CDC model comparison at the same semantic `T=1`, batch 256 setting:
 

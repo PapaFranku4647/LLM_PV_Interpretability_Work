@@ -38,8 +38,10 @@ SEMANTIC_BIN_LABELS = ["very low", "low", "medium", "high", "very high"]
 
 def _get_tabular_representation(env_name: str) -> str:
     representation = os.getenv(env_name, os.getenv("TABULAR_REPRESENTATION", "obfuscated")).strip().lower()
-    if representation not in {"obfuscated", "semantic", "hybrid"}:
-        raise ValueError(f"{env_name} must be obfuscated, semantic, or hybrid, got {representation!r}.")
+    if representation not in {"obfuscated", "semantic", "hybrid", "named_numeric"}:
+        raise ValueError(
+            f"{env_name} must be obfuscated, semantic, hybrid, or named_numeric, got {representation!r}."
+        )
     return representation
 
 
@@ -104,6 +106,16 @@ def _z_score(raw_value: Any, stats: Tuple[float, float]) -> str:
         return "0.00"
     mean, std = stats
     return f"{((value - mean) / std):.2f}"
+
+
+def _compact_float(raw_value: Any) -> str:
+    try:
+        value = float(raw_value)
+    except (TypeError, ValueError):
+        return "0"
+    if not np.isfinite(value):
+        return "0"
+    return f"{value:.6g}"
 
 # Optional dependency handling for performance
 try:
@@ -2078,6 +2090,12 @@ class HTRU2DataGenerator(BaseDataGenerator):
                 self._numeric_stats.get(idx, (0.0, 1.0)),
             )
         return hybrid
+
+    def _named_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        return {
+            self.SEMANTIC_FEATURE_NAMES[idx]: _compact_float(raw.get(name, ""))
+            for idx, name in enumerate(self.RAW_FEATURE_NAMES)
+        }
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -2119,7 +2137,7 @@ class HTRU2DataGenerator(BaseDataGenerator):
             self._init_semantic_bins(all_raw_samples)
             if self.representation == "hybrid":
                 self._init_numeric_stats(all_raw_samples)
-        else:
+        elif self.representation != "named_numeric":
             numeric_values_list = []
             for sample in all_raw_samples:
                 numeric_values = [float(sample[name]) for name in self.RAW_FEATURE_NAMES]
@@ -2133,6 +2151,8 @@ class HTRU2DataGenerator(BaseDataGenerator):
                 features = self._semantic_sample(raw_sample)
             elif self.representation == "hybrid":
                 features = self._hybrid_sample(raw_sample)
+            elif self.representation == "named_numeric":
+                features = self._named_numeric_sample(raw_sample)
             else:
                 features = {}
                 for feat_idx, name in enumerate(self.RAW_FEATURE_NAMES):

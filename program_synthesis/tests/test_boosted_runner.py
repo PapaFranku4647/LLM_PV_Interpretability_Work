@@ -275,6 +275,10 @@ class BoostedMathTests(unittest.TestCase):
             boosted_runner.get_dataset_context("htru2", "obfuscated", "hybrid"),
         )
         self.assertIn(
+            "real-valued numeric",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "named_numeric"),
+        )
+        self.assertIn(
             "code_",
             boosted_runner.get_dataset_context("mushroom", "obfuscated", "hybrid"),
         )
@@ -515,6 +519,21 @@ class BoostedMathTests(unittest.TestCase):
         self.assertIn("dm_snr_kurtosis_z", sample)
         self.assertNotIn("x0", sample)
         self.assertIsInstance(float(sample["profile_mean_z"]), float)
+
+    def test_named_numeric_htru2_generator_uses_raw_values_with_named_features(self) -> None:
+        raw = [
+            {name: str(idx + feat_idx + 0.125) for feat_idx, name in enumerate(HTRU2DataGenerator.RAW_FEATURE_NAMES)}
+            for idx in range(10)
+        ]
+
+        with mock.patch.dict(os.environ, {"TABULAR_REPRESENTATION": "named_numeric", "HTRU2_REPRESENTATION": "named_numeric"}):
+            generator = HTRU2DataGenerator(sequence_length=8, num_samples=2)
+            sample = generator._named_numeric_sample(raw[0])
+
+        self.assertEqual(sample["profile_mean"], "0.125")
+        self.assertEqual(sample["dm_snr_kurtosis"], "7.125")
+        self.assertNotIn("x0", sample)
+        self.assertNotIn("profile_mean_bin", sample)
 
     def test_semantic_chess_generator_uses_uci_names_and_readable_values(self) -> None:
         raw = {name: "t" for name in ChessDataGenerator.RAW_FEATURE_NAMES}

@@ -1,0 +1,92 @@
+{
+  "summary": {
+    "attempts_jsonl": "program_synthesis\\boosted\\runs\\htru2_obfuscated_candidate_library_t4_b256_r10_s1_timeout180\\protected_gpt_5_2_medium\\attempts.jsonl",
+    "function": "fn_p",
+    "length": 8,
+    "train_size": 256,
+    "val_size": 256,
+    "test_size": 2000,
+    "seed": 42,
+    "tabular_representation": "obfuscated",
+    "cdc_representation": "obfuscated",
+    "loaded_attempt_rows": 20,
+    "compiled_candidates": 1,
+    "rejected_candidates": 19,
+    "selected_count": 1,
+    "selection_mode": "uniform_greedy",
+    "max_rounds": 8,
+    "max_weak_error": 0.499,
+    "min_alpha": 1e-06,
+    "min_val_improvement": 0.0,
+    "allow_inverted_candidates": true,
+    "final_train_acc": 0.94921875,
+    "final_val_acc": 0.953125,
+    "final_test_acc": 0.923,
+    "stopped_reason": "no_candidate"
+  },
+  "selected": [
+    {
+      "step": 1,
+      "row_index": 0,
+      "attempt": 1,
+      "round": 1,
+      "retry": 1,
+      "direction": 1,
+      "alpha": 1.0,
+      "weighted_error": 0.05078125,
+      "train_acc": 0.94921875,
+      "val_acc": 0.953125,
+      "test_acc": 0.923,
+      "candidate_code_sha256": "27679652875b9ad1dc66730a1f670140cf1ef7f0c0ff01504017f22cd87dcdc4",
+      "candidate_code_chars": 916
+    }
+  ],
+  "trace": [
+    {
+      "step": 1,
+      "considered": 2,
+      "valid": 2,
+      "current_best_val_acc": 0.0,
+      "best_row_index": 0,
+      "best_attempt": 1,
+      "best_round": 1,
+      "best_retry": 1,
+      "best_direction": 1,
+      "best_alpha": 1.0,
+      "best_weighted_error": 0.05078125,
+      "best_train_acc": 0.94921875,
+      "best_val_acc": 0.953125,
+      "best_test_acc": 0.923,
+      "best_candidate_code_sha256": "27679652875b9ad1dc66730a1f670140cf1ef7f0c0ff01504017f22cd87dcdc4",
+      "selected": true
+    },
+    {
+      "step": 2,
+      "considered": 0,
+      "valid": 0,
+      "current_best_val_acc": 0.953125,
+      "stopped_reason": "no_candidate"
+    }
+  ],
+  "config": {
+    "attempts_jsonl": "program_synthesis\\boosted\\runs\\htru2_obfuscated_candidate_library_t4_b256_r10_s1_timeout180\\protected_gpt_5_2_medium\\attempts.jsonl",
+    "output_dir": "program_synthesis\\boosted\\runs\\htru2_obfuscated_candidate_library_t4_b256_r10_s1_timeout180\\posthoc_uniform_greedy_val",
+    "function": "fn_p",
+    "length": 8,
+    "train_size": 256,
+    "val_size": 256,
+    "test_size": 2000,
+    "seed": 42,
+    "dataset_dir": "program_synthesis\\boosted\\datasets",
+    "tabular_representation": "obfuscated",
+    "cdc_representation": null,
+    "max_rounds": 8,
+    "selection_mode": "uniform_greedy",
+    "max_weak_error": 0.499,
+    "min_alpha": 1e-06,
+    "min_val_improvement": 0.0,
+    "allow_inverted_candidates": true,
+    "no_dedupe": false,
+    "log_level": "INFO"
+  }
+}

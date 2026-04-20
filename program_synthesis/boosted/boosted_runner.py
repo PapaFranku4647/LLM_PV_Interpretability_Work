@@ -99,7 +99,22 @@ HTRU2_HYBRID_CONTEXT = textwrap.dedent(
     Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
     Inputs are dictionaries with named pulse-profile and dispersion-measure features. Each numeric feature has a qualitative bin field ending in _bin and a numeric z-score field ending in _z.
     Pulse profile fields include profile_mean, profile_stdev, profile_skewness, and profile_kurtosis. Dispersion-measure signal-to-noise fields include dm_snr_mean, dm_snr_stdev, dm_snr_skewness, and dm_snr_kurtosis.
+    Pulsars often have lower profile_mean/profile_stdev, higher profile_skewness/profile_kurtosis, higher dm_snr_mean/dm_snr_stdev, and lower dm_snr_skewness/dm_snr_kurtosis than non-pulsars.
     Prefer rules that threshold z-scores while using bins for readable guards, e.g. float(x.get("profile_skewness_z", 0)) > 1.0 or x.get("dm_snr_kurtosis_bin") in ("high", "very high").
+    """
+).strip()
+
+
+HTRU2_NAMED_NUMERIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named real-valued numeric features, not bins. Convert values with float(...) before thresholding.
+    Pulse profile fields: profile_mean, profile_stdev, profile_skewness, profile_kurtosis.
+    Dispersion-measure signal-to-noise fields: dm_snr_mean, dm_snr_stdev, dm_snr_skewness, dm_snr_kurtosis.
+    Pulsars often have lower profile_mean/profile_stdev, higher profile_skewness/profile_kurtosis, higher dm_snr_mean/dm_snr_stdev, and lower dm_snr_skewness/dm_snr_kurtosis than non-pulsars.
+    Useful HTRU2 threshold ranges are often around: profile_skewness > 0.7 to 1.4, profile_kurtosis > 1 to 4, profile_mean < 85 to 100, dm_snr_mean > 8 to 12, dm_snr_stdev > 15, dm_snr_skewness < 4 to 6, and dm_snr_kurtosis < 20 to 80.
+    A strong rule should usually combine several of these conditions instead of relying on only one feature.
+    Prefer concise numeric threshold rules and interactions, e.g. float(x.get("profile_skewness", 0)) > 1.5 and float(x.get("profile_mean", 999)) < 90.
     """
 ).strip()
 
@@ -138,6 +153,10 @@ def get_dataset_context(
             return HTRU2_HYBRID_CONTEXT
         if target_name == "chess":
             return CHESS_HYBRID_CONTEXT
+        return None
+    if tabular_representation == "named_numeric":
+        if target_name == "htru2":
+            return HTRU2_NAMED_NUMERIC_CONTEXT
         return None
     return None
 
@@ -2633,9 +2652,9 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for summaries and saved ensembles.")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic", "hybrid"],
+        choices=["obfuscated", "semantic", "hybrid", "named_numeric"],
         default=os.getenv("TABULAR_REPRESENTATION", "obfuscated"),
-        help="Input representation for non-CDC tabular datasets. semantic uses named fields; hybrid keeps names plus z-scores/code tokens.",
+        help="Input representation for non-CDC tabular datasets. semantic uses named fields; hybrid keeps names plus z-scores/code tokens; named_numeric preserves HTRU2 raw numeric values with semantic names.",
     )
     p.add_argument(
         "--cdc-representation",

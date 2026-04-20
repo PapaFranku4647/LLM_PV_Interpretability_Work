@@ -101,6 +101,7 @@ nano, all below the existing 5.2 matched CDC semantic row at 0.7173.
 - If you later set `--val-size > 0`, the runner will log validation metrics as well.
 - `--tabular-representation semantic` enables named features and readable bins/categories for mushroom, HTRU2, chess, and CDC.
 - `--tabular-representation hybrid` keeps named fields while adding numeric z-scores and category code tokens for non-CDC tabular datasets. CDC defaults to semantic when this flag is used.
+- `--tabular-representation named_numeric` is HTRU2-only. It keeps semantic HTRU2 feature names while preserving compact raw numeric values for threshold rules.
 - `--cdc-representation semantic` remains available as a CDC-specific override.
 - `--sampling-strategy` supports `weighted_random`, `weighted_without_replacement`, `feature_diverse`, `label_balanced_diverse`, and `stratified_diverse`. Diverse strategies use fixed-size hashed feature vectors internally, so they work across tabular tasks with arbitrary feature counts and categorical cardinalities.
 - `--candidate-selection best_ensemble_val` evaluates all retries in a round and selects by the candidate's full-train/validation ensemble behavior instead of accepting the first valid weak learner.
@@ -309,3 +310,19 @@ summarized in `program_synthesis/CODEBOOST_POSTHOC_SELECTOR_B256.md`.
 `uniform_greedy` selected 6 candidates and reached train/val/test
 0.7068/0.7045/0.7062, improving over the online library ensemble but still not
 beating the best CDC semantic `T=1` run.
+
+## HTRU2 Second-Dataset Push
+
+The latest HTRU2 push is summarized in
+`program_synthesis/CODEBOOST_HTRU2_SECOND_DATASET_PUSH.md`.
+
+Runs tried named raw numeric features, calibrated threshold hints, 5.4 full/nano,
+512-example prompts, and post-hoc selection over saved candidates. None beat the
+matched HTRU2 baseline at 0.9340. The best HTRU2 CodeBoost result is still the
+prior obfuscated 5.2 best trial at 0.9300; the best new comparable run from this
+push was the partial obfuscated 5.2 candidate library at 0.9230.
+
+Do not spend more API budget on model-only HTRU2 reruns without a method change.
+The next viable HTRU2 direction is broader candidate-library generation with
+local ensemble selection, or an explicitly new threshold-search/distillation
+component.

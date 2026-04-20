@@ -14,8 +14,9 @@ that file updated when adding new result docs or run families.
 - Strongest current method: semantic CDC rows with named features and qualitative
   bins, one synthesized program (`T=1`), batch size 256, full-train weak-error
   gate, and best-valid fallback.
-- Current non-CDC method under test: hybrid rows with named fields, qualitative
-  bins, z-score numeric features, category code tokens, and missingness markers.
+- Current non-CDC status: HTRU2 remains the only plausible second dataset, but
+  the latest named-numeric, calibrated-threshold, 5.4, 512-example, and post-hoc
+  selector pushes still did not beat the 0.9340 matched baseline.
 - Best robust saved aggregate:
   `program_synthesis/boosted/runs/semantic_cdc_t1_quality_gate_e03025_fallback_s30`
   - 30 seeds
@@ -39,6 +40,16 @@ that file updated when adding new result docs or run families.
   - conclusion: no 5.4-family direct row improved over the existing 5.2 matched
     row at 0.7173. Nano was the strongest 5.4-family direct row and is the best
     candidate for cheap proposer sweeps.
+- HTRU2 second-dataset push:
+  `program_synthesis/CODEBOOST_HTRU2_SECOND_DATASET_PUSH.md`
+  - added `--tabular-representation named_numeric` for HTRU2 semantic feature
+    names with compact raw numeric values.
+  - best new comparable result: partial obfuscated 5.2 library at 0.9230 test.
+  - best HTRU2 CodeBoost result remains the prior obfuscated best trial at
+    0.9300, below the 0.9340 matched baseline.
+  - local gradient-boosting sanity checks can reach about 0.9360 on the same
+    split, so the gap is candidate generation/selection rather than the dataset
+    being impossible from 256 examples.
 
 ## Important Ignored Artifacts
 

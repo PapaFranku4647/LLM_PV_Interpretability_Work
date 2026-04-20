@@ -1351,8 +1351,8 @@ def parse_args() -> Config:
     p.add_argument("--dataset-dir", help="Dataset split/cache directory")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic", "hybrid"],
-        help="Use obfuscated, semantic/named, or hybrid named plus numeric tabular dataset rows.",
+        choices=["obfuscated", "semantic", "hybrid", "named_numeric"],
+        help="Use obfuscated, semantic/named, hybrid named plus numeric, or HTRU2 named_numeric tabular rows.",
     )
     p.add_argument("--out-jsonl", help="Output JSONL path")
     p.add_argument("--out-csv", help="Output CSV path")

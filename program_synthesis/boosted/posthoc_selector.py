@@ -816,7 +816,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--dataset-dir", default=boosted_runner.DEFAULT_DATASET_DIR)
     parser.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic", "hybrid"],
+        choices=["obfuscated", "semantic", "hybrid", "named_numeric"],
         default="semantic",
     )
     parser.add_argument("--cdc-representation", choices=["obfuscated", "semantic"], default=None)
