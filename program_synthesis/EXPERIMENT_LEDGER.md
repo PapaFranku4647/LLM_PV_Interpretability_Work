@@ -1,6 +1,6 @@
 # CodeBoost Experiment Ledger
 
-Last updated: 2026-04-18.
+Last updated: 2026-04-20.
 
 This is the consolidated experiment map. It does not replace the detailed notes
 and raw artifacts; it records where they live, what each method tried to test,
@@ -13,9 +13,10 @@ and what currently looks strongest.
 - Best saved matched CodeBoost result: CDC semantic `T=1`, batch 256, 5 trials,
   mean test accuracy 0.7173, best trial 0.7300, versus the best matched CDC
   baseline at 0.7225.
-- New model comparison: `gpt-5.4` full via Azure Responses with medium reasoning
-  reached 0.6995 mean test accuracy on the same CDC semantic `T=1` setup, below
-  the existing 5.2 row and below the best CDC baseline.
+- New model comparison: `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.4-nano` via
+  Azure Responses with medium reasoning did not beat the existing 5.2 CDC
+  semantic row. Nano was the best 5.4-family direct row at 0.7067 mean test
+  accuracy; full 5.4 reached 0.6995; mini reached 0.6865.
 - Best robust CDC aggregate before matched baselines: semantic CDC `T=1`,
   quality gate `max_weak_error=0.3025`, best-valid fallback, 30 seeds, mean test
   accuracy 0.70321 with std 0.00523.
@@ -118,11 +119,15 @@ CDC model comparison at the same semantic `T=1`, batch 256 setting:
 | Method | Model | API | Reasoning | Mean test | Std | Min | Max | Best baseline | Gap | Attempts | Cost |
 | --- | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |
 | CodeBoost | `protected.gpt-5.2` | chat completions | medium | 0.7173 | 0.0102 | 0.7020 | 0.7300 | 0.7225 | -0.0052 | 6 | $0.4465 |
+| CodeBoost | `gpt-5.4-nano` | Responses | medium | 0.7067 | 0.0041 | 0.7000 | 0.7125 | 0.7225 | -0.0158 | 5 | unknown |
 | CodeBoost | `gpt-5.4` | Responses | medium | 0.6995 | 0.0108 | 0.6810 | 0.7150 | 0.7225 | -0.0230 | 5 | unknown |
+| CodeBoost | `gpt-5.4-mini` | Responses | medium | 0.6865 | 0.0213 | 0.6530 | 0.7080 | 0.7225 | -0.0360 | 10 | unknown |
 
-The 5.4 result is saved in
-`program_synthesis/CODEBOOST_MODEL_COMPARISON.md`. It did not improve the
-paper story; the strongest current CDC claim is still the 5.2 semantic row.
+The 5.4-family results are saved in
+`program_synthesis/CODEBOOST_MODEL_COMPARISON.md`. They did not improve the
+direct CDC paper story; the strongest current CDC claim is still the 5.2
+semantic row. Nano is still useful because it is stable and cheap enough to try
+as a large candidate-library proposer.
 
 Non-CDC semantic one-trial pilot:
 

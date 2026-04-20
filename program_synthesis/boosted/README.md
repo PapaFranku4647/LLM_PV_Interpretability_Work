@@ -87,9 +87,13 @@ python program_synthesis/boosted/boosted_runner.py \
   --output-dir program_synthesis/boosted/runs/model_compare_cdc_semantic_t1_b256_s5/gpt_5_4_medium_final
 ```
 
-This 5-trial `gpt-5.4` comparison has been run. Results are summarized in
-`program_synthesis/CODEBOOST_MODEL_COMPARISON.md`; mean test accuracy was
-0.6995, below the existing 5.2 matched CDC semantic row at 0.7173.
+Swap `--model gpt-5.4` and the output directory for `gpt-5.4-mini` or
+`gpt-5.4-nano` to run the smaller model-family rows.
+
+This 5-trial comparison has been run for full, mini, and nano 5.4 deployments.
+Results are summarized in `program_synthesis/CODEBOOST_MODEL_COMPARISON.md`.
+Mean test accuracies were 0.6995 for full 5.4, 0.6865 for mini, and 0.7067 for
+nano, all below the existing 5.2 matched CDC semantic row at 0.7173.
 
 ## Notes
 

@@ -1,6 +1,6 @@
 # CodeBoost Experiment Status
 
-Last updated: 2026-04-18.
+Last updated: 2026-04-20.
 
 This note preserves the current experimental state before repository cleanup. Large run
 artifacts are intentionally kept on disk and ignored by git; this file records the
@@ -29,16 +29,16 @@ that file updated when adding new result docs or run families.
   - min/max test accuracy: 0.69268 / 0.71325
   - mean cost: about $0.1445 per run
 - New model comparison:
-  `program_synthesis/boosted/runs/model_compare_cdc_semantic_t1_b256_s5/gpt_5_4_medium_final`
-  - `gpt-5.4` via Azure Responses API
+  `program_synthesis/boosted/runs/model_compare_cdc_semantic_t1_b256_s5/`
+  - `gpt-5.4`, `gpt-5.4-mini`, and `gpt-5.4-nano` via Azure Responses API
   - `reasoning_effort=medium`
   - same CDC semantic `T=1`, batch 256, 5-trial setup as the matched 5.2 row
-  - mean test accuracy: 0.6995
-  - test standard deviation: 0.0108
-  - min/max test accuracy: 0.6810 / 0.7150
-  - total API attempts: 5
-  - conclusion: full 5.4 did not improve over the existing 5.2 matched row
-    at 0.7173.
+  - full 5.4 mean test accuracy: 0.6995
+  - 5.4-mini mean test accuracy: 0.6865
+  - 5.4-nano mean test accuracy: 0.7067
+  - conclusion: no 5.4-family direct row improved over the existing 5.2 matched
+    row at 0.7173. Nano was the strongest 5.4-family direct row and is the best
+    candidate for cheap proposer sweeps.
 
 ## Important Ignored Artifacts
 
@@ -123,11 +123,15 @@ The CDC model comparison is saved in
 
 - `protected.gpt-5.2` chat-completions row: mean test 0.7173.
 - `gpt-5.4` Azure Responses row: mean test 0.6995.
+- `gpt-5.4-mini` Azure Responses row: mean test 0.6865.
+- `gpt-5.4-nano` Azure Responses row: mean test 0.7067.
 - Best CDC baseline: logistic regression, 0.7225.
 
 Conclusion: this does not change the current paper story. The best CDC
 CodeBoost row is still the semantic 5.2 matched run, and larger model quality
-alone is not enough to solve the large-train-set boosting issue.
+alone is not enough to solve the large-train-set boosting issue. Nano is the
+only 5.4-family result worth using immediately, and only as a cheaper candidate
+generator rather than as a direct accuracy upgrade.
 
 Status update: semantic/named tabular representations are now wired for mushroom,
 HTRU2, and chess through `--tabular-representation semantic`. This creates:
