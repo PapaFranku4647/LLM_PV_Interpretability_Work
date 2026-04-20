@@ -73,3 +73,9 @@ change is to generate a larger, diverse candidate library with cheaper proposers
 and select ensembles locally, or to add a threshold-search/distillation module.
 The latter would be a new method component and should be labeled separately from
 plain CodeBoost.
+
+Follow-up: the threshold-search/distillation module was implemented after this
+note. It reached 0.9375 test accuracy on the matched HTRU2 split with
+stability-regularized validation selection. See
+`program_synthesis/CODEBOOST_THRESHOLD_DISTILLER_HTRU2.md`. This is a positive
+HTRU2 result for `CodeBoost + threshold distillation`, not for plain CodeBoost.

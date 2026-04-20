@@ -8,7 +8,11 @@ import random
 import sys
 import tempfile
 import unittest
+from typing import Any, Dict
 from unittest import mock
+
+import numpy as np
+from sklearn.ensemble import GradientBoostingClassifier
 
 
 PROGRAM_SYNTHESIS_DIR = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -20,6 +24,7 @@ if PROGRAM_SYNTHESIS_DIR not in sys.path:
 
 from program_synthesis import runner as base_runner  # noqa: E402
 from program_synthesis.boosted import boosted_runner  # noqa: E402
+from program_synthesis.boosted import threshold_distiller  # noqa: E402
 from src.data_handler import (  # noqa: E402
     CDCDiabetesDataGenerator,
     ChessDataGenerator,
@@ -534,6 +539,50 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(sample["dm_snr_kurtosis"], "7.125")
         self.assertNotIn("x0", sample)
         self.assertNotIn("profile_mean_bin", sample)
+
+    def test_threshold_distiller_infers_htru2_named_numeric_features(self) -> None:
+        example = boosted_runner.Example(
+            line="profile_mean:1.0,profile_stdev:2.0 -> 1",
+            x={feature: "1.0" for feature in threshold_distiller.HTRU2_FEATURES},
+            y01=1,
+            ypm=1,
+        )
+
+        self.assertEqual(
+            threshold_distiller.infer_numeric_features([example]),
+            threshold_distiller.HTRU2_FEATURES,
+        )
+
+    def test_threshold_distiller_export_matches_gradient_boosting_model(self) -> None:
+        features = ["a", "b"]
+        X = np.array(
+            [
+                [0.0, 0.0],
+                [0.0, 1.0],
+                [1.0, 0.0],
+                [1.0, 1.0],
+                [2.0, 0.0],
+                [2.0, 1.0],
+            ]
+        )
+        y = np.array([0, 0, 1, 1, 1, 1])
+        model = GradientBoostingClassifier(
+            n_estimators=3,
+            learning_rate=0.2,
+            max_depth=1,
+            min_samples_leaf=1,
+            random_state=0,
+        )
+        model.fit(X, y)
+
+        namespace: Dict[str, Any] = {}
+        exec(threshold_distiller.build_ensemble_source(model, features=features), namespace)
+        exported_predict = namespace["predict"]
+
+        rows = [{"a": str(row[0]), "b": str(row[1])} for row in X]
+        exported_preds = np.array([exported_predict(row) for row in rows])
+
+        np.testing.assert_array_equal(exported_preds, model.predict(X))
 
     def test_semantic_chess_generator_uses_uci_names_and_readable_values(self) -> None:
         raw = {name: "t" for name in ChessDataGenerator.RAW_FEATURE_NAMES}

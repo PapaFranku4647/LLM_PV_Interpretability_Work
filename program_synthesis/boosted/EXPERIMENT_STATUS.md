@@ -50,6 +50,13 @@ that file updated when adding new result docs or run families.
   - local gradient-boosting sanity checks can reach about 0.9360 on the same
     split, so the gap is candidate generation/selection rather than the dataset
     being impossible from 256 examples.
+- HTRU2 threshold distillation:
+  `program_synthesis/CODEBOOST_THRESHOLD_DISTILLER_HTRU2.md`
+  - added `program_synthesis/boosted/threshold_distiller.py`.
+  - stability-regularized validation selection reached train/val/test
+    0.9453/0.9648/0.9375 on HTRU2 named numeric rows.
+  - this beats the saved 0.9340 HTRU2 matched baseline, but it is a new local
+    distillation layer and should not be merged into the plain-CodeBoost claim.
 
 ## Important Ignored Artifacts
 

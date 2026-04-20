@@ -29,6 +29,10 @@ and what currently looks strongest.
   post-hoc selection. None beat the 0.9340 baseline; best new comparable row was
   the partial obfuscated 5.2 library at 0.9230. The prior 0.9300 HTRU2 best
   trial remains the strongest CodeBoost HTRU2 result.
+- New HTRU2 method component: threshold distillation over named numeric HTRU2
+  features reached 0.9375 test accuracy with stability-regularized validation
+  selection, beating the saved 0.9340 matched baseline. This is not plain
+  CodeBoost; label it as `CodeBoost + threshold distillation`.
 - Mushroom and chess improved with semantic rows, but they remain far below
   classical baselines. Do not spend full 5-trial API budgets on them unless a
   pilot closes the gap.
@@ -44,6 +48,7 @@ and what currently looks strongest.
 - CDC model comparison: `program_synthesis/CODEBOOST_MODEL_COMPARISON.md`
 - Non-CDC semantic pilot: `program_synthesis/CODEBOOST_SEMANTIC_PILOT.md`
 - HTRU2 second-dataset push: `program_synthesis/CODEBOOST_HTRU2_SECOND_DATASET_PUSH.md`
+- HTRU2 threshold distiller: `program_synthesis/CODEBOOST_THRESHOLD_DISTILLER_HTRU2.md`
 - Hybrid non-CDC pilot: `program_synthesis/CODEBOOST_HYBRID_PILOT.md`
 - CDC stratified diverse sampler pilot:
   `program_synthesis/CODEBOOST_STRATIFIED_DIVERSE_PILOT.md`
@@ -133,6 +138,14 @@ HTRU2 second-dataset push:
 | 5.4 full named numeric | named numeric | 3 retries, best validation candidate | 0.9175 | Full 5.4 did not improve HTRU2. |
 | 5.4 nano named numeric | named numeric | 10 retries attempted | 0.8945 | Nano was not useful here. |
 | Calibrated named numeric | named numeric + threshold hints | 5.2, 3 retries | 0.9025 | Threshold hints did not fix it. |
+
+HTRU2 threshold distiller:
+
+| Method | Selection | Train | Val | Test | Takeaway |
+| --- | --- | ---: | ---: | ---: | --- |
+| Plain validation selector | highest validation accuracy | 0.9766 | 0.9688 | 0.9330 | Overfit; does not beat the 0.9340 baseline. |
+| Threshold distiller | stability-regularized validation | 0.9453 | 0.9648 | 0.9375 | First saved HTRU2 positive result, but it is a new local distillation component. |
+| Threshold distiller refit | selected params refit on train+val | 0.9590 train+val | n/a | 0.9360 | Different protocol; keep separate from matched train-only selection. |
 
 CDC model comparison at the same semantic `T=1`, batch 256 setting:
 

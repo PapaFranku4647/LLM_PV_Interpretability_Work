@@ -326,3 +326,15 @@ Do not spend more API budget on model-only HTRU2 reruns without a method change.
 The next viable HTRU2 direction is broader candidate-library generation with
 local ensemble selection, or an explicitly new threshold-search/distillation
 component.
+
+## Threshold Distiller
+
+`threshold_distiller.py` fits local shallow numeric threshold ensembles over
+named tabular features and exports executable `ensemble.py` files. It is meant
+as a method component after semantic/LLM feature discovery, not as plain
+CodeBoost.
+
+The first HTRU2 named-numeric run reached train/val/test
+0.9453/0.9648/0.9375 with stability-regularized validation selection, beating
+the saved 0.9340 matched HTRU2 baseline. Results are summarized in
+`program_synthesis/CODEBOOST_THRESHOLD_DISTILLER_HTRU2.md`.
