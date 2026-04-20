@@ -116,6 +116,12 @@ The 5-trial matched follow-up is saved in
   best baseline 0.7225.
 - HTRU2 obfuscated: mean test 0.9032, std 0.0204, best trial 0.9300, best
   baseline 0.9340.
+- HTRU2 semantic follow-up: mean test 0.9001, std 0.0089, best trial 0.9120,
+  best baseline 0.9340.
+
+Conclusion: HTRU2 remains the best non-CDC secondary dataset, but the semantic
+bin-only representation did not improve it. The likely issue is that HTRU2's
+numeric threshold detail matters more than qualitative bin labels.
 
 The CDC model comparison is saved in
 `program_synthesis/CODEBOOST_MODEL_COMPARISON.md`, with aggregate CSV at

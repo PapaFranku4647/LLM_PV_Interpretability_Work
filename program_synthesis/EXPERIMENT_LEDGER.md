@@ -21,8 +21,9 @@ and what currently looks strongest.
   quality gate `max_weak_error=0.3025`, best-valid fallback, 30 seeds, mean test
   accuracy 0.70321 with std 0.00523.
 - HTRU2 is the only plausible non-CDC secondary dataset so far. It reached
-  0.9032 mean test accuracy with obfuscated numeric rows and 0.8950 in the
-  one-trial semantic pilot, versus the best matched baseline at 0.9340.
+  0.9032 mean test accuracy with obfuscated numeric rows and 0.9001 in the
+  5-trial semantic follow-up, versus the best matched baseline at 0.9340.
+  Semantic bins did not improve HTRU2, likely because threshold detail matters.
 - Mushroom and chess improved with semantic rows, but they remain far below
   classical baselines. Do not spend full 5-trial API budgets on them unless a
   pilot closes the gap.
@@ -113,6 +114,7 @@ Matched 5-trial follow-up:
 | --- | --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
 | `fn_o` | CDC diabetes | semantic | 0.7173 | 0.0102 | 0.7020 | 0.7300 | 0.7225 | -0.0052 | 6 | $0.4465 |
 | `fn_p` | HTRU2 | obfuscated | 0.9032 | 0.0204 | 0.8795 | 0.9300 | 0.9340 | -0.0308 | 5 | $0.7939 |
+| `fn_p` | HTRU2 | semantic | 0.9001 | 0.0089 | 0.8875 | 0.9120 | 0.9340 | -0.0339 | 5 | $0.3541 |
 
 CDC model comparison at the same semantic `T=1`, batch 256 setting:
 
@@ -136,6 +138,9 @@ Non-CDC semantic one-trial pilot:
 | `fn_n` | mushroom | 0.6380 | 0.5755 | 0.8528 | -0.2148 | 2 | $0.1665 |
 | `fn_p` | HTRU2 | 0.8950 | 0.8830 | 0.9340 | -0.0390 | 1 | $0.0522 |
 | `fn_q` | chess | 0.6310 | 0.5775 | 0.9615 | -0.3305 | 8 | $0.7695 |
+
+HTRU2 semantic was later expanded to 5 trials and reached 0.9001 mean test
+accuracy, still below the obfuscated HTRU2 5-trial mean of 0.9032.
 
 Hybrid one-trial pilot:
 
@@ -195,8 +200,9 @@ These are generated from the `summary.csv` files under
 - Repair prompts sometimes improve the best individual run, but they cost a lot
   and have not improved the mean enough to justify broad use.
 - Semantic context matters more than round count on the current pipeline.
-- For HTRU2, pure bins may throw away useful thresholds, but the first hybrid
-  `_z` pilot was worse than semantic and obfuscated one-trial pilots.
+- For HTRU2, pure bins throw away useful thresholds. The 5-trial semantic
+  follow-up was slightly worse than obfuscated, and the first hybrid `_z` pilot
+  was worse than semantic and obfuscated one-trial pilots.
 - For mushroom, preserving original code tokens and missingness did not improve
   over readable semantic categories.
 - For chess, UCI abbreviations are still too opaque. A proper chess semantic

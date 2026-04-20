@@ -1,6 +1,7 @@
 # Semantic CodeBoost Pilot
 
 Run completed on 2026-04-17 around 23:12 local time.
+Last updated with the HTRU2 semantic 5-trial follow-up on 2026-04-20.
 
 This pilot reruns the non-CDC one-trial matched setup after adding
 `--tabular-representation semantic`.
@@ -43,7 +44,9 @@ the model to reason well.
 
 HTRU2 semantic reached 0.8950. That is better than the one-trial obfuscated pilot
 at 0.8830, but below the 5-trial obfuscated mean of 0.9032 and below the best
-baseline at 0.9340. For HTRU2, binning may be discarding useful threshold detail.
+baseline at 0.9340. The later 5-trial semantic follow-up reached 0.9001 mean
+test accuracy with a best trial of 0.9120, still below the obfuscated 5-trial
+mean. For HTRU2, binning appears to discard useful threshold detail.
 
 The next best experiment is not a full mushroom/chess run. The better next step
 is to improve the representation further:
