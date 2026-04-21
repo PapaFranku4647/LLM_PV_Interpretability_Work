@@ -248,46 +248,72 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(cfg.candidate_selection, "best_ensemble_val")
         self.assertEqual(cfg.early_stop_val_patience, 2)
 
-    def test_semantic_generation_prompt_includes_cdc_context(self) -> None:
+    def test_schema_generation_prompt_avoids_dataset_identity(self) -> None:
         prompt = boosted_runner.build_generation_prompt(
             ["HighBP:yes,BMI:high,Age:medium -> 1"],
             seq_len=21,
             decimal=False,
             tabular=True,
-            dataset_context=boosted_runner.CDC_SEMANTIC_CONTEXT,
+            dataset_context=boosted_runner.GENERIC_SEMANTIC_SCHEMA_CONTEXT,
         )
 
-        self.assertIn("Dataset: CDC diabetes indicators", prompt)
+        self.assertNotIn("Dataset:", prompt)
+        self.assertNotIn("diabetes", prompt.lower())
+        self.assertIn("named features", prompt)
         self.assertIn("HighBP:yes,BMI:high,Age:medium -> 1", prompt)
         self.assertIn('{"code": "<python function>"}', prompt)
 
-    def test_non_cdc_semantic_contexts_are_selected_by_tabular_representation(self) -> None:
+    def test_schema_contexts_are_selected_by_tabular_representation(self) -> None:
         self.assertIn(
-            "secondary mushroom",
-            boosted_runner.get_dataset_context("mushroom", "obfuscated", "semantic"),
+            "named features",
+            boosted_runner.get_dataset_context("mushroom", "obfuscated", "semantic", "schema"),
         )
         self.assertIn(
-            "HTRU2 pulsar",
-            boosted_runner.get_dataset_context("htru2", "obfuscated", "semantic"),
+            "five qualitative bins",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "semantic", "schema"),
         )
         self.assertIn(
-            "King-Rook",
-            boosted_runner.get_dataset_context("chess", "obfuscated", "semantic"),
+            "named features",
+            boosted_runner.get_dataset_context("chess", "obfuscated", "semantic", "schema"),
         )
-        self.assertIsNone(boosted_runner.get_dataset_context("mushroom", "obfuscated", "obfuscated"))
+        self.assertIsNone(boosted_runner.get_dataset_context("mushroom", "obfuscated", "obfuscated", "schema"))
         self.assertIn(
-            "z-score",
-            boosted_runner.get_dataset_context("htru2", "obfuscated", "hybrid"),
-        )
-        self.assertIn(
-            "real-valued numeric",
-            boosted_runner.get_dataset_context("htru2", "obfuscated", "named_numeric"),
+            "_z",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "hybrid", "schema"),
         )
         self.assertIn(
-            "code_",
-            boosted_runner.get_dataset_context("mushroom", "obfuscated", "hybrid"),
+            "float(...)",
+            boosted_runner.get_dataset_context("htru2", "obfuscated", "named_numeric", "schema"),
         )
         self.assertEqual(boosted_runner.default_cdc_representation("hybrid"), "semantic")
+        self.assertIn(
+            "Dataset: CDC diabetes indicators",
+            boosted_runner.get_dataset_context("cdc_diabetes", "semantic", "semantic", "legacy_hints"),
+        )
+
+    def test_positive_affine_numeric_transform_only_changes_numeric_tabular_fields(self) -> None:
+        dataset = [
+            {"Input": np.array(["age:10,sex:1,bmi:30.5,flag:yes"]), "Output": "1"},
+            {"Input": np.array(["age:20,sex:0,bmi:28.5,flag:no"]), "Output": "0"},
+        ]
+
+        class StubGenerator:
+            representation = "named_numeric"
+            NUMERIC_INDICES = {0, 2}
+            SEMANTIC_FEATURE_NAMES = ["age", "sex", "bmi", "flag"]
+
+        transformed = base_runner.apply_tabular_numeric_transform(
+            dataset,
+            generator=StubGenerator(),
+            seed=42,
+            mode="positive_affine",
+        )
+
+        self.assertNotEqual(str(transformed[0]["Input"][0]), "age:10,sex:1,bmi:30.5,flag:yes")
+        self.assertIn("sex:1", str(transformed[0]["Input"][0]))
+        self.assertIn("flag:yes", str(transformed[0]["Input"][0]))
+        self.assertNotIn("age:10", str(transformed[0]["Input"][0]))
+        self.assertNotIn("bmi:30.5", str(transformed[0]["Input"][0]))
 
     def test_accept_best_on_failure_keeps_best_valid_retry(self) -> None:
         class StubClient:
@@ -552,6 +578,23 @@ class BoostedMathTests(unittest.TestCase):
             threshold_distiller.infer_numeric_features([example]),
             threshold_distiller.HTRU2_FEATURES,
         )
+
+    def test_threshold_distiller_one_hot_encodes_categorical_features(self) -> None:
+        examples = [
+            boosted_runner.Example(line="color:red,size:low -> 1", x={"color": "red", "size": "low"}, y01=1, ypm=1),
+            boosted_runner.Example(line="color:blue,size:high -> 0", x={"color": "blue", "size": "high"}, y01=0, ypm=-1),
+        ]
+
+        specs = threshold_distiller.infer_feature_specs(examples)
+        X, y = threshold_distiller.examples_to_matrix(examples, specs)
+
+        self.assertIn(
+            {"key": "color", "kind": "categorical", "category": "red", "name": "color == red"},
+            [spec.to_dict() for spec in specs],
+        )
+        self.assertEqual(X.shape[0], 2)
+        self.assertEqual(y.tolist(), [1, 0])
+        self.assertTrue(np.all((X == 0.0) | (X == 1.0)))
 
     def test_threshold_distiller_export_matches_gradient_boosting_model(self) -> None:
         features = ["a", "b"]
@@ -1031,7 +1074,7 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(history[-1]["status"], "whole_train_repair")
         self.assertTrue(history[-1]["accepted_as_best"])
 
-    def test_semantic_cdc_trial_uses_context_prompt_and_named_features(self) -> None:
+    def test_semantic_cdc_trial_uses_schema_prompt_and_named_features(self) -> None:
         class StubClient:
             def __init__(self) -> None:
                 self.cfg = type("Cfg", (), {"seed": 7, "model": "gpt-5"})()
@@ -1079,6 +1122,7 @@ class BoostedMathTests(unittest.TestCase):
             resample_each_retry=False,
             output_dir="unused",
             cdc_representation="semantic",
+            dataset_context_mode="schema",
         )
         log = logging.getLogger("boosted_runner_test")
         log.handlers[:] = [logging.NullHandler()]
@@ -1114,7 +1158,9 @@ class BoostedMathTests(unittest.TestCase):
         self.assertEqual(len(accepted_rounds), 1)
         self.assertTrue(attempt_rows[0]["accepted"])
         self.assertIsNotNone(client.prompt_overrides[0])
-        self.assertIn("Dataset: CDC diabetes indicators", client.prompt_overrides[0])
+        self.assertIn("named features", client.prompt_overrides[0])
+        self.assertNotIn("Dataset:", client.prompt_overrides[0])
+        self.assertNotIn("diabetes", client.prompt_overrides[0].lower())
         self.assertIn("HighBP:yes,BMI:medium,Age:high -> 1", client.prompt_overrides[0])
 
     def test_candidate_library_selection_evaluates_all_retries_before_accepting(self) -> None:

@@ -84,6 +84,39 @@ CHESS_SEMANTIC_CONTEXT = textwrap.dedent(
 ).strip()
 
 
+ADULT_INCOME_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: UCI Adult income. The target output is binary: 1 means income over 50K, 0 means income at or below 50K.
+    Inputs are dictionaries with named demographic and employment fields such as age, workclass, education, education_num, marital_status, occupation, relationship, race, sex, capital_gain, capital_loss, hours_per_week, and native_country.
+    Numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Useful risk factors often include high education_num, high capital_gain, high hours_per_week, age, marital_status, occupation, and relationship.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("education_num") in ("high", "very high")` or `x.get("capital_gain") == "very high"`.
+    """
+).strip()
+
+
+PIMA_DIABETES_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: Pima Indians diabetes. The target output is binary: 1 means tested positive for diabetes, 0 means tested negative.
+    Inputs are dictionaries with named medical fields: pregnancies, plasma_glucose, diastolic_blood_pressure, triceps_skinfold, serum_insulin, bmi, diabetes_pedigree, and age.
+    All numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Important risk factors include high plasma_glucose, high bmi, high diabetes_pedigree, higher age, and more pregnancies.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("plasma_glucose") in ("high", "very high")`.
+    """
+).strip()
+
+
+HEART_DISEASE_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: Statlog heart disease. The target output is binary: 1 means heart disease is present, 0 means absent.
+    Inputs are dictionaries with named clinical fields such as age, sex, chest_pain_type, resting_blood_pressure, serum_cholesterol, fasting_blood_sugar, resting_ecg, max_heart_rate, exercise_angina, st_depression, st_slope, major_vessels, and thalassemia.
+    Numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high; categorical fields use readable tokens.
+    Useful risk factors often include exercise_angina, high st_depression, lower max_heart_rate, chest_pain_type, major_vessels, thalassemia, and age.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("exercise_angina") == "1"` or `x.get("st_depression") in ("high", "very high")`.
+    """
+).strip()
+
+
 MUSHROOM_HYBRID_CONTEXT = textwrap.dedent(
     """
     Dataset: secondary mushroom attributes. The target output is binary: 1 means edible, 0 means poisonous.
@@ -128,24 +161,79 @@ CHESS_HYBRID_CONTEXT = textwrap.dedent(
 ).strip()
 
 
+GENERIC_SEMANTIC_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric or ordinal features, when present, are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Categorical features use short readable tokens such as yes, no, unknown, or normalized category strings.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
+GENERIC_NAMED_NUMERIC_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric features are stored as compact strings and should be converted with `float(...)` before thresholding.
+    Categorical features use short readable tokens such as yes, no, unknown, or normalized category strings.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
+GENERIC_HYBRID_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric features may appear both as qualitative bin fields ending in `_bin` and numeric standardized fields ending in `_z`.
+    Categorical features use short readable tokens and may include compact code suffixes.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
 def default_cdc_representation(tabular_representation: str) -> str:
-    return "semantic" if tabular_representation in {"semantic", "hybrid"} else "obfuscated"
+    if tabular_representation in {"semantic", "named_numeric", "anonymous_numeric", "obfuscated_bins"}:
+        return tabular_representation
+    if tabular_representation == "hybrid":
+        return "semantic"
+    return "obfuscated"
 
 
 def get_dataset_context(
     target_name: str,
     cdc_representation: str,
     tabular_representation: str = "obfuscated",
+    context_mode: str = "schema",
 ) -> Optional[str]:
+    if context_mode == "none":
+        return None
+    if context_mode == "schema":
+        if target_name == "cdc_diabetes" and cdc_representation == "semantic":
+            return GENERIC_SEMANTIC_SCHEMA_CONTEXT
+        if tabular_representation == "semantic":
+            return GENERIC_SEMANTIC_SCHEMA_CONTEXT
+        if tabular_representation == "hybrid":
+            return GENERIC_HYBRID_SCHEMA_CONTEXT
+        if tabular_representation == "named_numeric":
+            return GENERIC_NAMED_NUMERIC_SCHEMA_CONTEXT
+        return None
+    if context_mode not in {"hints", "legacy_hints"}:
+        raise ValueError(f"Unsupported dataset context mode: {context_mode!r}")
     if target_name == "cdc_diabetes" and cdc_representation == "semantic":
         return CDC_SEMANTIC_CONTEXT
     if tabular_representation == "semantic":
+        if target_name == "adult_income":
+            return ADULT_INCOME_SEMANTIC_CONTEXT
         if target_name == "mushroom":
             return MUSHROOM_SEMANTIC_CONTEXT
         if target_name == "htru2":
             return HTRU2_SEMANTIC_CONTEXT
         if target_name == "chess":
             return CHESS_SEMANTIC_CONTEXT
+        if target_name == "pima_diabetes":
+            return PIMA_DIABETES_SEMANTIC_CONTEXT
+        if target_name == "heart_disease":
+            return HEART_DISEASE_SEMANTIC_CONTEXT
     if tabular_representation == "hybrid":
         if target_name == "mushroom":
             return MUSHROOM_HYBRID_CONTEXT
@@ -304,6 +392,8 @@ class BoostConfig:
     whole_train_anchor_frac: float = 0.1
     tabular_representation: str = "obfuscated"
     cdc_representation: str = "obfuscated"
+    dataset_context_mode: str = "schema"
+    tabular_numeric_transform: str = "none"
     accept_best_on_failure: bool = False
     best_fallback_max_weak_error: float = 0.499
     sampling_strategy: str = "weighted_random"
@@ -1457,7 +1547,12 @@ async def run_boosting_trial(
     total_estimated_cost_usd = 0.0
     total_estimated_cost_pricing_known = True
     fallback_model = getattr(getattr(client, "cfg", None), "model", None)
-    dataset_context = get_dataset_context(target_name, cfg.cdc_representation, cfg.tabular_representation)
+    dataset_context = get_dataset_context(
+        target_name,
+        cfg.cdc_representation,
+        cfg.tabular_representation,
+        cfg.dataset_context_mode,
+    )
     feature_matrix = (
         build_feature_matrix(train_examples, cfg.sampler_feature_hash_dim)
         if cfg.sampling_strategy in {"feature_diverse", "label_balanced_diverse", "stratified_diverse"}
@@ -1639,6 +1734,8 @@ async def run_boosting_trial(
                 "repair_history": None,
                 "whole_train_repair_rounds_requested": cfg.whole_train_repair_rounds,
                 "candidate_selection": cfg.candidate_selection,
+                "dataset_context_mode": cfg.dataset_context_mode,
+                "tabular_numeric_transform": cfg.tabular_numeric_transform,
                 "candidate_selected": False,
                 "candidate_reject_reason": None,
                 "candidate_ensemble_train_acc": None,
@@ -2321,6 +2418,8 @@ async def run_boosting_trial(
         "strict_acceptance": cfg.strict_acceptance,
         "tabular_representation": cfg.tabular_representation,
         "cdc_representation": cfg.cdc_representation,
+        "dataset_context_mode": cfg.dataset_context_mode,
+        "tabular_numeric_transform": cfg.tabular_numeric_transform,
         "accept_best_on_failure": cfg.accept_best_on_failure,
         "best_fallback_max_weak_error": cfg.best_fallback_max_weak_error,
         "sampling_strategy": cfg.sampling_strategy,
@@ -2406,7 +2505,10 @@ def build_base_config(args: argparse.Namespace) -> base_runner.Config:
     os.environ["MUSHROOM_REPRESENTATION"] = tabular_representation
     os.environ["HTRU2_REPRESENTATION"] = tabular_representation
     os.environ["CHESS_REPRESENTATION"] = tabular_representation
+    os.environ["ADULT_INCOME_REPRESENTATION"] = tabular_representation
+    os.environ["OPENML_TABULAR_REPRESENTATION"] = tabular_representation
     os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
+    os.environ["TABULAR_NUMERIC_TRANSFORM"] = getattr(args, "tabular_numeric_transform", "none")
     os.environ["CDC_DIABETES_SEMANTIC_FALLBACK"] = (
         "1" if getattr(args, "cdc_semantic_allow_transformed_fallback", True) else "0"
     )
@@ -2415,6 +2517,11 @@ def build_base_config(args: argparse.Namespace) -> base_runner.Config:
         cfg.dataset_dir = os.path.join(args.dataset_dir, f"tabular_representation_{tabular_representation}")
     elif cdc_representation != "obfuscated":
         cfg.dataset_dir = os.path.join(args.dataset_dir, f"cdc_representation_{cdc_representation}")
+    numeric_transform_suffix = base_runner.tabular_numeric_transform_suffix(
+        getattr(args, "tabular_numeric_transform", "none")
+    )
+    if numeric_transform_suffix:
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, numeric_transform_suffix)
     cfg.model = args.model
     cfg.provider = args.provider
     cfg.api_mode = args.api_mode
@@ -2476,6 +2583,8 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
         whole_train_anchor_frac=args.whole_train_anchor_frac,
         tabular_representation=tabular_representation,
         cdc_representation=cdc_representation,
+        dataset_context_mode=getattr(args, "dataset_context_mode", "schema"),
+        tabular_numeric_transform=getattr(args, "tabular_numeric_transform", "none"),
         accept_best_on_failure=args.accept_best_on_failure,
         best_fallback_max_weak_error=args.best_fallback_max_weak_error,
         sampling_strategy=args.sampling_strategy,
@@ -2603,6 +2712,8 @@ async def main_async(args: argparse.Namespace) -> int:
                                 "whole_train_recent_fix_frac": boost_cfg.whole_train_recent_fix_frac,
                                 "whole_train_anchor_frac": boost_cfg.whole_train_anchor_frac,
                                 "cdc_representation": boost_cfg.cdc_representation,
+                                "dataset_context_mode": boost_cfg.dataset_context_mode,
+                                "tabular_numeric_transform": boost_cfg.tabular_numeric_transform,
                                 "accept_best_on_failure": boost_cfg.accept_best_on_failure,
                                 "best_fallback_max_weak_error": boost_cfg.best_fallback_max_weak_error,
                                 "dataset_dir": base_cfg.dataset_dir,
@@ -2652,15 +2763,27 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for summaries and saved ensembles.")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic", "hybrid", "named_numeric"],
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "hybrid", "named_numeric"],
         default=os.getenv("TABULAR_REPRESENTATION", "obfuscated"),
-        help="Input representation for non-CDC tabular datasets. semantic uses named fields; hybrid keeps names plus z-scores/code tokens; named_numeric preserves HTRU2 raw numeric values with semantic names.",
+        help="Input representation for non-CDC tabular datasets. semantic uses names plus bins; named_numeric uses names plus raw numeric values; anonymous_numeric uses x_i names plus raw numeric values; obfuscated_bins uses x_i names plus binned numeric values.",
     )
     p.add_argument(
         "--cdc-representation",
-        choices=["obfuscated", "semantic"],
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "named_numeric"],
         default=os.getenv("CDC_DIABETES_REPRESENTATION"),
-        help="Optional CDC-specific representation override. Defaults to semantic when --tabular-representation is semantic or hybrid.",
+        help="Optional CDC-specific representation override. Defaults to the matching tabular representation when supported.",
+    )
+    p.add_argument(
+        "--dataset-context-mode",
+        choices=["schema", "none", "legacy_hints", "hints"],
+        default=os.getenv("DATASET_CONTEXT_MODE", "schema"),
+        help="schema adds only representation-format instructions; none uses only the generic prompt and examples; legacy_hints preserves the older dataset-specific descriptions.",
+    )
+    p.add_argument(
+        "--tabular-numeric-transform",
+        choices=["none", "positive_affine"],
+        default=os.getenv("TABULAR_NUMERIC_TRANSFORM", "none"),
+        help="Optional monotone affine anonymization applied to numeric tabular fields when they are surfaced explicitly.",
     )
     p.add_argument(
         "--no-cdc-semantic-transformed-fallback",

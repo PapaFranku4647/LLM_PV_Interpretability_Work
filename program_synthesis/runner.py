@@ -35,6 +35,7 @@ import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, t
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
+import numpy as np
 
 import os
 import sys
@@ -368,6 +369,110 @@ def build_user_prompt(
     return prompt
 
 
+TABULAR_NUMERIC_TRANSFORM_MODES = {"none", "positive_affine"}
+
+
+def get_tabular_numeric_transform_mode() -> str:
+    mode = os.getenv("TABULAR_NUMERIC_TRANSFORM", "none").strip().lower()
+    if mode not in TABULAR_NUMERIC_TRANSFORM_MODES:
+        raise ValueError(
+            f"TABULAR_NUMERIC_TRANSFORM must be one of {sorted(TABULAR_NUMERIC_TRANSFORM_MODES)}, got {mode!r}."
+        )
+    return mode
+
+
+def tabular_numeric_transform_suffix(mode: str) -> str:
+    return "" if mode == "none" else f"numeric_transform_{mode}"
+
+
+def _infer_numeric_feature_keys(generator: Any) -> set[str]:
+    representation = getattr(generator, "representation", "obfuscated")
+    numeric_indices = sorted(getattr(generator, "NUMERIC_INDICES", set()))
+    semantic_feature_names = list(getattr(generator, "SEMANTIC_FEATURE_NAMES", []))
+
+    if representation in {"semantic", "obfuscated_bins"}:
+        return set()
+    if representation == "hybrid":
+        return {
+            f"{semantic_feature_names[idx]}_z"
+            for idx in numeric_indices
+            if idx < len(semantic_feature_names)
+        }
+    if representation == "named_numeric":
+        return {
+            semantic_feature_names[idx]
+            for idx in numeric_indices
+            if idx < len(semantic_feature_names)
+        }
+    return {f"x{idx}" for idx in numeric_indices}
+
+
+def _split_tabular_pairs(line: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for part in line.split(","):
+        item = part.strip()
+        if not item or ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def _format_numeric_token(value: float) -> str:
+    return f"{value:.6g}"
+
+
+def apply_tabular_numeric_transform(
+    dataset: list[dict[str, Any]],
+    *,
+    generator: Any,
+    seed: int,
+    mode: str,
+) -> list[dict[str, Any]]:
+    if mode == "none":
+        return dataset
+    if mode != "positive_affine":
+        raise ValueError(f"Unsupported tabular numeric transform mode: {mode!r}")
+
+    numeric_keys = _infer_numeric_feature_keys(generator)
+    if not numeric_keys:
+        return dataset
+
+    rng = np.random.default_rng(seed)
+    feature_params = {
+        key: (
+            float(rng.uniform(0.5, 2.0)),
+            float(rng.normal(0.0, 1.0)),
+        )
+        for key in sorted(numeric_keys)
+    }
+
+    transformed_dataset: list[dict[str, Any]] = []
+    for sample in dataset:
+        raw_input = sample["Input"]
+        if isinstance(raw_input, np.ndarray):
+            input_line = str(raw_input[0])
+        else:
+            input_line = str(raw_input)
+        pairs = _split_tabular_pairs(input_line)
+        rewritten: list[str] = []
+        for key, value in pairs:
+            if key not in feature_params:
+                rewritten.append(f"{key}:{value}")
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                rewritten.append(f"{key}:{value}")
+                continue
+            scale, offset = feature_params[key]
+            rewritten.append(f"{key}:{_format_numeric_token(scale * numeric_value + offset)}")
+        transformed_sample = dict(sample)
+        transformed_sample["Input"] = np.array([",".join(rewritten)])
+        transformed_dataset.append(transformed_sample)
+    return transformed_dataset
+
+
 # =========================
 # Function mapping & special sets
 # =========================
@@ -375,7 +480,23 @@ def build_user_prompt(
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check", "prime_plus_47", "collatz_steps_parity"}
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+}
 
 
 # =========================
@@ -462,6 +583,7 @@ class DatasetStore:
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
         is_tabular = target_name in TABULAR_FNS
+        numeric_transform_mode = get_tabular_numeric_transform_mode()
 
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
@@ -485,6 +607,13 @@ class DatasetStore:
         total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
         generator = get_data_generator(target_name, L, total_samples)
         all_samples_dicts = generator.generate_data()
+        if is_tabular and numeric_transform_mode != "none":
+            all_samples_dicts = apply_tabular_numeric_transform(
+                all_samples_dicts,
+                generator=generator,
+                seed=derived_seed,
+                mode=numeric_transform_mode,
+            )
 
         train_split_dicts, val_split_dicts, test_split_dicts = create_stratified_splits(
             all_samples=all_samples_dicts,
@@ -508,6 +637,7 @@ class DatasetStore:
             "fn": fn, "target_name": target_name, "length": L, 
             "decimal": is_decimal, "tabular": is_tabular,
             "derived_seed": derived_seed,
+            "tabular_numeric_transform": numeric_transform_mode,
             "sizes": {"train": self.cfg.train_size, "val": self.cfg.val_size, "test": self.cfg.test_size},
             "created_ts": int(time.time())
         })

@@ -36,14 +36,34 @@ except Exception:  # pragma: no cover - optional dependency
 
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
+import runner as synthesis_runner
 
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+}
 BOOLEAN_FNS = {"parity_all", "parity_first_half", "parity_rand_3", "parity_rand_10", 
                "automata_parity", "palindrome", "dyck2", "patternmatch1", "patternmatch2",
                "prime_decimal", "prime_decimal_tf_check", "sha256_parity", "prime_plus_47", "collatz_steps_parity",
                "graph_has_cycle", "graph_connected",
-               "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+               "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess",
+               "pima_diabetes", "heart_disease", "breast_wisconsin", "wdbc_diagnostic",
+               "mammographic_mass", "blood_transfusion", "heart_disease_comprehensive",
+               "chronic_kidney_disease", "indian_liver_patient", "cardiovascular_disease"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("baseline_runner")
@@ -319,6 +339,7 @@ class Config:
     num_trials: int = int(os.getenv("NUM_TRIALS", "10"))
     dataset_dir: str = os.getenv("DATASET_DIR", "program_synthesis/datasets")
     tabular_representation: str = os.getenv("TABULAR_REPRESENTATION", "obfuscated")
+    tabular_numeric_transform: str = os.getenv("TABULAR_NUMERIC_TRANSFORM", "none")
     out_jsonl: str = "program_synthesis/baseline_results.jsonl"
     out_csv: str = "program_synthesis/baseline_results.csv"
     models: List[str] = field(default_factory=lambda: [
@@ -373,12 +394,20 @@ class DatasetStore:
 
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str]]:
         target_name = FUNCTION_NAME_MAPPING[fn]
-        cdc_representation = "semantic" if self.cfg.tabular_representation in {"semantic", "hybrid"} else "obfuscated"
+        if self.cfg.tabular_representation in {"semantic", "named_numeric", "anonymous_numeric", "obfuscated_bins"}:
+            cdc_representation = self.cfg.tabular_representation
+        elif self.cfg.tabular_representation == "hybrid":
+            cdc_representation = "semantic"
+        else:
+            cdc_representation = "obfuscated"
         os.environ["TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
         os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
         os.environ["MUSHROOM_REPRESENTATION"] = self.cfg.tabular_representation
         os.environ["HTRU2_REPRESENTATION"] = self.cfg.tabular_representation
         os.environ["CHESS_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["ADULT_INCOME_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["OPENML_TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["TABULAR_NUMERIC_TRANSFORM"] = self.cfg.tabular_numeric_transform
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
 
@@ -389,6 +418,13 @@ class DatasetStore:
         total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
         generator = get_data_generator(target_name, L, total_samples)
         all_samples = generator.generate_data()
+        if target_name in TABULAR_FNS and self.cfg.tabular_numeric_transform != "none":
+            all_samples = synthesis_runner.apply_tabular_numeric_transform(
+                all_samples,
+                generator=generator,
+                seed=derived_seed,
+                mode=self.cfg.tabular_numeric_transform,
+            )
 
         train_split, val_split, test_split = create_stratified_splits(
             all_samples, self.cfg.train_size, self.cfg.val_size, self.cfg.test_size, device='cpu'
@@ -1009,6 +1045,7 @@ class BenchmarkRunner:
             "best_cv_score": None,
             "num_trials": self.cfg.num_trials,
             "tabular_representation": self.cfg.tabular_representation,
+            "tabular_numeric_transform": self.cfg.tabular_numeric_transform,
             "train_size": self.cfg.train_size,
             "val_size": self.cfg.val_size,
             "test_size": self.cfg.test_size,
@@ -1274,6 +1311,7 @@ class BenchmarkRunner:
                                 "best_cv_score": float(np.mean(val_accuracies)),
                                 "num_trials": self.cfg.num_trials,
                                 "tabular_representation": self.cfg.tabular_representation,
+                                "tabular_numeric_transform": self.cfg.tabular_numeric_transform,
                                 "train_size": len(y_train),
                                 "val_size": len(y_val),
                                 "test_size": len(y_test),
@@ -1323,7 +1361,7 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         return
     preferred = [
         "fn", "target_name", "length", "model", "status", "error",
-        "tabular_representation", "train_size", "val_size", "test_size", "seed",
+        "tabular_representation", "tabular_numeric_transform", "train_size", "val_size", "test_size", "seed",
         "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std",
         "best_params", "best_cv_score", "num_trials", "selection_split", "mean_fit_count",
@@ -1351,8 +1389,13 @@ def parse_args() -> Config:
     p.add_argument("--dataset-dir", help="Dataset split/cache directory")
     p.add_argument(
         "--tabular-representation",
-        choices=["obfuscated", "semantic", "hybrid", "named_numeric"],
-        help="Use obfuscated, semantic/named, hybrid named plus numeric, or HTRU2 named_numeric tabular rows.",
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "hybrid", "named_numeric"],
+        help="Use obfuscated legacy, anonymous_numeric, obfuscated_bins, semantic/named binned, hybrid, or named_numeric tabular rows.",
+    )
+    p.add_argument(
+        "--tabular-numeric-transform",
+        choices=["none", "positive_affine"],
+        help="Optional monotone affine anonymization applied to numeric tabular fields when they are surfaced explicitly.",
     )
     p.add_argument("--out-jsonl", help="Output JSONL path")
     p.add_argument("--out-csv", help="Output CSV path")
@@ -1375,8 +1418,12 @@ def parse_args() -> Config:
     if args.num_trials is not None: cfg.num_trials = args.num_trials
     if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
     if args.tabular_representation: cfg.tabular_representation = args.tabular_representation
+    if args.tabular_numeric_transform: cfg.tabular_numeric_transform = args.tabular_numeric_transform
     if cfg.tabular_representation != "obfuscated":
         cfg.dataset_dir = os.path.join(cfg.dataset_dir, f"tabular_representation_{cfg.tabular_representation}")
+    numeric_transform_suffix = synthesis_runner.tabular_numeric_transform_suffix(cfg.tabular_numeric_transform)
+    if numeric_transform_suffix:
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, numeric_transform_suffix)
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
     if args.include_ga: cfg.include_ga = True

@@ -1,0 +1,4 @@
+dataset,representation,context_mode,numeric_transform,trials_or_retries,codeboost_test_acc,codeboost_test_std,best_baseline,best_baseline_test_acc,gap,notes
+cdc_diabetes,semantic,schema,positive_affine,5_trials,0.7070,0.0125,adaboost,0.7150,-0.0080,clean rerun under schema-only prompt
+pima_diabetes,named_numeric,none,positive_affine,40_retry_single_trial,0.7302631579,,adaboost,0.7302631579,0.0000,clean no-description candidate-library tie
+htru2,obfuscated,none,already_obfuscated,5_trials,0.9032,0.0204,gradient_boosting,0.9340,-0.0308,existing obfuscated row already satisfied clean protocol
