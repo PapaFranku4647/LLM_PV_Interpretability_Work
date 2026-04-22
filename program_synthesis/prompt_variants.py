@@ -236,13 +236,17 @@ Requirements:
 - The subset should be as LARGE as possible while maintaining accuracy
 
 Note on data format:
-- Numeric features use float comparisons: x0 >= 40.0
-- Categorical features use string values like 'c0', 'c1', 'c4'.
-  Write them as: x5 == 'c2', NOT x5 == 2.
+- Numeric features use numeric comparisons.
+- Categorical features use string values like 'c0', 'c1', 'c4', or
+  semantic values like 'yes', 'no', 'very high'.
+- Use the EXACT feature names that appear in the sample/code artifact.
+  Do NOT rename semantic features to x0/x1 or invent positional aliases.
+
+[FEATURE_GUIDANCE]
 
 Output your thesis in this exact JSON format:
 {
-  "conditions": "x5 == 'c2' AND x0 >= 40.0",
+  "conditions": "feature_a == 'value' AND feature_b >= 40.0",
   "label": 1
 }
 """.strip()
@@ -288,13 +292,17 @@ Requirements:
   minor check
 
 Note on data format:
-- Numeric features use float comparisons: x0 >= 40.0
-- Categorical features use string values like 'c0', 'c1', 'c4'.
-  Write them as: x5 == 'c2', NOT x5 == 2.
+- Numeric features use numeric comparisons.
+- Categorical features use string values like 'c0', 'c1', 'c4', or
+  semantic values like 'yes', 'no', 'very high'.
+- Use the EXACT feature names that appear in the sample/code artifact.
+  Do NOT rename semantic features to x0/x1 or invent positional aliases.
+
+[FEATURE_GUIDANCE]
 
 Output your thesis in this exact JSON format:
 {
-  "conditions": "x5 == 'c2' AND x0 >= 40.0",
+  "conditions": "feature_a == 'value' AND feature_b >= 40.0",
   "label": 1
 }
 """.strip()
@@ -343,13 +351,17 @@ Requirements:
   a threshold in the code
 
 Note on data format:
-- Numeric features use float comparisons: x0 >= 40.0
-- Categorical features use string values like 'c0', 'c1', 'c4'.
-  Write them as: x5 == 'c2', NOT x5 == 2.
+- Numeric features use numeric comparisons.
+- Categorical features use string values like 'c0', 'c1', 'c4', or
+  semantic values like 'yes', 'no', 'very high'.
+- Use the EXACT feature names that appear in the sample/code artifact.
+  Do NOT rename semantic features to x0/x1 or invent positional aliases.
+
+[FEATURE_GUIDANCE]
 
 Output your thesis in this exact JSON format:
 {
-  "conditions": "x5 == 'c2' AND x0 >= 40.0",
+  "conditions": "feature_a == 'value' AND feature_b >= 40.0",
   "label": 1
 }
 """.strip()
@@ -376,40 +388,74 @@ def format_sample_for_thesis_prompt(sample: Mapping[str, Any] | str) -> str:
     return ", ".join(parts)
 
 
-def build_thesis_generation_prompt(code0: str, sample_repr: str, predicted_label: int) -> str:
+def _parse_sample_repr(sample_repr: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for raw_part in (sample_repr or "").split(","):
+        part = raw_part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            items.append((key, value))
+    return items
+
+
+def _build_feature_guidance(sample_repr: str) -> str:
+    items = _parse_sample_repr(sample_repr)
+    if not items:
+        return "- Use the exact feature names shown in the sample and code artifact."
+
+    keys = [key for key, _ in items]
+    preview = ", ".join(f"{key}={value}" for key, value in items[:6])
+    semantic_keys = any(_FEATURE_KEY_RE.fullmatch(key) is None for key in keys)
+
+    guidance = [
+        f"- Reference sample keys: {', '.join(keys[:12])}" + (" ..." if len(keys) > 12 else ""),
+        f"- Reference sample preview: {preview}",
+    ]
+    if semantic_keys:
+        guidance.extend(
+            [
+                "- Use these exact semantic feature names in your conditions, such as HighBP, BMI, Age, GenHlth.",
+                "- Do NOT rename them to x0/x1 or invent any positional aliases.",
+            ]
+        )
+    else:
+        guidance.extend(
+            [
+                "- The feature keys are positional names like x0, x1, x2; use those exact keys.",
+                "- Do NOT invent new feature names or rename existing positional keys.",
+            ]
+        )
+    return "\n".join(guidance)
+
+
+def _build_thesis_prompt(template: str, code0: str, sample_repr: str, predicted_label: int) -> str:
     code_text = (code0 or "").strip()
     sample_text = (sample_repr or "").strip()
     label_text = str(int(predicted_label))
+    feature_guidance = _build_feature_guidance(sample_text)
 
-    prompt = THESIS_GENERATION_TEMPLATE
+    prompt = template
     prompt = prompt.replace("[CODE0]", code_text)
     prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
     prompt = prompt.replace("[LABEL]", label_text)
+    prompt = prompt.replace("[FEATURE_GUIDANCE]", feature_guidance)
     return prompt
+
+
+def build_thesis_generation_prompt(code0: str, sample_repr: str, predicted_label: int) -> str:
+    return _build_thesis_prompt(THESIS_GENERATION_TEMPLATE, code0, sample_repr, predicted_label)
 
 
 def build_thesis_generation_prompt_v2(code0: str, sample_repr: str, predicted_label: int) -> str:
-    code_text = (code0 or "").strip()
-    sample_text = (sample_repr or "").strip()
-    label_text = str(int(predicted_label))
-
-    prompt = THESIS_GENERATION_TEMPLATE_V2
-    prompt = prompt.replace("[CODE0]", code_text)
-    prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
-    prompt = prompt.replace("[LABEL]", label_text)
-    return prompt
+    return _build_thesis_prompt(THESIS_GENERATION_TEMPLATE_V2, code0, sample_repr, predicted_label)
 
 
 def build_thesis_generation_prompt_v3(code0: str, sample_repr: str, predicted_label: int) -> str:
-    code_text = (code0 or "").strip()
-    sample_text = (sample_repr or "").strip()
-    label_text = str(int(predicted_label))
-
-    prompt = THESIS_GENERATION_TEMPLATE_V3
-    prompt = prompt.replace("[CODE0]", code_text)
-    prompt = prompt.replace("[SAMPLE]", f"[{sample_text}]")
-    prompt = prompt.replace("[LABEL]", label_text)
-    return prompt
+    return _build_thesis_prompt(THESIS_GENERATION_TEMPLATE_V3, code0, sample_repr, predicted_label)
 
 
 def get_prompt_variant_suffix(variant: str) -> str:

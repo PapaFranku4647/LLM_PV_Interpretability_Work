@@ -5,12 +5,21 @@ import json
 import re
 import threading
 from dataclasses import dataclass, field
-from typing import Any, Callable, Literal, Optional, Sequence
+from typing import Any, Callable, Literal, Mapping, Optional, Sequence
 
 try:
     from program_synthesis.code_normalizer import sanitize_generated_code
+    from program_synthesis.llm_client import (
+        LLMCallResult,
+        build_chat_completions_body,
+        call_llm_sync,
+        estimate_usage_cost,
+        merge_cost_estimates,
+        merge_usage,
+    )
 except ModuleNotFoundError:
     from code_normalizer import sanitize_generated_code  # type: ignore
+    from llm_client import LLMCallResult, build_chat_completions_body, call_llm_sync, estimate_usage_cost, merge_cost_estimates, merge_usage  # type: ignore
 
 
 Judgement = Literal["pass", "fail", "uncertain"]
@@ -40,13 +49,17 @@ Rules:
 - Avoid loops or comprehensions.
 - Do NOT use classes, decorators, or async features.
 - Return only bool/boolish values (`True/False` or equivalent).
-- x may be either:
-  1) dict with keys like x0, x1, ...
-  2) list/tuple where xN maps to x[N]
-- DATA FORMAT: Some features are categorical strings like 'c0', 'c1', 'c4'.
-  Compare them as strings: x.get("x5") == 'c4', NOT x.get("x5") == 4.
-  Numeric features are floats: x.get("x0") >= 40.0.
-  Check the reference sample above to determine each feature's type.
+- Assume x is a dict whose keys match the reference sample unless the thesis
+  explicitly uses positional x0/x1-style keys.
+- Use the EXACT feature names from the thesis/reference sample.
+- Do NOT rename semantic features to x0/x1 or invent positional aliases.
+- If you choose to support list/tuple input, only do so when the thesis itself
+  already uses positional xN-style keys.
+- DATA FORMAT: Some features are categorical strings like 'c0', 'c1', 'c4',
+  or semantic values like 'yes', 'no', 'very high'. Compare them as strings.
+- Numeric features use numeric comparisons.
+
+[FEATURE_GUIDANCE]
 
 Output STRICT JSON only:
 {
@@ -65,18 +78,23 @@ Thesis conditions (raw text):
 Thesis label:
 [LABEL]
 
+Reference sample format:
+[SAMPLE]
+
 Candidate Code1:
 ```python
 [CODE1]
 ```
+
+[FEATURE_GUIDANCE]
 
 Output STRICT JSON only:
 {
   "judgement": "pass|fail|uncertain",
   "reason": "short explanation",
   "testcases": [
-    {"sample": {"x0": 1, "x1": 5}, "expected": true, "note": "satisfies thesis"},
-    {"sample": {"x0": 0, "x1": 1}, "expected": false, "note": "violates thesis"}
+    {"sample": {"feature_a": "value", "feature_b": 5}, "expected": true, "note": "satisfies thesis"},
+    {"sample": {"feature_a": "other", "feature_b": 1}, "expected": false, "note": "violates thesis"}
   ]
 }
 
@@ -84,9 +102,11 @@ Testcase requirements:
 - Provide thesis-grounded cases.
 - Include both positive and negative cases.
 - Prefer at least 3 positive and 3 negative cases when possible.
-- DATA FORMAT: Categorical features use string values like "c0", "c1", "c4".
-  Testcase samples must use the exact string format: {"x5": "c4"}, NOT {"x5": 4}.
-  Numeric features use floats: {"x0": 40.0}.
+- Use the EXACT feature keys from the thesis/reference sample.
+- Do NOT rename semantic features to x0/x1 or invent positional aliases.
+- DATA FORMAT: Categorical features use string values like "c0", "c1", "c4",
+  or semantic values like "yes", "no", "very high".
+- Testcase samples must preserve those exact string values.
 """.strip()
 
 
@@ -177,6 +197,10 @@ class Code1GenerationResult:
     code1: Optional[str]
     compile_ok: bool
     compile_error: Optional[str]
+    usage: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
+    response_id: Optional[str] = None
+    response_status: Optional[str] = None
 
 
 @dataclass
@@ -191,6 +215,10 @@ class SemanticVerificationResult:
     judgement: Judgement
     reason: str
     testcases: list[TestCase] = field(default_factory=list)
+    usage: dict[str, Any] = field(default_factory=dict)
+    cost: dict[str, Any] = field(default_factory=dict)
+    response_id: Optional[str] = None
+    response_status: Optional[str] = None
 
 
 @dataclass
@@ -209,6 +237,12 @@ class Code1VerificationBundle:
     semantic_result: Optional[SemanticVerificationResult]
     testcase_result: Optional[TestcaseVerificationResult]
     error: Optional[str]
+    writer_usage: dict[str, Any] = field(default_factory=dict)
+    verifier_usage: dict[str, Any] = field(default_factory=dict)
+    usage_total: dict[str, Any] = field(default_factory=dict)
+    writer_cost: dict[str, Any] = field(default_factory=dict)
+    verifier_cost: dict[str, Any] = field(default_factory=dict)
+    cost_total: dict[str, Any] = field(default_factory=dict)
 
 
 def _obj_get(obj: Any, key: str) -> Any:
@@ -288,15 +322,20 @@ def _request_json_object(
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     api_mode: str = "responses",
-) -> tuple[Optional[dict[str, Any]], Optional[str], str]:
+    api_base_url: str = "",
+    api_key: str = "",
+    azure_endpoint: str = "",
+) -> tuple[Optional[dict[str, Any]], Optional[str], LLMCallResult]:
     if api_mode == "chat_completions":
-        body = {
-            "model": model,
-            "messages": [{"role": "user", "content": prompt}],
-            "max_tokens": max_output_tokens,
-        }
-        response = client.chat.completions.create(**body)
-        response_text = response.choices[0].message.content or ""
+        body = build_chat_completions_body(
+            model=model,
+            messages=[{"role": "user", "content": prompt}],
+            max_output_tokens=max_output_tokens,
+            reasoning_effort=reasoning_effort,
+            stream=False,
+            api_base_url=api_base_url,
+            azure_endpoint=azure_endpoint,
+        )
     else:
         body = {
             "model": model,
@@ -306,13 +345,21 @@ def _request_json_object(
             "max_output_tokens": max_output_tokens,
             "tool_choice": "none",
         }
-        response = client.responses.create(**body)
-        response_text = _extract_text_from_response(response)
-    parsed, parse_error = _parse_json_dict(response_text)
-    return parsed, parse_error, response_text
+    llm_result = call_llm_sync(
+        client=client,
+        api_mode=api_mode,
+        body=body,
+        timeout=120.0,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
+    )
+    parsed, parse_error = _parse_json_dict(llm_result.text)
+    return parsed, parse_error, llm_result
 
 
 _CATEGORICAL_VALUE_RE = re.compile(r"=c\d+")
+_POSITIONAL_KEY_RE = re.compile(r"^x\d+$")
 
 
 def _detect_categorical_features(sample_repr: str) -> list[str]:
@@ -326,6 +373,49 @@ def _detect_categorical_features(sample_repr: str) -> list[str]:
     return features
 
 
+def _parse_sample_repr(sample_repr: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for raw_part in (sample_repr or "").split(","):
+        part = raw_part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            items.append((key, value))
+    return items
+
+
+def _build_feature_guidance(sample_repr: str) -> str:
+    items = _parse_sample_repr(sample_repr)
+    if not items:
+        return "- Use the exact feature names shown in the thesis/reference sample."
+
+    keys = [key for key, _ in items]
+    preview = ", ".join(f"{key}={value}" for key, value in items[:6])
+    semantic_keys = any(_POSITIONAL_KEY_RE.fullmatch(key) is None for key in keys)
+
+    guidance = [
+        f"- Reference sample keys: {', '.join(keys[:12])}" + (" ..." if len(keys) > 12 else ""),
+        f"- Reference sample preview: {preview}",
+    ]
+    if semantic_keys:
+        guidance.extend(
+            [
+                "- Access dict values with the exact semantic keys, e.g. x.get(\"HighBP\"), x.get(\"BMI\").",
+                "- Do NOT rename those keys to x0/x1 or any other positional aliases.",
+            ]
+        )
+    else:
+        guidance.extend(
+            [
+                "- The keys are already positional xN names; use those exact keys and no others.",
+            ]
+        )
+    return "\n".join(guidance)
+
+
 def _build_code1_writer_prompt(
     thesis_conditions: str,
     thesis_label: int,
@@ -336,6 +426,7 @@ def _build_code1_writer_prompt(
     prompt = prompt.replace("[CONDITIONS]", str(thesis_conditions).strip())
     prompt = prompt.replace("[LABEL]", str(int(thesis_label)))
     prompt = prompt.replace("[SAMPLE]", str(sample_repr).strip())
+    prompt = prompt.replace("[FEATURE_GUIDANCE]", _build_feature_guidance(str(sample_repr).strip()))
     cat_features = _detect_categorical_features(str(sample_repr))
     if cat_features:
         prompt += (
@@ -352,11 +443,14 @@ def _build_code1_verifier_prompt(
     thesis_conditions: str,
     thesis_label: int,
     code1: str,
+    sample_repr: str,
 ) -> str:
     prompt = CODE1_VERIFIER_TEMPLATE
     prompt = prompt.replace("[CONDITIONS]", str(thesis_conditions).strip())
     prompt = prompt.replace("[LABEL]", str(int(thesis_label)))
+    prompt = prompt.replace("[SAMPLE]", str(sample_repr).strip())
     prompt = prompt.replace("[CODE1]", (code1 or "").strip())
+    prompt = prompt.replace("[FEATURE_GUIDANCE]", _build_feature_guidance(str(sample_repr).strip()))
     return prompt
 
 
@@ -503,6 +597,9 @@ def generate_code1_from_thesis(
     text_verbosity: str = "low",
     feedback: str = "",
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
+    azure_endpoint: str = "",
 ) -> Code1GenerationResult:
     prompt = _build_code1_writer_prompt(
         thesis_conditions=thesis_conditions,
@@ -510,7 +607,7 @@ def generate_code1_from_thesis(
         sample_repr=sample_repr,
         feedback=feedback,
     )
-    parsed, parse_error, _ = _request_json_object(
+    parsed, parse_error, llm_result = _request_json_object(
         client=client,
         model=model,
         prompt=prompt,
@@ -518,12 +615,21 @@ def generate_code1_from_thesis(
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
         api_mode=api_mode,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
     )
+    usage = llm_result.usage
+    cost = estimate_usage_cost(usage, llm_result.model or model)
     if not isinstance(parsed, dict):
         return Code1GenerationResult(
             code1=None,
             compile_ok=False,
             compile_error=f"writer_json_parse_error: {parse_error}",
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     raw_code = parsed.get("code1")
@@ -532,6 +638,10 @@ def generate_code1_from_thesis(
             code1=None,
             compile_ok=False,
             compile_error="writer_missing_code1_field",
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     code1 = sanitize_generated_code(raw_code)
@@ -540,6 +650,10 @@ def generate_code1_from_thesis(
         code1=code1,
         compile_ok=compile_error is None,
         compile_error=compile_error,
+        usage=usage,
+        cost=cost,
+        response_id=llm_result.response_id,
+        response_status=llm_result.response_status,
     )
 
 
@@ -549,18 +663,23 @@ def verify_code1_semantics(
     thesis_conditions: str,
     thesis_label: int,
     code1: str,
+    sample_repr: str,
     *,
     max_output_tokens: int = 1200,
     reasoning_effort: str = "minimal",
     text_verbosity: str = "low",
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
+    azure_endpoint: str = "",
 ) -> SemanticVerificationResult:
     prompt = _build_code1_verifier_prompt(
         thesis_conditions=thesis_conditions,
         thesis_label=thesis_label,
         code1=code1,
+        sample_repr=sample_repr,
     )
-    parsed, parse_error, _ = _request_json_object(
+    parsed, parse_error, llm_result = _request_json_object(
         client=client,
         model=verifier_model,
         prompt=prompt,
@@ -568,12 +687,21 @@ def verify_code1_semantics(
         reasoning_effort=reasoning_effort,
         text_verbosity=text_verbosity,
         api_mode=api_mode,
+        api_base_url=api_base_url,
+        api_key=api_key,
+        azure_endpoint=azure_endpoint,
     )
+    usage = llm_result.usage
+    cost = estimate_usage_cost(usage, llm_result.model or verifier_model)
     if not isinstance(parsed, dict):
         return SemanticVerificationResult(
             judgement="uncertain",
             reason=f"verifier_json_parse_error: {parse_error}",
             testcases=[],
+            usage=usage,
+            cost=cost,
+            response_id=llm_result.response_id,
+            response_status=llm_result.response_status,
         )
 
     raw_judgement = str(parsed.get("judgement", "")).strip().lower()
@@ -586,7 +714,15 @@ def verify_code1_semantics(
     testcases, testcase_errors = _normalize_testcases(parsed.get("testcases"))
     if testcase_errors:
         reason = f"{reason} | testcase_parse_errors: {', '.join(testcase_errors)}"
-    return SemanticVerificationResult(judgement=judgement, reason=reason, testcases=testcases)
+    return SemanticVerificationResult(
+        judgement=judgement,
+        reason=reason,
+        testcases=testcases,
+        usage=usage,
+        cost=cost,
+        response_id=llm_result.response_id,
+        response_status=llm_result.response_status,
+    )
 
 
 def verify_code1_with_testcases(
@@ -688,6 +824,9 @@ def build_code1_with_verification(
     text_verbosity: str = "low",
     execution_timeout_s: float = 1.0,
     api_mode: str = "responses",
+    api_base_url: str = "",
+    api_key: str = "",
+    azure_endpoint: str = "",
 ) -> Code1VerificationBundle:
     max_attempts = 2 if retry_once else 1
     feedback = ""
@@ -696,6 +835,10 @@ def build_code1_with_verification(
     last_testcase: Optional[TestcaseVerificationResult] = None
     final_code1: Optional[str] = None
     final_error: Optional[str] = None
+    writer_usages: list[dict[str, Any]] = []
+    verifier_usages: list[dict[str, Any]] = []
+    writer_costs: list[dict[str, Any]] = []
+    verifier_costs: list[dict[str, Any]] = []
 
     for attempt_idx in range(1, max_attempts + 1):
         generation = generate_code1_from_thesis(
@@ -709,8 +852,13 @@ def build_code1_with_verification(
             text_verbosity=text_verbosity,
             feedback=feedback,
             api_mode=api_mode,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
         )
         final_code1 = generation.code1
+        writer_usages.append(generation.usage)
+        writer_costs.append(generation.cost)
 
         if not generation.compile_ok or not generation.code1:
             final_error = generation.compile_error or "code1_generation_failed"
@@ -729,12 +877,18 @@ def build_code1_with_verification(
             thesis_conditions=thesis_conditions,
             thesis_label=thesis_label,
             code1=generation.code1,
+            sample_repr=sample_repr,
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             text_verbosity=text_verbosity,
             api_mode=api_mode,
+            api_base_url=api_base_url,
+            api_key=api_key,
+            azure_endpoint=azure_endpoint,
         )
         last_semantic = semantic
+        verifier_usages.append(semantic.usage)
+        verifier_costs.append(semantic.cost)
 
         testcase_result = verify_code1_with_testcases(
             code1_callable=code1_callable,
@@ -748,6 +902,12 @@ def build_code1_with_verification(
         testcase_pass = testcase_result.total > 0 and testcase_result.failed == 0 and testcase_balance_ok
 
         if semantic_pass and testcase_pass:
+            writer_usage = merge_usage(writer_usages)
+            verifier_usage = merge_usage(verifier_usages)
+            usage_total = merge_usage([writer_usage, verifier_usage])
+            writer_cost = merge_cost_estimates(writer_costs)
+            verifier_cost = merge_cost_estimates(verifier_costs)
+            cost_total = merge_cost_estimates([writer_cost, verifier_cost])
             return Code1VerificationBundle(
                 final_code1=generation.code1,
                 accepted=True,
@@ -755,6 +915,12 @@ def build_code1_with_verification(
                 semantic_result=semantic,
                 testcase_result=testcase_result,
                 error=None,
+                writer_usage=writer_usage,
+                verifier_usage=verifier_usage,
+                usage_total=usage_total,
+                writer_cost=writer_cost,
+                verifier_cost=verifier_cost,
+                cost_total=cost_total,
             )
 
         failure_reasons = []
@@ -769,6 +935,12 @@ def build_code1_with_verification(
         final_error = "; ".join(failure_reasons) or "verification_failed"
         feedback = _build_retry_feedback(final_error, semantic, testcase_result)
 
+    writer_usage = merge_usage(writer_usages)
+    verifier_usage = merge_usage(verifier_usages)
+    usage_total = merge_usage([writer_usage, verifier_usage])
+    writer_cost = merge_cost_estimates(writer_costs)
+    verifier_cost = merge_cost_estimates(verifier_costs)
+    cost_total = merge_cost_estimates([writer_cost, verifier_cost])
     return Code1VerificationBundle(
         final_code1=final_code1,
         accepted=False,
@@ -776,4 +948,10 @@ def build_code1_with_verification(
         semantic_result=last_semantic,
         testcase_result=last_testcase,
         error=final_error or "verification_failed_after_retries",
+        writer_usage=writer_usage,
+        verifier_usage=verifier_usage,
+        usage_total=usage_total,
+        writer_cost=writer_cost,
+        verifier_cost=verifier_cost,
+        cost_total=cost_total,
     )

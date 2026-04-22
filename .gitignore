@@ -29,6 +29,13 @@ program_synthesis/analysis_*.csv
 program_synthesis/analysis_*.png
 program_synthesis/analysis_*.txt
 program_synthesis/analysis_*.html
+program_synthesis/analysis/
+program_synthesis/*INTERPRETABILITY*.md
+program_synthesis/*INTERPRETABILITY*.csv
+program_synthesis/CDC_EXTERNAL_ARTIFACT_PILOT_*.md
+program_synthesis/PAPER_*_TABLE_*.md
+program_synthesis/*sample_indices*.json
+program_synthesis/*comparison_indices*.json
 
 # Local planning notes
 program_synthesis/*TODO*.md

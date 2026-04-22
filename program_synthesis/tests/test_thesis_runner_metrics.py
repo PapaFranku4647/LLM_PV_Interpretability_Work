@@ -1,7 +1,10 @@
 from __future__ import annotations
 
+import argparse
 import importlib
+import json
 import sys
+import tempfile
 import types
 import unittest
 from pathlib import Path
@@ -20,7 +23,11 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             self.args = args
             self.kwargs = kwargs
 
+    class DummyAzureOpenAI(DummyOpenAI):
+        pass
+
     openai_mod.OpenAI = DummyOpenAI
+    openai_mod.AzureOpenAI = DummyAzureOpenAI
     return {"openai": openai_mod}
 
 
@@ -216,6 +223,94 @@ class Step23MatrixMetricTests(unittest.TestCase):
         pred, mode = self.mod.predict_code0_label(fn_requires_sequence, sample)
         self.assertEqual(pred, 1)
         self.assertIn(mode, {"list", "tuple"})
+
+    def test_resolve_prompt_artifact_prefers_explicit_prompt_code(self) -> None:
+        row = {
+            "code": "def f(x):\n    return 1\n",
+            "thesis_prompt_code": "MODEL: logistic regression with coefficients ...",
+        }
+        resolved = self.mod.resolve_prompt_artifact(row, "def f(x):\n    return 1\n")
+        self.assertEqual(resolved, "MODEL: logistic regression with coefficients ...")
+
+    def test_resolve_prompt_artifact_falls_back_to_sanitized_code(self) -> None:
+        sanitized = "def f(x):\n    return 0\n"
+        resolved = self.mod.resolve_prompt_artifact({"code": sanitized}, sanitized)
+        self.assertEqual(resolved, sanitized)
+
+    def test_load_external_artifact_row_reads_manifest_and_sidecar_files(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            combo_dir = Path(tmpdir) / "fn_o_seed42"
+            combo_dir.mkdir(parents=True, exist_ok=True)
+            code_path = combo_dir / "code_exec.py"
+            artifact_path = combo_dir / "artifact.txt"
+            code_path.write_text("def f(x):\n    return 1\n", encoding="utf-8")
+            artifact_path.write_text("RAW MODEL DUMP", encoding="utf-8")
+            manifest = {
+                "code_path": "code_exec.py",
+                "artifact_text_path": "artifact.txt",
+                "length": 21,
+                "dataset_seed": 123,
+            }
+            (combo_dir / "artifact.json").write_text(json.dumps(manifest), encoding="utf-8")
+            file_name, row = self.mod.load_external_artifact_row(combo_dir)
+            self.assertEqual(file_name, "artifact.json")
+            self.assertEqual(row["code"].strip(), "def f(x):\n    return 1")
+            self.assertEqual(row["artifact_text"], "RAW MODEL DUMP")
+
+    def test_run_runner_val_selection_forwards_batching_flags(self) -> None:
+        calls = []
+
+        def fake_run(cmd, **kwargs):
+            calls.append((cmd, kwargs))
+            return types.SimpleNamespace(returncode=0, stdout="", stderr="")
+
+        orig_run = self.mod.subprocess.run
+        self.mod.subprocess.run = fake_run
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                repo_root = Path(tmpdir)
+                (repo_root / "program_synthesis").mkdir(parents=True, exist_ok=True)
+                run_dir = repo_root / "run_dir"
+                dataset_dir = repo_root / "datasets"
+                logger = self.mod.logging.getLogger("thesis_runner_forward_test")
+                logger.handlers[:] = [self.mod.logging.NullHandler()]
+                logger.propagate = False
+                args = argparse.Namespace(
+                    attempts=5,
+                    num_trials=1,
+                    train_size=200,
+                    val_size=300,
+                    test_size=400,
+                    model="gpt-5-mini",
+                    reasoning_effort="low",
+                    max_output_tokens=1600,
+                    prompt_variant="explain",
+                    dataset_dir="",
+                    api_base_url="",
+                    api_mode="responses",
+                    code0_train_mode="batched",
+                    code0_batch_size=50,
+                )
+                self.mod.run_runner_val_selection(
+                    python_exe=sys.executable,
+                    repo_root=repo_root,
+                    fn="fn_m",
+                    seed=2201,
+                    run_dir=run_dir,
+                    dataset_dir=dataset_dir,
+                    args=args,
+                    logger=logger,
+                )
+        finally:
+            self.mod.subprocess.run = orig_run
+
+        self.assertEqual(len(calls), 1)
+        cmd, kwargs = calls[0]
+        self.assertIn("--code0-train-mode", cmd)
+        self.assertIn("batched", cmd)
+        self.assertIn("--code0-batch-size", cmd)
+        self.assertIn("50", cmd)
+        self.assertEqual(kwargs["cwd"], str(repo_root))
 
 
 if __name__ == "__main__":

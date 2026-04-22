@@ -126,6 +126,7 @@ class Step23MatrixMetricTests(unittest.TestCase):
                 "faithfulness_code0": 1.0,
                 "faithfulness_gt": 0.8,
                 "faithfulness": 1.0,
+                "train_acc": 0.95,
             },
             {
                 "code1_accepted": False,
@@ -137,6 +138,7 @@ class Step23MatrixMetricTests(unittest.TestCase):
                 "faithfulness_code0": None,
                 "faithfulness_gt": None,
                 "faithfulness": None,
+                "train_acc": 0.85,
             },
         ]
         s = self.mod.summarize_group(rows)
@@ -155,6 +157,8 @@ class Step23MatrixMetricTests(unittest.TestCase):
         # Backward compat aliases
         self.assertAlmostEqual(float(s["mean_faithfulness_defined_only"]), 1.0, places=8)
         self.assertAlmostEqual(float(s["mean_faithfulness_all_missing_as_zero"]), 0.5, places=8)
+        # train_acc aggregation
+        self.assertAlmostEqual(float(s["mean_train_acc"]), 0.9, places=8)
 
     def test_compute_auto_split_basic(self) -> None:
         from live_eval_common import compute_auto_split

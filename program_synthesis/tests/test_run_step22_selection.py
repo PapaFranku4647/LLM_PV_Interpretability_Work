@@ -76,6 +76,27 @@ class RunStep22SelectionTests(unittest.TestCase):
             self.assertEqual(best_row["attempt"], 1)
             self.assertAlmostEqual(float(best_row["val_acc"]), 0.80)
 
+    def test_load_best_row_prefers_final_selected_model_when_present(self) -> None:
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            trial_path = root / "demo_trial1.jsonl"
+            rows = [
+                {"attempt": 1, "val_acc": 0.95, "test_acc": 0.20, "code": "def f(x):\n    return 0\n"},
+                {
+                    "attempt": 2,
+                    "val_acc": 0.80,
+                    "test_acc": 0.40,
+                    "code": "def f(x):\n    return 1\n",
+                    "is_final_selected_model": True,
+                },
+            ]
+            trial_path.write_text("\n".join(json.dumps(r) for r in rows) + "\n", encoding="utf-8")
+
+            _, best_row = self.step22_mod.load_best_row(root)
+            self.assertEqual(best_row["attempt"], 2)
+            self.assertTrue(best_row["is_final_selected_model"])
+            self.assertAlmostEqual(float(best_row["val_acc"]), 0.80)
+
 
 if __name__ == "__main__":
     unittest.main()

@@ -32,6 +32,7 @@
 
 from __future__ import annotations
 import os, sys, json, csv, time, argparse, asyncio, re, ast, random, tempfile, shutil, hashlib
+import httpx
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
@@ -42,12 +43,22 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
-from openai import AsyncOpenAI
-
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 from prompt_variants import get_prompt_variant_suffix
 from code_normalizer import normalize_generated_code, sanitize_generated_code
+from llm_client import (
+    build_async_client,
+    build_chat_completions_body,
+    call_llm_async,
+    estimate_usage_cost as shared_estimate_usage_cost,
+    flatten_cost_fields as shared_flatten_cost_fields,
+    infer_default_api_mode,
+    resolve_api_key_from_env,
+    resolve_api_version_from_env,
+    resolve_azure_endpoint_from_env,
+    resolve_default_model_from_env,
+)
 
 external_get_accuracy = None
 
@@ -166,10 +177,12 @@ def _env_flag(name: str, default: bool) -> bool:
 
 @dataclass
 class Config:
-    api_key: str = field(default_factory=lambda: os.getenv("TAMU_API_KEY", os.getenv("OPENAI_API_KEY", "")))
+    api_key: str = field(default_factory=resolve_api_key_from_env)
     api_base_url: str = os.getenv("API_BASE_URL", "").strip()
-    api_mode: str = os.getenv("API_MODE", "responses").strip().lower()
-    model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    azure_endpoint: str = field(default_factory=resolve_azure_endpoint_from_env)
+    api_version: str = field(default_factory=resolve_api_version_from_env)
+    api_mode: str = field(default_factory=infer_default_api_mode)
+    model: str = field(default_factory=lambda: resolve_default_model_from_env("gpt-5"))
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
@@ -177,6 +190,7 @@ class Config:
     sanitize_generated_code: bool = field(default_factory=lambda: _env_flag("SANITIZE_GENERATED_CODE", True))
     prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
+    enable_thinking: bool = os.getenv("ENABLE_THINKING", "0") == "1"
 
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
@@ -220,6 +234,7 @@ def build_user_prompt(
             f"**Problem Statement:**\n"
             f"Given tabular input data (comma-separated feature:value pairs) and their corresponding scalar binary outputs ('0' or '1'), "
             f"find a concise Python function `f(x)` that accurately approximates the underlying relationship. "
+            f"The argument `x` is a Python dict mapping feature names to values (e.g. x['x3'] gives a float, x['x0'] gives a category string like 'c1'). "
             f"The function should not be a trainable model, but a direct logical or mathematical representation of the target function."
         )
     elif decimal:
@@ -238,7 +253,7 @@ def build_user_prompt(
         )
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.'
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}. Keep the function concise (under 30 lines, no comments). Output the JSON immediately with no other text.'
     variant_suffix = get_prompt_variant_suffix(prompt_variant)
     if variant_suffix:
         prompt += "\n\n" + variant_suffix
@@ -405,6 +420,10 @@ class DatasetStore:
 def extract_code_from_output(output_text: str) -> Optional[str]:
     if not output_text:
         return None
+    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
+    output_text = re.sub(r"<think>.*?</think>", "", output_text, flags=re.DOTALL).strip()
+    if not output_text:
+        return None
     try:
         obj = json.loads(output_text)
         if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
@@ -422,14 +441,70 @@ def extract_code_from_output(output_text: str) -> Optional[str]:
     return None
 
 
+def _flatten_chat_content_text(content: Any) -> List[str]:
+    if isinstance(content, str):
+        return [content]
+    if isinstance(content, Mapping):
+        nested = content.get("text")
+        if isinstance(nested, str):
+            return [nested]
+        return _flatten_chat_content_text(content.get("content"))
+    if isinstance(content, list):
+        parts: List[str] = []
+        for item in content:
+            parts.extend(_flatten_chat_content_text(item))
+        return parts
+    text_attr = getattr(content, "text", None)
+    if isinstance(text_attr, str):
+        return [text_attr]
+    nested_attr = getattr(content, "content", None)
+    if nested_attr is not None:
+        return _flatten_chat_content_text(nested_attr)
+    return []
+
+
+def _extract_text_parts_from_chat_choice(choice: Any) -> List[str]:
+    parts: List[str] = []
+    if isinstance(choice, Mapping):
+        delta = choice.get("delta")
+        message = choice.get("message")
+        text_value = choice.get("text")
+    else:
+        delta = getattr(choice, "delta", None)
+        message = getattr(choice, "message", None)
+        text_value = getattr(choice, "text", None)
+
+    parts.extend(_flatten_chat_content_text(text_value))
+
+    if delta is not None:
+        if isinstance(delta, Mapping):
+            parts.extend(_flatten_chat_content_text(delta.get("content")))
+        else:
+            parts.extend(_flatten_chat_content_text(getattr(delta, "content", None)))
+
+    if message is not None:
+        if isinstance(message, Mapping):
+            parts.extend(_flatten_chat_content_text(message.get("content")))
+        else:
+            parts.extend(_flatten_chat_content_text(getattr(message, "content", None)))
+
+    return [p for p in parts if isinstance(p, str) and p]
+
+
 def extract_text_from_chat_completion(res: Any) -> str:
     if isinstance(res, str):
         return parse_chat_completion_sse(res).get("text", "")
 
-    choices = getattr(res, "choices", None) or []
+    choices = getattr(res, "choices", None)
+    if choices is None and isinstance(res, Mapping):
+        choices = res.get("choices")
+    choices = choices or []
     if not choices:
         return ""
     first = choices[0]
+    direct_parts = _extract_text_parts_from_chat_choice(first)
+    if direct_parts:
+        return "".join(direct_parts).strip()
     msg = getattr(first, "message", None)
     if msg is None and isinstance(first, Mapping):
         msg = first.get("message")
@@ -440,22 +515,7 @@ def extract_text_from_chat_completion(res: Any) -> str:
     if content is None and isinstance(msg, Mapping):
         content = msg.get("content")
 
-    if isinstance(content, str):
-        return content.strip()
-
-    if isinstance(content, list):
-        parts: List[str] = []
-        for part in content:
-            txt = None
-            if isinstance(part, Mapping):
-                txt = part.get("text") or part.get("content")
-            else:
-                txt = getattr(part, "text", None) or getattr(part, "content", None)
-            if isinstance(txt, str) and txt.strip():
-                parts.append(txt.strip())
-        return "\n".join(parts).strip()
-
-    return ""
+    return "".join(_flatten_chat_content_text(content)).strip()
 
 
 def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
@@ -488,20 +548,33 @@ def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
                 for c in choices:
                     if not isinstance(c, Mapping):
                         continue
-                    delta = c.get("delta")
-                    if isinstance(delta, Mapping):
-                        content = delta.get("content")
-                        if isinstance(content, str) and content:
-                            text_parts.append(content)
-                    message = c.get("message")
-                    if isinstance(message, Mapping):
-                        content = message.get("content")
-                        if isinstance(content, str) and content:
-                            text_parts.append(content)
+                    text_parts.extend(_extract_text_parts_from_chat_choice(c))
     return {
         "text": "".join(text_parts).strip(),
         "usage": usage,
         "model": model_name,
+    }
+
+
+def parse_chat_completion_http_payload(payload_text: str, content_type: str = "") -> Dict[str, Any]:
+    text = payload_text or ""
+    lowered_content_type = (content_type or "").lower()
+    if "text/event-stream" in lowered_content_type or text.lstrip().startswith("data:"):
+        parsed = parse_chat_completion_sse(text)
+        return {
+            "text": parsed.get("text", ""),
+            "usage": normalize_usage(parsed.get("usage") or {}),
+            "raw_payload": text,
+        }
+
+    data = json.loads(text)
+    usage = {}
+    if isinstance(data, Mapping):
+        usage = normalize_usage(data.get("usage") or {})
+    return {
+        "text": extract_text_from_chat_completion(data),
+        "usage": usage,
+        "raw_payload": text,
     }
 
 def compile_callable_from_code(code_str: str, sanitize: bool = True) -> Callable[[str], int]:
@@ -612,11 +685,24 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
             pass
     return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
+
+def chat_completion_supports_reasoning_effort(model_name: str) -> bool:
+    model_l = (model_name or "").strip().lower()
+    return (
+        model_l.startswith("o3")
+        or model_l.startswith("o4")
+        or "gpt-5" in model_l
+        or model_l.startswith("openai/o3")
+        or model_l.startswith("openai/o4")
+    )
+
 def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
     return {
         "run_id": cfg.run_id,
         "api_mode": cfg.api_mode,
         "api_base_url": cfg.api_base_url,
+        "azure_endpoint": cfg.azure_endpoint,
+        "api_version": cfg.api_version,
         "model": cfg.model,
         "reasoning_effort": cfg.reasoning_effort,
         "max_output_tokens": cfg.max_output_tokens,
@@ -642,23 +728,67 @@ def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
 class Runner:
     def __init__(self, cfg: Config, logger: logging.Logger):
         if not cfg.api_key:
-            raise SystemExit("API key is required. Set TAMU_API_KEY or OPENAI_API_KEY.")
+            raise SystemExit("API key is required. Set TAMU_API_KEY, TAMUS_AI_CHAT_API_KEY, dpf-key, or OPENAI_API_KEY.")
         if cfg.api_mode not in {"responses", "chat_completions"}:
             raise SystemExit("API_MODE must be 'responses' or 'chat_completions'.")
         self.cfg = cfg
         self.log = logger
-        client_kwargs: Dict[str, Any] = {"api_key": cfg.api_key}
-        if cfg.api_base_url:
-            client_kwargs["base_url"] = cfg.api_base_url
-        self.client = AsyncOpenAI(**client_kwargs)
+        self.client, self.client_type = build_async_client(
+            cfg.api_key,
+            api_base_url=cfg.api_base_url,
+            azure_endpoint=cfg.azure_endpoint,
+            api_version=cfg.api_version,
+        )
         self.sem = asyncio.Semaphore(cfg.concurrency)
-        self.row_meta = build_row_run_metadata(cfg)
+        self.row_meta = {
+            **build_row_run_metadata(cfg),
+            "client_type": self.client_type,
+        }
 
         self.tools: List[Dict[str, Any]] = []
         if cfg.enable_code_interpreter:
             self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
 
         self.ds = DatasetStore(cfg, logger)
+
+    async def _call_chat_completions_raw(self, body: Dict[str, Any]) -> Dict[str, Any]:
+        if not self.cfg.api_base_url:
+            raise RuntimeError("Raw chat completions require api_base_url.")
+        url = self.cfg.api_base_url.rstrip("/") + "/chat/completions"
+        headers = {
+            "Authorization": f"Bearer {self.cfg.api_key}",
+            "Content-Type": "application/json",
+            "Accept": "application/json",
+        }
+        async with httpx.AsyncClient(timeout=self.cfg.per_call_timeout_s) as client:
+            try:
+                response = await client.post(url, headers=headers, json=body)
+                response.raise_for_status()
+                parsed = parse_chat_completion_http_payload(
+                    response.text,
+                    response.headers.get("content-type", ""),
+                )
+                if parsed.get("text") or body.get("stream") is True:
+                    return parsed
+                content_type = (response.headers.get("content-type", "") or "").lower()
+                if "text/event-stream" not in content_type:
+                    return parsed
+            except httpx.HTTPStatusError:
+                if body.get("stream") is True:
+                    raise
+
+            retry_body = dict(body)
+            retry_body["stream"] = True
+            retry_body["stream_options"] = {"include_usage": True}
+            async with client.stream("POST", url, headers=headers, json=retry_body) as response:
+                response.raise_for_status()
+                chunks: List[str] = []
+                async for chunk in response.aiter_text():
+                    chunks.append(chunk)
+                return parse_chat_completion_http_payload(
+                    "".join(chunks),
+                    response.headers.get("content-type", ""),
+                )
 
     def _attach_meta(self, row: Dict[str, Any], dataset_seed: Optional[int] = None) -> Dict[str, Any]:
         out = {**self.row_meta, **row}
@@ -677,18 +807,16 @@ class Runner:
         if self.cfg.api_mode == "chat_completions":
             msg_payload = [{"role": "user", "content": prompt_text}]
             body_preview_size = len(json.dumps({"messages": msg_payload}))
-            body: Dict[str, Any] = {
-                "model": self.cfg.model,
-                "messages": msg_payload,
-                "max_tokens": self.cfg.max_output_tokens,
-            }
-            base_url_lower = (self.cfg.api_base_url or "").lower()
-            if ("tamu" in base_url_lower) or ("tamus" in base_url_lower):
-                # TAMU gateway currently returns SSE payloads even via SDK non-stream path.
-                body["stream"] = True
-                body["stream_options"] = {"include_usage": True}
-            if self.cfg.reasoning_effort:
-                body["reasoning_effort"] = self.cfg.reasoning_effort
+            body = build_chat_completions_body(
+                model=self.cfg.model,
+                messages=msg_payload,
+                max_output_tokens=self.cfg.max_output_tokens,
+                reasoning_effort=self.cfg.reasoning_effort,
+                stream=False,
+                enable_thinking=self.cfg.enable_thinking,
+                api_base_url=self.cfg.api_base_url,
+                azure_endpoint=self.cfg.azure_endpoint,
+            )
         else:
             body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
             body = {
@@ -708,82 +836,30 @@ class Runner:
             return {
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "prompt": prompt_text, "request_body": body,
-                "text": None, "usage": {}, "cached_tokens": 0, "duration_ms": 0
+                "text": None, "usage": {}, "cost": {}, "cached_tokens": 0, "duration_ms": 0
             }
 
         async def _try_call(tag: str):
             t0 = time.perf_counter()
             async with self.sem:
-                tool_uses = 0
-                tool_results_chars = 0
-                if self.cfg.api_mode == "chat_completions":
-                    res = await asyncio.wait_for(
-                        self.client.chat.completions.create(**body),
+                llm_result = await asyncio.wait_for(
+                    call_llm_async(
+                        client=self.client,
+                        api_mode=self.cfg.api_mode,
+                        body=body,
                         timeout=self.cfg.per_call_timeout_s,
-                    )
-                    if hasattr(res, "__aiter__"):
-                        text_parts: List[str] = []
-                        usage_obj: Dict[str, Any] = {}
-                        async for chunk in res:
-                            if hasattr(chunk, "model_dump"):
-                                d = chunk.model_dump()
-                            elif isinstance(chunk, Mapping):
-                                d = dict(chunk)
-                            elif isinstance(chunk, str):
-                                d = parse_chat_completion_sse(chunk)
-                            else:
-                                continue
-
-                            if isinstance(d, Mapping):
-                                chs = d.get("choices")
-                                if isinstance(chs, list):
-                                    for c in chs:
-                                        if not isinstance(c, Mapping):
-                                            continue
-                                        delta = c.get("delta")
-                                        if isinstance(delta, Mapping):
-                                            content = delta.get("content")
-                                            if isinstance(content, str) and content:
-                                                text_parts.append(content)
-                                        message = c.get("message")
-                                        if isinstance(message, Mapping):
-                                            content = message.get("content")
-                                            if isinstance(content, str) and content:
-                                                text_parts.append(content)
-                                u = d.get("usage")
-                                if isinstance(u, Mapping):
-                                    usage_obj = dict(u)
-                                elif "usage" in d and isinstance(d.get("usage"), dict):
-                                    usage_obj = d.get("usage", {})
-                        out_text = "".join(text_parts).strip()
-                        usage = normalize_usage(usage_obj)
-                    elif isinstance(res, str):
-                        parsed = parse_chat_completion_sse(res)
-                        out_text = parsed.get("text", "")
-                        usage = normalize_usage(parsed.get("usage") or {})
-                    else:
-                        out_text = extract_text_from_chat_completion(res)
-                        usage = normalize_usage(getattr(res, "usage", {}))
-                else:
-                    res = await asyncio.wait_for(
-                        self.client.responses.create(**body),
-                        timeout=self.cfg.per_call_timeout_s,
-                    )
-                    for item in getattr(res, "output", []) or []:
-                        t = getattr(item, "type", None)
-                        if t == "tool_use":
-                            tool_uses += 1
-                        elif t == "tool_result":
-                            content = getattr(item, "content", None)
-                            if isinstance(content, list):
-                                for part in content:
-                                    txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
-                                    if isinstance(txt, str):
-                                        tool_results_chars += len(txt)
-                            elif isinstance(content, str):
-                                tool_results_chars += len(content)
-                    out_text = (getattr(res, "output_text", "") or "").strip()
-                    usage = normalize_usage(getattr(res, "usage", {}))
+                        api_base_url=self.cfg.api_base_url,
+                        api_key=self.cfg.api_key,
+                        azure_endpoint=self.cfg.azure_endpoint,
+                    ),
+                    timeout=self.cfg.per_call_timeout_s,
+                )
+                out_text = llm_result.text
+                usage = normalize_usage(llm_result.usage)
+                tool_uses = llm_result.tool_uses
+                tool_results_chars = llm_result.tool_results_chars
+                returned_model = llm_result.model or self.cfg.model
+                cost = shared_estimate_usage_cost(usage, returned_model)
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
@@ -798,11 +874,12 @@ class Runner:
                 "reasoning_tokens": usage.get("reasoning_tokens"),
                 "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
                 "cached_tokens": cached, "completion_tokens": usage.get("completion_tokens"),
+                "estimated_total_cost_usd": cost.get("estimated_total_cost_usd"),
             })
             return {
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "prompt": prompt_text,
-                "text": out_text, "usage": usage,
+                "text": out_text, "usage": usage, "cost": cost, "returned_model": returned_model,
                 "cached_tokens": cached, "duration_ms": dt_ms,
                 "request_body_bytes": len(json.dumps(body)),
                 "prompt_chars": len(prompt_text),
@@ -992,13 +1069,15 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "run_id", "api_mode", "api_base_url", "model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
+        "run_id", "api_mode", "api_base_url", "azure_endpoint", "api_version", "client_type", "model", "returned_model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
         "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
         "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
         "fn", "length", "attempt", "trial", "prompt", "text",
         "code", "code_lines", "num_branches", "code_analysis_error",
         "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
+        "pricing_available", "pricing_source", "pricing_model", "input_rate_per_million", "output_rate_per_million",
+        "estimated_input_cost_usd", "estimated_output_cost_usd", "estimated_total_cost_usd",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std", "stopped_early", "compile_error", "num_trials", "is_summary",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1006,11 +1085,16 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w.writeheader()
         for r in rows:
             usage = r.get("usage") or {}
+            cost_fields = shared_flatten_cost_fields(r.get("cost") or {})
             w.writerow({
                 "run_id": r.get("run_id"),
                 "api_mode": r.get("api_mode"),
                 "api_base_url": r.get("api_base_url"),
+                "azure_endpoint": r.get("azure_endpoint"),
+                "api_version": r.get("api_version"),
+                "client_type": r.get("client_type"),
                 "model": r.get("model"),
+                "returned_model": r.get("returned_model"),
                 "reasoning_effort": r.get("reasoning_effort"),
                 "max_output_tokens": r.get("max_output_tokens"),
                 "tool_choice": r.get("tool_choice"),
@@ -1042,6 +1126,14 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "reasoning_tokens": usage.get("reasoning_tokens"),
                 "tool_uses": r.get("tool_uses"),
                 "tool_results_chars": r.get("tool_results_chars"),
+                "pricing_available": cost_fields.get("pricing_available"),
+                "pricing_source": cost_fields.get("pricing_source"),
+                "pricing_model": cost_fields.get("pricing_model"),
+                "input_rate_per_million": cost_fields.get("input_rate_per_million"),
+                "output_rate_per_million": cost_fields.get("output_rate_per_million"),
+                "estimated_input_cost_usd": cost_fields.get("estimated_input_cost_usd"),
+                "estimated_output_cost_usd": cost_fields.get("estimated_output_cost_usd"),
+                "estimated_total_cost_usd": cost_fields.get("estimated_total_cost_usd"),
                 "val_acc": r.get("val_acc"),
                 "val_acc_std": r.get("val_acc_std"),
                 "test_acc": r.get("test_acc"),
@@ -1064,6 +1156,8 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
         "config": {
             "api_mode": cfg.api_mode,
             "api_base_url": cfg.api_base_url,
+            "azure_endpoint": cfg.azure_endpoint,
+            "api_version": cfg.api_version,
             "model": cfg.model,
             "max_output_tokens": cfg.max_output_tokens,
             "reasoning_effort": cfg.reasoning_effort,
@@ -1097,6 +1191,11 @@ def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
             "summary_rows": sum(1 for r in rows if r.get("is_summary")),
             "attempt_rows": sum(1 for r in rows if r.get("attempt") is not None and not r.get("is_summary")),
             "compile_error_rows": sum(1 for r in rows if r.get("compile_error")),
+            "attempt_estimated_total_cost_usd": sum(
+                float(((r.get("cost") or {}).get("estimated_total_cost_usd")) or 0.0)
+                for r in rows
+                if r.get("attempt") is not None and not r.get("is_summary")
+            ),
         },
     }
     _safe_write_json(path, manifest)
@@ -1111,6 +1210,8 @@ def parse_args() -> Config:
 
     p.add_argument("--api-mode", choices=["responses", "chat_completions"], help="API mode: Responses API or chat completions")
     p.add_argument("--api-base-url", help="Override API base URL (e.g., TAMU gateway base URL)")
+    p.add_argument("--azure-endpoint", help="Azure OpenAI endpoint (e.g., https://...openai.azure.com/)")
+    p.add_argument("--api-version", help="Azure OpenAI API version (default: 2024-12-01-preview)")
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths (e.g., 100 50 30 25 20)")
     p.add_argument("--attempts", type=int, help="Attempts per (fn, length), default=5")
@@ -1119,7 +1220,7 @@ def parse_args() -> Config:
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
     p.add_argument("--retry-delay", type=float, help="Seconds to wait before retrying a failed call (default: 5)")
 
-    p.add_argument("--model", help="Model name (default: gpt-5)")
+    p.add_argument("--model", help="Model or Azure deployment name")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
@@ -1140,6 +1241,7 @@ def parse_args() -> Config:
     p.add_argument("--run-id", help="Optional run id for artifact traceability")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
+    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode (adds chat_template_kwargs for Qwen/DeepSeek models)")
 
     args = p.parse_args()
     cfg = Config()
@@ -1148,6 +1250,8 @@ def parse_args() -> Config:
     if args.lengths: cfg.lengths = args.lengths
     if args.api_mode: cfg.api_mode = args.api_mode
     if args.api_base_url: cfg.api_base_url = args.api_base_url
+    if args.azure_endpoint: cfg.azure_endpoint = args.azure_endpoint.strip()
+    if args.api_version: cfg.api_version = args.api_version.strip()
     if args.attempts: cfg.attempts = args.attempts
     if args.num_trials: cfg.num_trials = args.num_trials
     if args.concurrency: cfg.concurrency = args.concurrency
@@ -1172,6 +1276,7 @@ def parse_args() -> Config:
     if args.seed is not None: cfg.seed = args.seed
     if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
     if args.dry_run: cfg.dry_run = True
+    if args.enable_thinking: cfg.enable_thinking = True
 
     os.environ["LOG_LEVEL"] = args.log_level
     return cfg

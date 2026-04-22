@@ -22,7 +22,11 @@ def _build_stub_modules() -> dict[str, types.ModuleType]:
             self.args = args
             self.kwargs = kwargs
 
+    class DummyAsyncAzureOpenAI(DummyAsyncOpenAI):
+        pass
+
     openai_mod.AsyncOpenAI = DummyAsyncOpenAI
+    openai_mod.AsyncAzureOpenAI = DummyAsyncAzureOpenAI
 
     src_mod = types.ModuleType("src")
     src_mod.__path__ = []

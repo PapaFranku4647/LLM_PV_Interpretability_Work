@@ -50,6 +50,17 @@ class ThesisPromptVariantsTests(unittest.TestCase):
         for snippet in required_snippets:
             self.assertIn(snippet, prompt)
 
+    def test_build_prompt_includes_semantic_key_guidance(self) -> None:
+        prompt = build_thesis_generation_prompt(
+            "def f(x):\n    return 1",
+            "HighBP=yes, BMI=very high, Age=low",
+            1,
+        )
+        self.assertIn("HighBP", prompt)
+        self.assertIn("BMI", prompt)
+        self.assertIn("Do NOT rename", prompt)
+        self.assertIn("x0/x1", prompt)
+
     def test_format_sample_mapping_orders_feature_keys_numerically(self) -> None:
         sample = {"x10": 10, "x2": 2, "foo": "bar", "x1": 1}
         formatted = format_sample_for_thesis_prompt(sample)
@@ -108,6 +119,15 @@ class ThesisPromptVariantsTests(unittest.TestCase):
         prompt = build_thesis_generation_prompt_v2("def f(x):\n    return 1", "x0=1", 1)
         self.assertIn("trace through your code", prompt)
         self.assertIn("at least 30%", prompt)
+
+    def test_build_prompt_v2_includes_semantic_key_guidance(self) -> None:
+        prompt = build_thesis_generation_prompt_v2(
+            "def f(x):\n    return 1",
+            "HighBP=yes, BMI=very high, Age=low",
+            1,
+        )
+        self.assertIn("Use these exact semantic feature names", prompt)
+        self.assertIn("Do NOT rename them to x0/x1", prompt)
 
 
 if __name__ == "__main__":

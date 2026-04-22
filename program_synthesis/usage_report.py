@@ -9,6 +9,8 @@ import glob
 import os
 from typing import Dict, Iterable, List
 
+from llm_client import estimate_usage_cost, resolve_model_pricing
+
 
 def _to_int(value) -> int:
     if value in (None, ""):
@@ -44,14 +46,14 @@ def main() -> None:
     p.add_argument(
         "--input-rate",
         type=float,
-        default=1.75,
-        help="USD per 1M input tokens (default: GPT-5.2 price 1.75)",
+        default=None,
+        help="Override USD per 1M input tokens for all rows.",
     )
     p.add_argument(
         "--output-rate",
         type=float,
-        default=14.0,
-        help="USD per 1M output tokens (default: GPT-5.2 price 14.0)",
+        default=None,
+        help="Override USD per 1M output tokens for all rows.",
     )
     args = p.parse_args()
 
@@ -68,13 +70,35 @@ def main() -> None:
     completion_tokens = sum(_to_int(r.get("completion_tokens")) for r in attempt_rows)
     reasoning_tokens = sum(_to_int(r.get("reasoning_tokens")) for r in attempt_rows)
     cached_tokens = sum(_to_int(r.get("cached_tokens")) for r in attempt_rows)
-
-    input_cost = (prompt_tokens / 1_000_000.0) * args.input_rate
-    output_cost = (completion_tokens / 1_000_000.0) * args.output_rate
-    total_cost = input_cost + output_cost
+    input_cost = 0.0
+    output_cost = 0.0
+    total_cost = 0.0
+    unresolved_models: set[str] = set()
+    priced_rows = 0
+    for row in attempt_rows:
+        usage = {
+            "prompt_tokens": _to_int(row.get("prompt_tokens")),
+            "completion_tokens": _to_int(row.get("completion_tokens")),
+            "reasoning_tokens": _to_int(row.get("reasoning_tokens")),
+            "cached_tokens": _to_int(row.get("cached_tokens")),
+        }
+        cost = estimate_usage_cost(
+            usage,
+            row.get("returned_model") or row.get("model"),
+            input_rate=args.input_rate,
+            output_rate=args.output_rate,
+        )
+        if cost.get("estimated_total_cost_usd") is None:
+            unresolved_models.add(str(row.get("returned_model") or row.get("model") or "<missing-model>"))
+            continue
+        priced_rows += 1
+        input_cost += float(cost.get("estimated_input_cost_usd") or 0.0)
+        output_cost += float(cost.get("estimated_output_cost_usd") or 0.0)
+        total_cost += float(cost.get("estimated_total_cost_usd") or 0.0)
 
     print(f"rows_total={len(rows)}")
     print(f"rows_attempt={len(attempt_rows)}")
+    print(f"rows_priced={priced_rows}")
     print(f"prompt_tokens={prompt_tokens}")
     print(f"completion_tokens={completion_tokens}")
     print(f"reasoning_tokens={reasoning_tokens}")
@@ -82,6 +106,12 @@ def main() -> None:
     print(f"est_input_cost_usd={input_cost:.6f}")
     print(f"est_output_cost_usd={output_cost:.6f}")
     print(f"est_total_cost_usd={total_cost:.6f}")
+    if args.input_rate is None and args.output_rate is None:
+        known_models = sorted({resolve_model_pricing(r.get("returned_model") or r.get("model")).canonical_name for r in attempt_rows if resolve_model_pricing(r.get("returned_model") or r.get("model"))})
+        if known_models:
+            print(f"priced_models={','.join(known_models)}")
+    if unresolved_models:
+        print(f"unpriced_models={','.join(sorted(unresolved_models))}")
 
 
 if __name__ == "__main__":

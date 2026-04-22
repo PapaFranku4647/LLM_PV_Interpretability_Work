@@ -137,3 +137,73 @@ python program_synthesis/thesis_analysis.py `
   --results-dir program_synthesis/runs_step23_live_matrix/<timestamp_run1> `
   --results-dir program_synthesis/runs_step23_live_matrix/<timestamp_run2>
 ```
+
+## 9. Code0 batched training smoke test
+
+Train Code0 in batches and carry the best code forward after each batch.
+
+```powershell
+python program_synthesis/runner_val_selection.py `
+  --functions fn_o `
+  --attempts 2 `
+  --num-trials 1 `
+  --train-size 40 `
+  --val-size 100 `
+  --test-size 500 `
+  --seed 2201 `
+  --model gpt-5-mini `
+  --reasoning-effort minimal `
+  --tool-choice none `
+  --prompt-variant explain `
+  --code0-train-mode batched `
+  --code0-batch-size 10 `
+  --out-jsonl program_synthesis/runs_batching_smoke/batched/results.jsonl `
+  --out-csv program_synthesis/runs_batching_smoke/batched/results.csv
+```
+
+Batch winners are also written to:
+- `results_batches.jsonl`
+- `results_batches.csv`
+
+## 10. Fair normal-vs-batched Code0 comparison
+
+Match both total training samples and total Code0 generations.
+Example: `train_size=200`, `batch_size=50`, `attempts=5` means 4 batches, so the fair normal control uses `attempts=20`.
+
+```powershell
+python program_synthesis/runner_val_selection.py `
+  --functions fn_o `
+  --attempts 5 `
+  --num-trials 1 `
+  --train-size 200 `
+  --val-size 2300 `
+  --test-size 7500 `
+  --seed 2201 `
+  --model gpt-5.2 `
+  --reasoning-effort low `
+  --tool-choice none `
+  --prompt-variant explain `
+  --code0-train-mode batched `
+  --code0-batch-size 50 `
+  --dataset-dir program_synthesis/runs_batching_compare/shared_datasets `
+  --out-jsonl program_synthesis/runs_batching_compare/batched/results.jsonl `
+  --out-csv program_synthesis/runs_batching_compare/batched/results.csv
+```
+
+```powershell
+python program_synthesis/runner_val_selection.py `
+  --functions fn_o `
+  --attempts 20 `
+  --num-trials 1 `
+  --train-size 200 `
+  --val-size 2300 `
+  --test-size 7500 `
+  --seed 2201 `
+  --model gpt-5.2 `
+  --reasoning-effort low `
+  --tool-choice none `
+  --prompt-variant explain `
+  --dataset-dir program_synthesis/runs_batching_compare/shared_datasets `
+  --out-jsonl program_synthesis/runs_batching_compare/normal/results.jsonl `
+  --out-csv program_synthesis/runs_batching_compare/normal/results.csv
+```
