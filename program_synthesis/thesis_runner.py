@@ -117,6 +117,39 @@ def compute_equation_metrics(
     return result.to_legacy_dict()
 
 
+def resolve_prompt_artifact(row: Mapping[str, Any], sanitized_code: str) -> str:
+    for key in ("raw_artifact_text", "artifact_text", "thesis_prompt_code"):
+        prompt_code = row.get(key)
+        if isinstance(prompt_code, str) and prompt_code.strip():
+            return prompt_code.strip()
+    return sanitized_code
+
+
+def load_external_artifact_row(combo_dir: Path) -> tuple[str, dict[str, Any]]:
+    artifact_path = combo_dir / "artifact.json"
+    if not artifact_path.exists():
+        raise FileNotFoundError(f"External artifact manifest missing: {artifact_path}")
+    row = json.loads(artifact_path.read_text(encoding="utf-8"))
+    if not isinstance(row, dict):
+        raise ValueError(f"External artifact manifest must be a JSON object: {artifact_path}")
+
+    for text_key, path_key in (
+        ("code", "code_path"),
+        ("thesis_prompt_code", "thesis_prompt_code_path"),
+        ("artifact_text", "artifact_text_path"),
+        ("raw_artifact_text", "raw_artifact_text_path"),
+    ):
+        if not isinstance(row.get(text_key), str) or not row.get(text_key, "").strip():
+            raw_path = row.get(path_key)
+            if isinstance(raw_path, str) and raw_path.strip():
+                candidate = Path(raw_path)
+                if not candidate.is_absolute():
+                    candidate = (combo_dir / candidate).resolve()
+                row[text_key] = candidate.read_text(encoding="utf-8")
+
+    return artifact_path.name, row
+
+
 def write_json(path: Path, obj: Any) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(obj, indent=2), encoding="utf-8")
@@ -468,6 +501,11 @@ def main() -> None:
              "If it exists, indices are loaded from it. If not, indices are "
              "computed and saved to it for reuse across runs.",
     )
+    parser.add_argument(
+        "--external-artifact-root",
+        default="",
+        help="Optional root containing external code0 artifacts under <fn>_seed<seed>/artifact.json.",
+    )
     args = parser.parse_args()
     if args.code0_train_mode == "batched" and args.code0_batch_size <= 0:
         raise SystemExit("--code0-batch-size must be positive when --code0-train-mode batched is used")
@@ -525,6 +563,15 @@ def main() -> None:
             preloaded_indices = load_sample_indices(sample_indices_path)
             logger.info("loaded_sample_indices path=%s combos=%d", sample_indices_path, len(preloaded_indices))
 
+    external_artifact_root: Optional[Path] = None
+    if args.external_artifact_root:
+        external_artifact_root = Path(args.external_artifact_root)
+        if not external_artifact_root.is_absolute():
+            external_artifact_root = (repo_root / external_artifact_root).resolve()
+        if not external_artifact_root.exists():
+            raise SystemExit(f"External artifact root does not exist: {external_artifact_root}")
+        args.skip_runner = True
+
     auto_split_sizes: dict[str, dict[str, int]] = {}
 
     for fn in args.functions:
@@ -555,7 +602,7 @@ def main() -> None:
             case_root.mkdir(parents=True, exist_ok=True)
             logger.info("combo_start fn=%s seed=%s", fn, seed)
 
-            if not args.skip_runner:
+            if external_artifact_root is None and not args.skip_runner:
                 run_runner_val_selection(
                     python_exe=args.python_exe,
                     repo_root=repo_root,
@@ -567,7 +614,12 @@ def main() -> None:
                     logger=logger,
                 )
 
-            best_row_file, row = load_best_row(run_dir)
+            if external_artifact_root is not None:
+                external_combo_dir = external_artifact_root / combo_id
+                best_row_file, row = load_external_artifact_row(external_combo_dir)
+                run_dir = external_combo_dir
+            else:
+                best_row_file, row = load_best_row(run_dir)
             original_code = row.get("code")
             if not isinstance(original_code, str) or not original_code.strip():
                 raise RuntimeError(f"Best row has no code for fn={fn}, seed={seed}")
@@ -586,16 +638,22 @@ def main() -> None:
                 )
                 raise RuntimeError(f"Sanitized Code0 still contains comments/docstrings for fn={fn}, seed={seed}")
             code0_fn = compile_callable(sanitized_code)
+            prompt_artifact = resolve_prompt_artifact(row, sanitized_code)
 
             length = row.get("length")
             dataset_seed = row.get("dataset_seed")
-            if length is None or dataset_seed is None:
-                raise RuntimeError(f"Missing length/dataset_seed for fn={fn}, seed={seed}")
-
-            target = TARGET_NAME_BY_FN[fn]
-            split_dir = dataset_dir / target / f"L{length}" / f"seed{dataset_seed}"
-            train_lines = read_split_lines(split_dir / "train.txt")
-            test_lines = read_split_lines(split_dir / "test.txt")
+            train_path = row.get("train_path")
+            test_path = row.get("test_path")
+            if isinstance(train_path, str) and train_path.strip() and isinstance(test_path, str) and test_path.strip():
+                train_lines = read_split_lines(Path(train_path))
+                test_lines = read_split_lines(Path(test_path))
+            else:
+                if length is None or dataset_seed is None:
+                    raise RuntimeError(f"Missing length/dataset_seed or train/test paths for fn={fn}, seed={seed}")
+                target = TARGET_NAME_BY_FN[fn]
+                split_dir = dataset_dir / target / f"L{length}" / f"seed{dataset_seed}"
+                train_lines = read_split_lines(split_dir / "train.txt")
+                test_lines = read_split_lines(split_dir / "test.txt")
             if args.samples_per_seed > len(test_lines):
                 raise RuntimeError(
                     f"Requested samples_per_seed={args.samples_per_seed} but only {len(test_lines)} test rows "
@@ -630,6 +688,7 @@ def main() -> None:
                     case_dir = case_root / f"sample_{enum_pos + 1:04d}"
                     case_dir.mkdir(parents=True, exist_ok=True)
                     (case_dir / "code0_sanitized.py").write_text(sanitized_code, encoding="utf-8")
+                    (case_dir / "code0_prompt_artifact.txt").write_text(prompt_artifact, encoding="utf-8")
                     write_json(
                         case_dir / "summary.json",
                         {
@@ -660,6 +719,7 @@ def main() -> None:
                             "code0_has_hash_comment_char": code0_has_hash,
                             "code0_has_comment_tokens": code0_has_comment_tokens,
                             "code0_has_docstring": code0_has_docstring,
+                            "code0_prompt_artifact_differs": prompt_artifact != sanitized_code,
                             "case_dir": str(case_dir),
                         },
                     )
@@ -687,6 +747,7 @@ def main() -> None:
                             "code0_has_hash_comment_char": code0_has_hash,
                             "code0_has_comment_tokens": code0_has_comment_tokens,
                             "code0_has_docstring": code0_has_docstring,
+                            "code0_prompt_artifact_differs": prompt_artifact != sanitized_code,
                             "response_id": None,
                             "response_status": None,
                             "response_json_parse_error": "code0_prediction_failed",
@@ -732,11 +793,11 @@ def main() -> None:
                     continue
                 sample_repr = format_sample_for_thesis_prompt(sample)
                 if args.thesis_prompt_version == "v3":
-                    thesis_prompt = build_thesis_generation_prompt_v3(sanitized_code, sample_repr, pred_label)
+                    thesis_prompt = build_thesis_generation_prompt_v3(prompt_artifact, sample_repr, pred_label)
                 elif args.thesis_prompt_version == "v2":
-                    thesis_prompt = build_thesis_generation_prompt_v2(sanitized_code, sample_repr, pred_label)
+                    thesis_prompt = build_thesis_generation_prompt_v2(prompt_artifact, sample_repr, pred_label)
                 else:
-                    thesis_prompt = build_thesis_generation_prompt(sanitized_code, sample_repr, pred_label)
+                    thesis_prompt = build_thesis_generation_prompt(prompt_artifact, sample_repr, pred_label)
 
                 if args.api_mode == "chat_completions":
                     request_body = build_chat_completions_body(
@@ -757,24 +818,43 @@ def main() -> None:
                         "max_output_tokens": args.max_output_tokens,
                         "tool_choice": "none",
                     }
-                llm_result = call_llm_sync(
-                    client=client,
-                    api_mode=args.api_mode,
-                    body=request_body,
-                    timeout=120.0,
-                    api_base_url=args.api_base_url or "",
-                    api_key=api_key,
-                    azure_endpoint=args.azure_endpoint or "",
-                )
-                response_text = llm_result.text
-                response_dump = llm_result.response_dump
-                response_status = llm_result.response_status or ("completed" if args.api_mode == "chat_completions" else None)
-                response_id = llm_result.response_id
-                thesis_usage = llm_result.usage
-                thesis_cost = estimate_usage_cost(thesis_usage, llm_result.model or args.model)
-                returned_model = llm_result.model or args.model
-
-                parsed_json, parse_err = parse_json_from_text(response_text)
+                llm_call_error = None
+                try:
+                    llm_result = call_llm_sync(
+                        client=client,
+                        api_mode=args.api_mode,
+                        body=request_body,
+                        timeout=120.0,
+                        api_base_url=args.api_base_url or "",
+                        api_key=api_key,
+                        azure_endpoint=args.azure_endpoint or "",
+                    )
+                    response_text = llm_result.text
+                    response_dump = llm_result.response_dump
+                    response_status = llm_result.response_status or ("completed" if args.api_mode == "chat_completions" else None)
+                    response_id = llm_result.response_id
+                    thesis_usage = llm_result.usage
+                    thesis_cost = estimate_usage_cost(thesis_usage, llm_result.model or args.model)
+                    returned_model = llm_result.model or args.model
+                    parsed_json, parse_err = parse_json_from_text(response_text)
+                except Exception as e:
+                    llm_call_error = str(e)
+                    response_text = ""
+                    response_dump = {"error": llm_call_error}
+                    response_status = "error"
+                    response_id = None
+                    thesis_usage = {}
+                    thesis_cost = {}
+                    returned_model = args.model
+                    parsed_json = None
+                    parse_err = f"llm_call_error: {llm_call_error}"
+                    logger.warning(
+                        "thesis_llm_call_failed fn=%s seed=%s sample=%s err=%s",
+                        fn,
+                        seed,
+                        enum_pos + 1,
+                        llm_call_error,
+                    )
                 has_conditions = (
                     isinstance(parsed_json, dict)
                     and isinstance(parsed_json.get("conditions"), str)
@@ -858,6 +938,7 @@ def main() -> None:
                 case_dir = case_root / f"sample_{enum_pos + 1:04d}"
                 case_dir.mkdir(parents=True, exist_ok=True)
                 (case_dir / "code0_sanitized.py").write_text(sanitized_code, encoding="utf-8")
+                (case_dir / "code0_prompt_artifact.txt").write_text(prompt_artifact, encoding="utf-8")
                 (case_dir / "prompt.txt").write_text(thesis_prompt, encoding="utf-8")
                 (case_dir / "response.txt").write_text(response_text, encoding="utf-8")
                 write_json(case_dir / "raw_response.json", response_dump)
@@ -891,6 +972,7 @@ def main() -> None:
                     "code0_has_hash_comment_char": code0_has_hash,
                     "code0_has_comment_tokens": code0_has_comment_tokens,
                     "code0_has_docstring": code0_has_docstring,
+                    "code0_prompt_artifact_differs": prompt_artifact != sanitized_code,
                     "returned_model": returned_model,
                     "response_id": response_id,
                     "response_status": response_status,

@@ -49,13 +49,17 @@ Rules:
 - Avoid loops or comprehensions.
 - Do NOT use classes, decorators, or async features.
 - Return only bool/boolish values (`True/False` or equivalent).
-- x may be either:
-  1) dict with keys like x0, x1, ...
-  2) list/tuple where xN maps to x[N]
-- DATA FORMAT: Some features are categorical strings like 'c0', 'c1', 'c4'.
-  Compare them as strings: x.get("x5") == 'c4', NOT x.get("x5") == 4.
-  Numeric features are floats: x.get("x0") >= 40.0.
-  Check the reference sample above to determine each feature's type.
+- Assume x is a dict whose keys match the reference sample unless the thesis
+  explicitly uses positional x0/x1-style keys.
+- Use the EXACT feature names from the thesis/reference sample.
+- Do NOT rename semantic features to x0/x1 or invent positional aliases.
+- If you choose to support list/tuple input, only do so when the thesis itself
+  already uses positional xN-style keys.
+- DATA FORMAT: Some features are categorical strings like 'c0', 'c1', 'c4',
+  or semantic values like 'yes', 'no', 'very high'. Compare them as strings.
+- Numeric features use numeric comparisons.
+
+[FEATURE_GUIDANCE]
 
 Output STRICT JSON only:
 {
@@ -74,18 +78,23 @@ Thesis conditions (raw text):
 Thesis label:
 [LABEL]
 
+Reference sample format:
+[SAMPLE]
+
 Candidate Code1:
 ```python
 [CODE1]
 ```
+
+[FEATURE_GUIDANCE]
 
 Output STRICT JSON only:
 {
   "judgement": "pass|fail|uncertain",
   "reason": "short explanation",
   "testcases": [
-    {"sample": {"x0": 1, "x1": 5}, "expected": true, "note": "satisfies thesis"},
-    {"sample": {"x0": 0, "x1": 1}, "expected": false, "note": "violates thesis"}
+    {"sample": {"feature_a": "value", "feature_b": 5}, "expected": true, "note": "satisfies thesis"},
+    {"sample": {"feature_a": "other", "feature_b": 1}, "expected": false, "note": "violates thesis"}
   ]
 }
 
@@ -93,9 +102,11 @@ Testcase requirements:
 - Provide thesis-grounded cases.
 - Include both positive and negative cases.
 - Prefer at least 3 positive and 3 negative cases when possible.
-- DATA FORMAT: Categorical features use string values like "c0", "c1", "c4".
-  Testcase samples must use the exact string format: {"x5": "c4"}, NOT {"x5": 4}.
-  Numeric features use floats: {"x0": 40.0}.
+- Use the EXACT feature keys from the thesis/reference sample.
+- Do NOT rename semantic features to x0/x1 or invent positional aliases.
+- DATA FORMAT: Categorical features use string values like "c0", "c1", "c4",
+  or semantic values like "yes", "no", "very high".
+- Testcase samples must preserve those exact string values.
 """.strip()
 
 
@@ -348,6 +359,7 @@ def _request_json_object(
 
 
 _CATEGORICAL_VALUE_RE = re.compile(r"=c\d+")
+_POSITIONAL_KEY_RE = re.compile(r"^x\d+$")
 
 
 def _detect_categorical_features(sample_repr: str) -> list[str]:
@@ -361,6 +373,49 @@ def _detect_categorical_features(sample_repr: str) -> list[str]:
     return features
 
 
+def _parse_sample_repr(sample_repr: str) -> list[tuple[str, str]]:
+    items: list[tuple[str, str]] = []
+    for raw_part in (sample_repr or "").split(","):
+        part = raw_part.strip()
+        if not part or "=" not in part:
+            continue
+        key, value = part.split("=", 1)
+        key = key.strip()
+        value = value.strip()
+        if key:
+            items.append((key, value))
+    return items
+
+
+def _build_feature_guidance(sample_repr: str) -> str:
+    items = _parse_sample_repr(sample_repr)
+    if not items:
+        return "- Use the exact feature names shown in the thesis/reference sample."
+
+    keys = [key for key, _ in items]
+    preview = ", ".join(f"{key}={value}" for key, value in items[:6])
+    semantic_keys = any(_POSITIONAL_KEY_RE.fullmatch(key) is None for key in keys)
+
+    guidance = [
+        f"- Reference sample keys: {', '.join(keys[:12])}" + (" ..." if len(keys) > 12 else ""),
+        f"- Reference sample preview: {preview}",
+    ]
+    if semantic_keys:
+        guidance.extend(
+            [
+                "- Access dict values with the exact semantic keys, e.g. x.get(\"HighBP\"), x.get(\"BMI\").",
+                "- Do NOT rename those keys to x0/x1 or any other positional aliases.",
+            ]
+        )
+    else:
+        guidance.extend(
+            [
+                "- The keys are already positional xN names; use those exact keys and no others.",
+            ]
+        )
+    return "\n".join(guidance)
+
+
 def _build_code1_writer_prompt(
     thesis_conditions: str,
     thesis_label: int,
@@ -371,6 +426,7 @@ def _build_code1_writer_prompt(
     prompt = prompt.replace("[CONDITIONS]", str(thesis_conditions).strip())
     prompt = prompt.replace("[LABEL]", str(int(thesis_label)))
     prompt = prompt.replace("[SAMPLE]", str(sample_repr).strip())
+    prompt = prompt.replace("[FEATURE_GUIDANCE]", _build_feature_guidance(str(sample_repr).strip()))
     cat_features = _detect_categorical_features(str(sample_repr))
     if cat_features:
         prompt += (
@@ -387,11 +443,14 @@ def _build_code1_verifier_prompt(
     thesis_conditions: str,
     thesis_label: int,
     code1: str,
+    sample_repr: str,
 ) -> str:
     prompt = CODE1_VERIFIER_TEMPLATE
     prompt = prompt.replace("[CONDITIONS]", str(thesis_conditions).strip())
     prompt = prompt.replace("[LABEL]", str(int(thesis_label)))
+    prompt = prompt.replace("[SAMPLE]", str(sample_repr).strip())
     prompt = prompt.replace("[CODE1]", (code1 or "").strip())
+    prompt = prompt.replace("[FEATURE_GUIDANCE]", _build_feature_guidance(str(sample_repr).strip()))
     return prompt
 
 
@@ -604,6 +663,7 @@ def verify_code1_semantics(
     thesis_conditions: str,
     thesis_label: int,
     code1: str,
+    sample_repr: str,
     *,
     max_output_tokens: int = 1200,
     reasoning_effort: str = "minimal",
@@ -617,6 +677,7 @@ def verify_code1_semantics(
         thesis_conditions=thesis_conditions,
         thesis_label=thesis_label,
         code1=code1,
+        sample_repr=sample_repr,
     )
     parsed, parse_error, llm_result = _request_json_object(
         client=client,
@@ -816,6 +877,7 @@ def build_code1_with_verification(
             thesis_conditions=thesis_conditions,
             thesis_label=thesis_label,
             code1=generation.code1,
+            sample_repr=sample_repr,
             max_output_tokens=max_output_tokens,
             reasoning_effort=reasoning_effort,
             text_verbosity=text_verbosity,

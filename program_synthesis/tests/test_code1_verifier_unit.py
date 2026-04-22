@@ -12,6 +12,8 @@ if str(PROGRAM_SYNTHESIS_DIR) not in sys.path:
 
 from code1_verifier import (  # noqa: E402
     TestCase,
+    _build_code1_verifier_prompt,
+    _build_code1_writer_prompt,
     _detect_categorical_features,
     compile_code1,
     generate_code1_from_thesis,
@@ -132,6 +134,28 @@ class Code1VerifierUnitTests(unittest.TestCase):
         sample = "x0=50.0, x1=3.2"
         cats = _detect_categorical_features(sample)
         self.assertEqual(cats, [])
+
+    def test_writer_prompt_preserves_semantic_feature_names(self) -> None:
+        prompt = _build_code1_writer_prompt(
+            thesis_conditions="HighBP == 'yes' AND BMI == 'very high'",
+            thesis_label=1,
+            sample_repr="HighBP=yes, BMI=very high, Age=low",
+        )
+        self.assertIn('x.get("HighBP")', prompt)
+        self.assertIn('x.get("BMI")', prompt)
+        self.assertIn("Do NOT rename semantic features to x0/x1", prompt)
+
+    def test_verifier_prompt_preserves_semantic_feature_names(self) -> None:
+        prompt = _build_code1_verifier_prompt(
+            thesis_conditions="HighBP == 'yes' AND BMI == 'very high'",
+            thesis_label=1,
+            code1="def check_conditions(x):\n    return x.get('HighBP') == 'yes'",
+            sample_repr="HighBP=yes, BMI=very high, Age=low",
+        )
+        self.assertIn("Reference sample format", prompt)
+        self.assertIn("HighBP=yes", prompt)
+        self.assertIn("Use the EXACT feature keys", prompt)
+        self.assertIn("Do NOT rename semantic features to x0/x1", prompt)
 
     def test_generate_code1_handles_malformed_writer_json(self) -> None:
         client = _FakeClient(["not-json-at-all"])
