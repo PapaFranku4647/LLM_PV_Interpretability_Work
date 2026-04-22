@@ -1,2 +1,0 @@
-row_index,attempt,round,retry,candidate_code_sha256,candidate_code_chars,individual_train_acc,individual_val_acc,individual_test_acc,train_eval_errors,val_eval_errors,test_eval_errors,original_weighted_error,original_alpha,original_batch_acc,original_candidate_selected
-0,1,1,1,27679652875b9ad1dc66730a1f670140cf1ef7f0c0ff01504017f22cd87dcdc4,916,0.94921875,0.953125,0.923,0,0,0,0.05078125,1.464056042939506,0.94921875,True

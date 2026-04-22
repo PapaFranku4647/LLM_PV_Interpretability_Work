@@ -34,7 +34,23 @@ from src.target_functions import EXPERIMENT_FUNCTION_MAPPING
 
 PROJECT_ROOT = os.path.abspath(parent_dir)
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+}
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s - %(levelname)s - %(message)s")
 logger = logging.getLogger("agent_baseline_runner")

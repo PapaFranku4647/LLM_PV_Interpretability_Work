@@ -1,2 +1,0 @@
-step,row_index,attempt,round,retry,direction,alpha,weighted_error,train_acc,val_acc,test_acc,candidate_code_sha256,candidate_code_chars
-1,8,9,1,9,1,0.43105187371774,0.2968999999999836,0.7031,0.695,0.7027,96ff54ab5d3d4e995ce0da696653b782f59e5493daaf8f6c9db4f151ea38ec70,1486

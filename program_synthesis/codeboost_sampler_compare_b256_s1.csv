@@ -1,4 +1,0 @@
-sampling_strategy,train_size,val_size,test_size,batch_size,boost_rounds,round_retries,candidate_selection,ensemble_val_drop_tolerance,max_weak_error,final_train_acc,final_val_acc,final_test_acc,best_val_acc,saved_rounds,selected_before_restore,api_attempt_count,total_estimated_cost_usd,stopped_reason,selected_round1_batch_acc,selected_round2_batch_acc,selected_round3_batch_acc
-feature_diverse,10000,2000,10000,256,3,3,best_ensemble_val,0.005,0.49,0.6984,0.688,0.6965,0.688,1,3,9,0.6974887500000001,val_early_stop_restored_best_val,0.72265625,0.24609375,0.109375
-label_balanced_diverse,10000,2000,10000,256,3,3,best_ensemble_val,0.005,0.49,0.7028,0.6905,0.7036,0.6905,1,3,9,0.6488912499999999,val_early_stop_restored_best_val,0.66015625,0.35546875,0.15625
-stratified_diverse,10000,2000,10000,256,3,3,best_ensemble_val,0.005,0.49,0.7015,0.69,0.7046,0.69,1,3,9,0.6415395,val_early_stop_restored_best_val,0.65234375,0.484375,0.34765625

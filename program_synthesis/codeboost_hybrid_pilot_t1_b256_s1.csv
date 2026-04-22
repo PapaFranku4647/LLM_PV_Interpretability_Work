@@ -1,3 +1,0 @@
-function,dataset,representation,train_acc,val_acc,test_acc,semantic_pilot_acc,obfuscated_pilot_acc,best_baseline,gap_to_baseline,api_attempts,estimated_cost_usd,output_dir
-fn_n,mushroom,hybrid,0.71484375,0.58984375,0.6115,0.6380,0.5755,0.8528,-0.2413,2,0.28280700000000003,program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_n_mushroom
-fn_p,htru2,hybrid,0.91015625,0.90234375,0.8770,0.8950,0.8830,0.9340,-0.0570,1,0.101563,program_synthesis/boosted/runs/hybrid_codeboost_pilot_t1_b256_s1/fn_p_htru2

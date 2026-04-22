@@ -1,77 +1,34 @@
-# LLM-PV (OpenAI Responses API)
+# CodeBoost
 
-**Goal:** Prompt a reasoning-capable model to output **executable Python** that implements a hidden mapping. We compile & evaluate the returned function, track validation/test accuracy, and **early-stop** when validation hits **1.0**. Datasets are **deterministic and persisted** per task.
+CodeBoost synthesizes standalone Python tabular classifiers with an LLM, evaluates them locally, and keeps the accepted program as the deployable artifact.
 
----
+## Main entry points
 
-## Key ideas
-- **Deterministic datasets** per (fn, L, sizes, seed): stored under `datasets/<target>/L<length>/seed<derived>/{train.txt,val.txt,test.txt,meta.json}`.
-- **Strict output contract:** model must return one JSON object: `{"code": "<python function>"}`.
-- **Exec:** code is `exec`’d in a restricted namespace; **not a security sandbox**
-- **Early stop:** perfect validation ⇒ compute test and stop further attempts for that grid point.
+- `boosted/boosted_runner.py`: CodeBoost runner for tabular experiments
+- `baseline_runner.py`: matched classical baseline runner
+- `export_interpretability_artifacts.py`: raw artifact exporter for the interpretability repo
+- `runner.py`: dataset split generation, tabular transforms, and core runner utilities
 
----
+## Canonical paper-facing results
 
-## Setup
-```bash
-conda activate llm_pv
-# Assuming requirements are installed
-export OPENAI_API_KEY=sk-...   # required
-```
+Use `program_synthesis/docs/PAPER_ACCURACY_TABLES.md` as the source of truth for the clean accuracy tables and protocol.
 
-## Minimal run
-```bash
-python program_synthesis/runner.py   --functions fn_a   --lengths 50   --attempts 5   --enable-code-interpreter   --concurrency 1   --timeout 1200
-```
+Current clean headline datasets:
 
-> **Note:** For tabular tasks, you do not need to provide `--lengths` parameter
+- CDC
+- Pima
+- Telco
+- credit_g
 
-## Replicating Paper (Uses Default Config) (Note: Consumes $$)
-```bash
-python program_synthesis/runner.py --enable-code-interpreter
-```
+## Clean protocol summary
 
-## Agent baseline (MLAgentBench)
-Clone [MLAgentBench](https://github.com/JunShern/MLAgentBench) into `external/` and install it once:
+- no dataset names in prompts
+- no dataset-specific descriptions
+- numeric anonymization via coordinate-wise positive affine transforms
+- matched transformed split for CodeBoost and all baselines
+- 5 trials on the same transformed split
 
-```bash
-git clone https://github.com/JunShern/MLAgentBench external/MLAgentBench
-cd external/MLAgentBench
-pip install -e .
-bash install.sh
-cd ../../
-```
+## Notes
 
-```bash
-export OPENAI_API_KEY=sk-...
-export MLAB_LLM=gpt-5
-export MLAB_MAX_STEPS=30
-export NUM_TRIALS=5
-
-python program_synthesis/agent_baseline_runner.py --functions fn_a --lengths 100
-```
-
-### Common flags
-- Grid: `--functions fn_a fn_b ...` • `--lengths 100 50 30 25 20` • `--attempts 5`
-- OpenAI: `--model gpt-5` • `--max-output-tokens 20000`  
-  Reasoning/text: `--reasoning-effort high` • `--verbosity low`  
-  Tools: `--enable-code-interpreter` • `--tool-choice auto|none`
-- Data: `--train-size 100 --val-size 100 --test-size 10000 --seed 42 --dataset-dir datasets`
-- Infra: `--concurrency 5 --timeout 1200`
-- Artifacts: `--out-jsonl results_attempts.jsonl --out-csv results_attempts.csv`
-- Dry run (no API call, print prompt): `--dry-run`
-
-> Function IDs map to targets in `src/target_functions.py` via `EXPERIMENT_FUNCTION_MAPPING` (e.g., `fn_a → parity_all`). Decimal tasks (`prime_decimal*`) receive a decimal problem statement but the line format is the same.
-
----
-
-## Artifacts
-- **`results_attempts.jsonl`** — one record per attempt (prompt, raw text, usage tokens, timings, val/test accuracy, errors).
-- **`results_attempts.csv`** — flat table (prompt/completion/reasoning tokens, `val_acc`, `test_acc`, `stopped_early`, etc.).
-- **`datasets/`** — reused across runs for reproducibility.
-- **`runner.log`** — JSON logs for each step (dataset reuse/generation, attempts, errors, early-stop, artifacts).
-
----
-
-## Safety note
-`exec()` is not a sandbox.
+- Generated reports, CSVs, JSONLs, and run directories are intentionally kept out of version control.
+- The interpretability pipeline lives in the sibling `LLM_ERM_Testing` repo and consumes exported raw artifacts from this repo.

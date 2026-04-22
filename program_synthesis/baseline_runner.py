@@ -55,6 +55,9 @@ TABULAR_FNS = {
     "chronic_kidney_disease",
     "indian_liver_patient",
     "cardiovascular_disease",
+    "credit_g",
+    "loan_prediction",
+    "telco_customer_churn",
 }
 BOOLEAN_FNS = {"parity_all", "parity_first_half", "parity_rand_3", "parity_rand_10", 
                "automata_parity", "palindrome", "dyck2", "patternmatch1", "patternmatch2",
@@ -63,7 +66,8 @@ BOOLEAN_FNS = {"parity_all", "parity_first_half", "parity_rand_3", "parity_rand_
                "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess",
                "pima_diabetes", "heart_disease", "breast_wisconsin", "wdbc_diagnostic",
                "mammographic_mass", "blood_transfusion", "heart_disease_comprehensive",
-               "chronic_kidney_disease", "indian_liver_patient", "cardiovascular_disease"}
+               "chronic_kidney_disease", "indian_liver_patient", "cardiovascular_disease",
+               "credit_g", "loan_prediction", "telco_customer_churn"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("baseline_runner")

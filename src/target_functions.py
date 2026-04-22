@@ -306,6 +306,19 @@ TARGET_FUNCTIONS: Dict[str, Callable[[torch.Tensor, str], torch.Tensor]] = {
     'breast_cancer': tabular_dummy,
     'htru2': tabular_dummy,
     'chess': tabular_dummy,
+    'pima_diabetes': tabular_dummy,
+    'heart_disease': tabular_dummy,
+    'breast_wisconsin': tabular_dummy,
+    'wdbc_diagnostic': tabular_dummy,
+    'mammographic_mass': tabular_dummy,
+    'blood_transfusion': tabular_dummy,
+    'heart_disease_comprehensive': tabular_dummy,
+    'chronic_kidney_disease': tabular_dummy,
+    'indian_liver_patient': tabular_dummy,
+    'cardiovascular_disease': tabular_dummy,
+    'credit_g': tabular_dummy,
+    'loan_prediction': tabular_dummy,
+    'telco_customer_churn': tabular_dummy,
 }
 
 EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
@@ -328,6 +341,19 @@ EXPERIMENT_FUNCTION_MAPPING: Dict[str, str] = {
     "fn_o": "cdc_diabetes",
     "fn_p": "htru2",
     "fn_q": "chess",
+    "fn_r": "pima_diabetes",
+    "fn_s": "heart_disease",
+    "fn_t": "breast_wisconsin",
+    "fn_u": "wdbc_diagnostic",
+    "fn_w": "mammographic_mass",
+    "fn_x": "blood_transfusion",
+    "fn_y": "heart_disease_comprehensive",
+    "fn_z": "chronic_kidney_disease",
+    "fn_ab": "indian_liver_patient",
+    "fn_ac": "cardiovascular_disease",
+    "fn_ad": "credit_g",
+    "fn_ae": "loan_prediction",
+    "fn_af": "telco_customer_churn",
     # Graph problems
     "fn_aa": "graph_has_cycle",
 }
@@ -354,6 +380,58 @@ EXPERIMENT_FUNCTION_METADATA: Dict[str, Dict[str, Any]] = {
     },
     "fn_q": {
         "lengths": [35],
+        "tabular": True
+    },
+    "fn_r": {
+        "lengths": [8],
+        "tabular": True
+    },
+    "fn_s": {
+        "lengths": [13],
+        "tabular": True
+    },
+    "fn_t": {
+        "lengths": [9],
+        "tabular": True
+    },
+    "fn_u": {
+        "lengths": [30],
+        "tabular": True
+    },
+    "fn_w": {
+        "lengths": [4],
+        "tabular": True
+    },
+    "fn_x": {
+        "lengths": [4],
+        "tabular": True
+    },
+    "fn_y": {
+        "lengths": [11],
+        "tabular": True
+    },
+    "fn_z": {
+        "lengths": [24],
+        "tabular": True
+    },
+    "fn_ab": {
+        "lengths": [10],
+        "tabular": True
+    },
+    "fn_ac": {
+        "lengths": [11],
+        "tabular": True
+    },
+    "fn_ad": {
+        "lengths": [20],
+        "tabular": True
+    },
+    "fn_ae": {
+        "lengths": [11],
+        "tabular": True
+    },
+    "fn_af": {
+        "lengths": [19],
         "tabular": True
     },
 }

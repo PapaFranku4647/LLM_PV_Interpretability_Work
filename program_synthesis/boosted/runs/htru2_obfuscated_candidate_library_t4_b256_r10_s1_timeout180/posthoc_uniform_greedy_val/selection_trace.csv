@@ -1,3 +1,0 @@
-step,considered,valid,current_best_val_acc,best_row_index,best_attempt,best_round,best_retry,best_direction,best_alpha,best_weighted_error,best_train_acc,best_val_acc,best_test_acc,best_candidate_code_sha256,selected,stopped_reason
-1,2,2,0.0,0,1,1,1,1,1.0,0.05078125,0.94921875,0.953125,0.923,27679652875b9ad1dc66730a1f670140cf1ef7f0c0ff01504017f22cd87dcdc4,True,
-2,0,0,0.953125,,,,,,,,,,,,,no_candidate

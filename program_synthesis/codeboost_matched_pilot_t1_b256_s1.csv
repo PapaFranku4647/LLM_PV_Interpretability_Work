@@ -1,5 +1,0 @@
-fn,target_name,length,representation,train_size,val_size,test_size,batch_size,boost_rounds,trials,round_retries,accepted_rounds,final_train_acc,final_val_acc,final_test_acc,best_baseline_test_acc,gap_to_best_baseline,api_attempt_count,total_prompt_tokens,total_completion_tokens,total_reasoning_tokens,total_estimated_cost_usd,artifact_dir
-fn_o,cdc_diabetes,21,semantic,256,256,2000,256,1,1,8,1,0.71875,0.6953125,0.706,0.7225,-0.0165,1,28167,1088,536,0.06452425,program_synthesis/boosted/runs/matched_codeboost_pilot_t1_b256_s1/fn_o_semantic
-fn_n,mushroom,20,obfuscated,256,256,2000,256,1,1,8,1,0.69921875,0.58984375,0.5755,0.8528,-0.2773,1,23142,4035,3441,0.0969885,program_synthesis/boosted/runs/matched_codeboost_pilot_t1_b256_s1/fn_n_obfuscated
-fn_p,htru2,8,obfuscated,256,256,2000,256,1,1,8,1,0.91015625,0.90625,0.883,0.934,-0.051,1,13414,12144,11880,0.1934905,program_synthesis/boosted/runs/matched_codeboost_pilot_t1_b256_s1/fn_p_obfuscated
-fn_q,chess,35,obfuscated,256,256,2000,256,1,1,8,1,0.640625,0.6484375,0.5775,0.9615,-0.384,8,295728,29752,27333,0.9340519999999999,program_synthesis/boosted/runs/matched_codeboost_pilot_t1_b256_s1/fn_q_obfuscated

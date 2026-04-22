@@ -220,7 +220,23 @@ class Config:
 
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check", "prime_plus_47", "collatz_steps_parity"}
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+}
 
 
 def build_user_prompt(

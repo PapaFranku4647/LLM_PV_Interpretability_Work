@@ -496,6 +496,9 @@ TABULAR_FNS = {
     "chronic_kidney_disease",
     "indian_liver_patient",
     "cardiovascular_disease",
+    "credit_g",
+    "loan_prediction",
+    "telco_customer_churn",
 }
 
 

@@ -1,3 +1,0 @@
-function,dataset,representation,sampling_strategy,train_size,val_size,test_size,batch_size,requested_rounds,accepted_rounds,final_train_acc,final_val_acc,final_test_acc,best_val_acc,best_val_round_count,api_attempts,total_cost_usd,stopped_reason
-fn_o,cdc_diabetes,semantic,stratified_diverse,10000,2000,10000,64,4,1,0.7043,0.6985,0.7076,0.6985,1,6,0.3032855,no_acceptable_weak_learner_restored_best_val
-fn_o,cdc_diabetes,semantic,stratified_diverse,10000,2000,10000,128,4,1,0.6885,0.68,0.6902,0.68,1,5,0.28484575,val_early_stop_restored_best_val

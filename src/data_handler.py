@@ -34,13 +34,26 @@ logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(name)s - %(level
 logger = logging.getLogger(__name__)
 
 SEMANTIC_BIN_LABELS = ["very low", "low", "medium", "high", "very high"]
+TABULAR_REPRESENTATIONS = {
+    "obfuscated",
+    "anonymous_numeric",
+    "obfuscated_bins",
+    "semantic",
+    "hybrid",
+    "named_numeric",
+}
+
+
+def _normalize_target_token(value: Any) -> str:
+    token = str(value).strip().strip("'\"").lower()
+    return token
 
 
 def _get_tabular_representation(env_name: str) -> str:
     representation = os.getenv(env_name, os.getenv("TABULAR_REPRESENTATION", "obfuscated")).strip().lower()
-    if representation not in {"obfuscated", "semantic", "hybrid", "named_numeric"}:
+    if representation not in TABULAR_REPRESENTATIONS:
         raise ValueError(
-            f"{env_name} must be obfuscated, semantic, hybrid, or named_numeric, got {representation!r}."
+            f"{env_name} must be one of {sorted(TABULAR_REPRESENTATIONS)}, got {representation!r}."
         )
     return representation
 
@@ -1580,9 +1593,10 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
         self._maps_initialized = False
         self._semantic_bins_initialized = False
         self.representation = os.getenv("CDC_DIABETES_REPRESENTATION", "obfuscated").strip().lower()
-        if self.representation not in {"obfuscated", "semantic"}:
+        if self.representation not in {"obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "named_numeric"}:
             raise ValueError(
-                "CDC_DIABETES_REPRESENTATION must be either 'obfuscated' or 'semantic', "
+                "CDC_DIABETES_REPRESENTATION must be one of obfuscated, anonymous_numeric, "
+                "obfuscated_bins, semantic, or named_numeric, "
                 f"got {self.representation!r}."
             )
         self.allow_semantic_fallback = os.getenv("CDC_DIABETES_SEMANTIC_FALLBACK", "1") != "0"
@@ -1826,6 +1840,38 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                 semantic[name] = self._semantic_categorical_value(idx, raw_value)
         return semantic
 
+    def _named_numeric_sample_from_raw(self, raw: Dict[str, str]) -> Dict[str, str]:
+        named: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                named[name] = _compact_float(raw_value)
+            else:
+                named[name] = self._semantic_categorical_value(idx, raw_value)
+        return named
+
+    def _anonymous_numeric_sample_from_raw(self, raw: Dict[str, str]) -> Dict[str, str]:
+        anonymous: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                anonymous[key] = _compact_float(raw_value)
+            else:
+                anonymous[key] = self._category_maps[idx].get(raw_value, "c_unk")
+        return anonymous
+
+    def _obfuscated_bins_sample_from_raw(self, raw: Dict[str, str]) -> Dict[str, str]:
+        binned: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                binned[key] = self._semantic_bin(idx, raw_value)
+            else:
+                binned[key] = self._category_maps[idx].get(raw_value, "c_unk")
+        return binned
+
     def _init_semantic_bins_from_transformed(self, samples: List[Dict[str, str]]) -> None:
         if self._semantic_bins_initialized:
             return
@@ -1858,6 +1904,17 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                 else:
                     semantic[name] = value or "unknown"
         return semantic
+
+    def _obfuscated_bins_sample_from_transformed(self, sample: Dict[str, str]) -> Dict[str, str]:
+        binned: Dict[str, str] = {}
+        for idx, _name in enumerate(self.RAW_FEATURE_NAMES):
+            key = f"x{idx}"
+            value = sample.get(key, "")
+            if idx in self.NUMERIC_INDICES:
+                binned[key] = self._semantic_bin(idx, value)
+            else:
+                binned[key] = value or "c_unk"
+        return binned
 
     def _semantic_dataset_from_transformed_fallback(self) -> Optional[Tuple[List[Dict[str, str]], List[Dict[str, str]]]]:
         transformed_cache = self._load_transformed_bootstrap_cache()
@@ -1902,6 +1959,43 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                 val = raw[name]
                 transformed[new_key] = self._category_maps[idx].get(val, "c_unk")
         return transformed
+
+    def _prepare_from_raw(
+        self,
+        all_raw_samples: List[Dict[str, str]],
+        positive_raw: List[Dict[str, str]],
+        negative_raw: List[Dict[str, str]],
+    ) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        if self.representation == "semantic":
+            self._init_semantic_bins(all_raw_samples)
+            return (
+                [self._semantic_sample_from_raw(s) for s in positive_raw],
+                [self._semantic_sample_from_raw(s) for s in negative_raw],
+            )
+        if self.representation == "named_numeric":
+            return (
+                [self._named_numeric_sample_from_raw(s) for s in positive_raw],
+                [self._named_numeric_sample_from_raw(s) for s in negative_raw],
+            )
+        if self.representation == "anonymous_numeric":
+            self._init_category_maps(all_raw_samples)
+            return (
+                [self._anonymous_numeric_sample_from_raw(s) for s in positive_raw],
+                [self._anonymous_numeric_sample_from_raw(s) for s in negative_raw],
+            )
+        if self.representation == "obfuscated_bins":
+            self._init_category_maps(all_raw_samples)
+            self._init_semantic_bins(all_raw_samples)
+            return (
+                [self._obfuscated_bins_sample_from_raw(s) for s in positive_raw],
+                [self._obfuscated_bins_sample_from_raw(s) for s in negative_raw],
+            )
+
+        self._init_category_maps(all_raw_samples)
+        return (
+            [self._transform_sample(s) for s in positive_raw],
+            [self._transform_sample(s) for s in negative_raw],
+        )
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -1910,14 +2004,11 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
         cached_raw = self._load_cached_raw_dataset()
         if cached_raw is not None:
             all_raw_samples, positive_raw, negative_raw = cached_raw
-            if self.representation == "semantic":
-                self._init_semantic_bins(all_raw_samples)
-                positive_samples = [self._semantic_sample_from_raw(s) for s in positive_raw]
-                negative_samples = [self._semantic_sample_from_raw(s) for s in negative_raw]
-            else:
-                self._init_category_maps(all_raw_samples)
-                positive_samples = [self._transform_sample(s) for s in positive_raw]
-                negative_samples = [self._transform_sample(s) for s in negative_raw]
+            positive_samples, negative_samples = self._prepare_from_raw(
+                all_raw_samples,
+                positive_raw,
+                negative_raw,
+            )
             logger.info(
                 f"Loaded and transformed cached CDC raw dataset with {len(positive_samples)} positive and {len(negative_samples)} negative samples"
             )
@@ -1960,14 +2051,11 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                     negative_raw.append(features)
 
             self._save_cached_raw_dataset(all_raw_samples, positive_raw, negative_raw)
-            if self.representation == "semantic":
-                self._init_semantic_bins(all_raw_samples)
-                positive_samples = [self._semantic_sample_from_raw(s) for s in positive_raw]
-                negative_samples = [self._semantic_sample_from_raw(s) for s in negative_raw]
-            else:
-                self._init_category_maps(all_raw_samples)
-                positive_samples = [self._transform_sample(s) for s in positive_raw]
-                negative_samples = [self._transform_sample(s) for s in negative_raw]
+            positive_samples, negative_samples = self._prepare_from_raw(
+                all_raw_samples,
+                positive_raw,
+                negative_raw,
+            )
 
             logger.info(
                 f"Loaded and transformed {len(positive_samples)} positive and {len(negative_samples)} negative samples"
@@ -1992,6 +2080,15 @@ class CDCDiabetesDataGenerator(BaseDataGenerator):
                 if semantic_fallback is None:
                     raise ConnectionError("Unable to load semantic CDC fallback dataset.")
                 positive_samples, negative_samples = semantic_fallback
+            elif self.representation == "obfuscated_bins":
+                all_transformed_samples = positive_samples + negative_samples
+                self._init_semantic_bins_from_transformed(all_transformed_samples)
+                positive_samples = [self._obfuscated_bins_sample_from_transformed(s) for s in positive_samples]
+                negative_samples = [self._obfuscated_bins_sample_from_transformed(s) for s in negative_samples]
+            elif self.representation in {"anonymous_numeric", "named_numeric"}:
+                logger.warning(
+                    "Using transformed CDC bootstrap cache for a raw-value ablation; numeric values are transformed fallback values."
+                )
             self._data_cache = (positive_samples, negative_samples)
             return self._data_cache
 
@@ -2096,6 +2193,21 @@ class HTRU2DataGenerator(BaseDataGenerator):
             self.SEMANTIC_FEATURE_NAMES[idx]: _compact_float(raw.get(name, ""))
             for idx, name in enumerate(self.RAW_FEATURE_NAMES)
         }
+
+    def _anonymous_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        return {
+            f"x{idx}": _compact_float(raw.get(name, ""))
+            for idx, name in enumerate(self.RAW_FEATURE_NAMES)
+        }
+
+    def _obfuscated_bins_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        return {
+            f"x{idx}": _semantic_bin_from_thresholds(
+                raw.get(name, ""),
+                self._semantic_thresholds.get(idx, []),
+            )
+            for idx, name in enumerate(self.RAW_FEATURE_NAMES)
+        }
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
         if self._data_cache is not None:
@@ -2133,11 +2245,11 @@ class HTRU2DataGenerator(BaseDataGenerator):
         positive_samples = []
         negative_samples = []
 
-        if self.representation in {"semantic", "hybrid"}:
+        if self.representation in {"semantic", "hybrid", "obfuscated_bins"}:
             self._init_semantic_bins(all_raw_samples)
             if self.representation == "hybrid":
                 self._init_numeric_stats(all_raw_samples)
-        elif self.representation != "named_numeric":
+        elif self.representation not in {"named_numeric", "anonymous_numeric"}:
             numeric_values_list = []
             for sample in all_raw_samples:
                 numeric_values = [float(sample[name]) for name in self.RAW_FEATURE_NAMES]
@@ -2153,6 +2265,10 @@ class HTRU2DataGenerator(BaseDataGenerator):
                 features = self._hybrid_sample(raw_sample)
             elif self.representation == "named_numeric":
                 features = self._named_numeric_sample(raw_sample)
+            elif self.representation == "anonymous_numeric":
+                features = self._anonymous_numeric_sample(raw_sample)
+            elif self.representation == "obfuscated_bins":
+                features = self._obfuscated_bins_sample(raw_sample)
             else:
                 features = {}
                 for feat_idx, name in enumerate(self.RAW_FEATURE_NAMES):
@@ -2643,6 +2759,11 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
     ]
     
     NUMERIC_INDICES = {0, 2, 4, 10, 11, 12}
+    SEMANTIC_FEATURE_NAMES = [
+        "age", "workclass", "final_weight", "education", "education_num",
+        "marital_status", "occupation", "relationship", "race", "sex",
+        "capital_gain", "capital_loss", "hours_per_week", "native_country",
+    ]
     
     def __init__(self, sequence_length: int, num_samples: int, device: str = 'cpu'):
         super().__init__(sequence_length, num_samples, device)
@@ -2656,7 +2777,10 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
         self._A_diag = np.random.normal(0, 1, n_numeric)
         self._b = np.random.normal(0, 1, n_numeric)
         self._numeric_indices_list = numeric_indices_list
-        logger.info(f"AdultIncomeDataGenerator initialized for {num_samples} samples")
+        self.representation = _get_tabular_representation("ADULT_INCOME_REPRESENTATION")
+        self._semantic_thresholds: Dict[int, List[float]] = {}
+        self._semantic_bins_initialized = False
+        logger.info(f"AdultIncomeDataGenerator initialized for {num_samples} samples (representation={self.representation})")
     
     def _init_category_maps(self, all_samples: List[Dict[str, str]]) -> None:
         if self._maps_initialized:
@@ -2668,6 +2792,21 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
                 pad_width = len(str(max_categories - 1))
                 self._category_maps[idx] = {v: f"c{i:0{pad_width}d}" for i, v in enumerate(unique_vals)}
         self._maps_initialized = True
+
+    def _init_semantic_bins(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            if idx not in self.NUMERIC_INDICES:
+                continue
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._semantic_thresholds[idx] = _quantile_thresholds(values)
+        self._semantic_bins_initialized = True
     
     def _transform_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
         transformed = {}
@@ -2692,6 +2831,56 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
             else:
                 val = raw[name]
                 transformed[new_key] = self._category_maps[idx].get(val, "c_unk")
+        return transformed
+
+    def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                transformed[semantic_name] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+            else:
+                transformed[semantic_name] = _semantic_token(raw_value)
+        return transformed
+
+    def _named_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                transformed[semantic_name] = _compact_float(raw_value)
+            else:
+                transformed[semantic_name] = _semantic_token(raw_value)
+        return transformed
+
+    def _anonymous_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                transformed[key] = _compact_float(raw_value)
+            else:
+                transformed[key] = self._category_maps[idx].get(raw_value, "c_unk")
+        return transformed
+
+    def _obfuscated_bins_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                transformed[key] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+            else:
+                transformed[key] = self._category_maps[idx].get(raw_value, "c_unk")
         return transformed
     
     def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
@@ -2743,10 +2932,26 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
                 else:
                     negative_raw.append(features)
         
-        self._init_category_maps(all_raw_samples)
-        
-        positive_samples = [self._transform_sample(s) for s in positive_raw]
-        negative_samples = [self._transform_sample(s) for s in negative_raw]
+        if self.representation in {"semantic", "obfuscated_bins"}:
+            self._init_semantic_bins(all_raw_samples)
+        if self.representation in {"obfuscated", "anonymous_numeric", "obfuscated_bins"}:
+            self._init_category_maps(all_raw_samples)
+
+        if self.representation == "semantic":
+            positive_samples = [self._semantic_sample(s) for s in positive_raw]
+            negative_samples = [self._semantic_sample(s) for s in negative_raw]
+        elif self.representation == "named_numeric":
+            positive_samples = [self._named_numeric_sample(s) for s in positive_raw]
+            negative_samples = [self._named_numeric_sample(s) for s in negative_raw]
+        elif self.representation == "anonymous_numeric":
+            positive_samples = [self._anonymous_numeric_sample(s) for s in positive_raw]
+            negative_samples = [self._anonymous_numeric_sample(s) for s in negative_raw]
+        elif self.representation == "obfuscated_bins":
+            positive_samples = [self._obfuscated_bins_sample(s) for s in positive_raw]
+            negative_samples = [self._obfuscated_bins_sample(s) for s in negative_raw]
+        else:
+            positive_samples = [self._transform_sample(s) for s in positive_raw]
+            negative_samples = [self._transform_sample(s) for s in negative_raw]
         
         logger.info(f"Loaded and transformed {len(positive_samples)} positive and {len(negative_samples)} negative samples")
         self._data_cache = (positive_samples, negative_samples)
@@ -2768,6 +2973,625 @@ class AdultIncomeDataGenerator(BaseDataGenerator):
     def _format_input(self, sample: Dict[str, str]) -> np.ndarray:
         formatted = ','.join(f"{k}:{v}" for k, v in sample.items())
         return np.array([formatted])
+
+
+class OpenMLSemanticBinaryDataGenerator(BaseDataGenerator):
+    DATA_ID: int = -1
+    CACHE_FILENAME: str = "openml_semantic.csv"
+    RAW_FEATURE_NAMES: List[str] = []
+    SEMANTIC_FEATURE_NAMES: List[str] = []
+    TARGET_POSITIVE_VALUES: Set[str] = set()
+    NUMERIC_INDICES: Set[int] = set()
+    TARGET_COLUMN: Optional[str] = None
+
+    def __init__(self, sequence_length: int, num_samples: int, device: str = 'cpu'):
+        super().__init__(sequence_length, num_samples, device)
+        if num_samples % 2 != 0:
+            raise ValueError("num_samples must be even for a 50/50 split.")
+        self._data_cache = None
+        self.representation = _get_tabular_representation("OPENML_TABULAR_REPRESENTATION")
+        self._category_maps: Dict[int, Dict[str, str]] = {}
+        self._maps_initialized = False
+        self._semantic_thresholds: Dict[int, List[float]] = {}
+        self._semantic_bins_initialized = False
+        self._normalized_positive_values = {
+            _normalize_target_token(value) for value in self.TARGET_POSITIVE_VALUES
+        }
+        logger.info(
+            f"{self.__class__.__name__} initialized for {num_samples} samples "
+            f"(representation={self.representation})"
+        )
+
+    def _init_category_maps(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._maps_initialized:
+            return
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            if idx not in self.NUMERIC_INDICES:
+                unique_vals = sorted(set(str(s.get(name, "")) for s in all_samples))
+                max_categories = max(1, len(unique_vals))
+                pad_width = len(str(max_categories - 1))
+                self._category_maps[idx] = {v: f"c{i:0{pad_width}d}" for i, v in enumerate(unique_vals)}
+        self._maps_initialized = True
+
+    def _init_semantic_bins(self, all_samples: List[Dict[str, str]]) -> None:
+        if self._semantic_bins_initialized:
+            return
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            if idx not in self.NUMERIC_INDICES:
+                continue
+            values: List[float] = []
+            for sample in all_samples:
+                try:
+                    values.append(float(sample[name]))
+                except (KeyError, TypeError, ValueError):
+                    continue
+            self._semantic_thresholds[idx] = _quantile_thresholds(values)
+        self._semantic_bins_initialized = True
+
+    def _semantic_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                transformed[semantic_name] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+            else:
+                transformed[semantic_name] = _semantic_token(raw_value)
+        return transformed
+
+    def _named_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            semantic_name = self.SEMANTIC_FEATURE_NAMES[idx]
+            raw_value = raw.get(name, "")
+            if idx in self.NUMERIC_INDICES:
+                transformed[semantic_name] = _compact_float(raw_value)
+            else:
+                transformed[semantic_name] = _semantic_token(raw_value)
+        return transformed
+
+    def _anonymous_numeric_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                transformed[key] = _compact_float(raw_value)
+            else:
+                transformed[key] = self._category_maps[idx].get(str(raw_value), "c_unk")
+        return transformed
+
+    def _obfuscated_bins_sample(self, raw: Dict[str, str]) -> Dict[str, str]:
+        transformed: Dict[str, str] = {}
+        for idx, name in enumerate(self.RAW_FEATURE_NAMES):
+            raw_value = raw.get(name, "")
+            key = f"x{idx}"
+            if idx in self.NUMERIC_INDICES:
+                transformed[key] = _semantic_bin_from_thresholds(
+                    raw_value,
+                    self._semantic_thresholds.get(idx, []),
+                )
+            else:
+                transformed[key] = self._category_maps[idx].get(str(raw_value), "c_unk")
+        return transformed
+
+    def _load_dataset(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        if self._data_cache is not None:
+            return self._data_cache
+
+        import pandas as pd
+        from sklearn.datasets import fetch_openml
+
+        cache_dir = os.path.join(os.path.dirname(__file__), '..', 'data_cache')
+        os.makedirs(cache_dir, exist_ok=True)
+        data_path = os.path.join(cache_dir, self.CACHE_FILENAME)
+
+        if os.path.exists(data_path):
+            df = pd.read_csv(data_path)
+        else:
+            dataset = fetch_openml(data_id=self.DATA_ID, as_frame=True, parser="auto")
+            df = dataset.frame.copy()
+            df.to_csv(data_path, index=False)
+            logger.info(f"Saved OpenML dataset {self.DATA_ID} to {data_path}")
+
+        all_raw_samples: List[Dict[str, str]] = []
+        labels: List[int] = []
+        target_col = self.TARGET_COLUMN or ("class" if "class" in df.columns else str(df.columns[-1]))
+        for _, row in df.iterrows():
+            features = {
+                name: ("" if pd.isna(row[name]) else str(row[name]))
+                for name in self.RAW_FEATURE_NAMES
+            }
+            label_token = _normalize_target_token(row[target_col])
+            all_raw_samples.append(features)
+            labels.append(1 if label_token in self._normalized_positive_values else 0)
+
+        if self.representation in {"semantic", "obfuscated_bins"}:
+            self._init_semantic_bins(all_raw_samples)
+        if self.representation in {"obfuscated", "anonymous_numeric", "obfuscated_bins"}:
+            self._init_category_maps(all_raw_samples)
+
+        positive_samples: List[Dict[str, str]] = []
+        negative_samples: List[Dict[str, str]] = []
+        for raw_sample, label in zip(all_raw_samples, labels):
+            if self.representation == "semantic":
+                features = self._semantic_sample(raw_sample)
+            elif self.representation == "named_numeric":
+                features = self._named_numeric_sample(raw_sample)
+            elif self.representation == "obfuscated_bins":
+                features = self._obfuscated_bins_sample(raw_sample)
+            else:
+                features = self._anonymous_numeric_sample(raw_sample)
+            if label == 1:
+                positive_samples.append(features)
+            else:
+                negative_samples.append(features)
+
+        logger.info(
+            f"Loaded {len(positive_samples)} positive and {len(negative_samples)} negative "
+            f"samples for {self.__class__.__name__}"
+        )
+        self._data_cache = (positive_samples, negative_samples)
+        return self._data_cache
+
+    def _generate_raw_data(self) -> Tuple[List[Dict[str, str]], List[Dict[str, str]]]:
+        all_positive, all_negative = self._load_dataset()
+
+        if len(all_positive) < self.num_positive_samples:
+            raise ValueError(f"Not enough positive samples: need {self.num_positive_samples}, have {len(all_positive)}")
+        if len(all_negative) < self.num_negative_samples:
+            raise ValueError(f"Not enough negative samples: need {self.num_negative_samples}, have {len(all_negative)}")
+
+        return (
+            random.sample(all_positive, self.num_positive_samples),
+            random.sample(all_negative, self.num_negative_samples),
+        )
+
+    def _format_input(self, sample: Dict[str, str]) -> np.ndarray:
+        formatted = ','.join(f"{k}:{v}" for k, v in sample.items())
+        return np.array([formatted])
+
+
+class PimaDiabetesDataGenerator(OpenMLSemanticBinaryDataGenerator):
+    DATA_ID = 37
+    CACHE_FILENAME = "openml_pima_diabetes_37.csv"
+    RAW_FEATURE_NAMES = ["preg", "plas", "pres", "skin", "insu", "mass", "pedi", "age"]
+    SEMANTIC_FEATURE_NAMES = [
+        "pregnancies", "plasma_glucose", "diastolic_blood_pressure", "triceps_skinfold",
+        "serum_insulin", "bmi", "diabetes_pedigree", "age",
+    ]
+    TARGET_POSITIVE_VALUES = {"tested_positive"}
+    NUMERIC_INDICES = set(range(8))
+
+
+class HeartDiseaseDataGenerator(OpenMLSemanticBinaryDataGenerator):
+    DATA_ID = 53
+    CACHE_FILENAME = "openml_heart_statlog_53.csv"
+    RAW_FEATURE_NAMES = [
+        "age", "sex", "chest", "resting_blood_pressure", "serum_cholestoral",
+        "fasting_blood_sugar", "resting_electrocardiographic_results",
+        "maximum_heart_rate_achieved", "exercise_induced_angina", "oldpeak",
+        "slope", "number_of_major_vessels", "thal",
+    ]
+    SEMANTIC_FEATURE_NAMES = [
+        "age", "sex", "chest_pain_type", "resting_blood_pressure", "serum_cholesterol",
+        "fasting_blood_sugar", "resting_ecg", "max_heart_rate", "exercise_angina",
+        "st_depression", "st_slope", "major_vessels", "thalassemia",
+    ]
+    TARGET_POSITIVE_VALUES = {"present"}
+    NUMERIC_INDICES = {0, 3, 4, 7, 9, 11}
+
+
+OPENML_BINARY_DATASET_REGISTRY: Dict[str, Dict[str, Any]] = {
+    "breast_wisconsin": {
+        "data_id": 15,
+        "cache_filename": "openml_breast_w_15.csv",
+        "raw_feature_names": [
+            "Clump_Thickness",
+            "Cell_Size_Uniformity",
+            "Cell_Shape_Uniformity",
+            "Marginal_Adhesion",
+            "Single_Epi_Cell_Size",
+            "Bare_Nuclei",
+            "Bland_Chromatin",
+            "Normal_Nucleoli",
+            "Mitoses",
+        ],
+        "semantic_feature_names": [
+            "clump_thickness",
+            "cell_size_uniformity",
+            "cell_shape_uniformity",
+            "marginal_adhesion",
+            "single_epithelial_cell_size",
+            "bare_nuclei",
+            "bland_chromatin",
+            "normal_nucleoli",
+            "mitoses",
+        ],
+        "target_column": "Class",
+        "positive_values": {"malignant"},
+        "numeric_indices": set(range(9)),
+        "openml_url": "https://www.openml.org/search?type=data&id=15",
+    },
+    "wdbc_diagnostic": {
+        "data_id": 1510,
+        "cache_filename": "openml_wdbc_1510.csv",
+        "raw_feature_names": [f"V{i}" for i in range(1, 31)],
+        "semantic_feature_names": [
+            "mean_radius",
+            "mean_texture",
+            "mean_perimeter",
+            "mean_area",
+            "mean_smoothness",
+            "mean_compactness",
+            "mean_concavity",
+            "mean_concave_points",
+            "mean_symmetry",
+            "mean_fractal_dimension",
+            "radius_se",
+            "texture_se",
+            "perimeter_se",
+            "area_se",
+            "smoothness_se",
+            "compactness_se",
+            "concavity_se",
+            "concave_points_se",
+            "symmetry_se",
+            "fractal_dimension_se",
+            "worst_radius",
+            "worst_texture",
+            "worst_perimeter",
+            "worst_area",
+            "worst_smoothness",
+            "worst_compactness",
+            "worst_concavity",
+            "worst_concave_points",
+            "worst_symmetry",
+            "worst_fractal_dimension",
+        ],
+        "target_column": "Class",
+        "positive_values": {"2", "2.0"},
+        "numeric_indices": set(range(30)),
+        "openml_url": "https://www.openml.org/search?type=data&id=1510",
+    },
+    "mammographic_mass": {
+        "data_id": 45557,
+        "cache_filename": "openml_mammographic_mass_45557.csv",
+        "raw_feature_names": ["Age", "Shape", "Margin", "Density"],
+        "semantic_feature_names": ["age", "mass_shape", "mass_margin", "breast_density"],
+        "target_column": "Severity",
+        "positive_values": {"1", "1.0"},
+        "numeric_indices": {0},
+        "openml_url": "https://www.openml.org/search?type=data&id=45557",
+    },
+    "blood_transfusion": {
+        "data_id": 1464,
+        "cache_filename": "openml_blood_transfusion_1464.csv",
+        "raw_feature_names": ["V1", "V2", "V3", "V4"],
+        "semantic_feature_names": [
+            "months_since_last_donation",
+            "donation_frequency",
+            "total_blood_donated_cc",
+            "months_since_first_donation",
+        ],
+        "target_column": "Class",
+        "positive_values": {"1", "1.0"},
+        "numeric_indices": set(range(4)),
+        "openml_url": "https://www.openml.org/search?type=data&id=1464",
+    },
+    "heart_disease_comprehensive": {
+        "data_id": 43672,
+        "cache_filename": "openml_heart_disease_comprehensive_43672.csv",
+        "raw_feature_names": [
+            "age",
+            "sex",
+            "chest_pain_type",
+            "resting_bp_s",
+            "cholesterol",
+            "fasting_blood_sugar",
+            "resting_ecg",
+            "max_heart_rate",
+            "exercise_angina",
+            "oldpeak",
+            "ST_slope",
+        ],
+        "semantic_feature_names": [
+            "age",
+            "sex",
+            "chest_pain_type",
+            "resting_blood_pressure",
+            "cholesterol",
+            "fasting_blood_sugar",
+            "resting_ecg",
+            "max_heart_rate",
+            "exercise_angina",
+            "st_depression",
+            "st_slope",
+        ],
+        "target_column": "target",
+        "positive_values": {"1", "1.0"},
+        "numeric_indices": {0, 3, 4, 7, 9},
+        "openml_url": "https://www.openml.org/search?type=data&id=43672",
+    },
+    "chronic_kidney_disease": {
+        "data_id": 42972,
+        "cache_filename": "openml_chronic_kidney_disease_42972.csv",
+        "raw_feature_names": [
+            "age",
+            "bp",
+            "sg",
+            "al",
+            "su",
+            "rbc",
+            "pc",
+            "pcc",
+            "ba",
+            "bgr",
+            "bu",
+            "sc",
+            "sod",
+            "pot",
+            "hemo",
+            "pcv",
+            "wc",
+            "rc",
+            "htn",
+            "dm",
+            "cad",
+            "appet",
+            "pe",
+            "ane",
+        ],
+        "semantic_feature_names": [
+            "age",
+            "blood_pressure",
+            "specific_gravity",
+            "albumin",
+            "sugar",
+            "red_blood_cells",
+            "pus_cell",
+            "pus_cell_clumps",
+            "bacteria",
+            "blood_glucose_random",
+            "blood_urea",
+            "serum_creatinine",
+            "sodium",
+            "potassium",
+            "hemoglobin",
+            "packed_cell_volume",
+            "white_blood_cell_count",
+            "red_blood_cell_count",
+            "hypertension",
+            "diabetes_mellitus",
+            "coronary_artery_disease",
+            "appetite",
+            "pedal_edema",
+            "anemia",
+        ],
+        "target_column": "classification",
+        "positive_values": {"ckd", "ckdt"},
+        "numeric_indices": {0, 1, 2, 3, 4, 9, 10, 11, 12, 13, 14, 15, 16, 17},
+        "openml_url": "https://www.openml.org/search?type=data&id=42972",
+    },
+    "indian_liver_patient": {
+        "data_id": 43665,
+        "cache_filename": "openml_indian_liver_patient_43665.csv",
+        "raw_feature_names": [
+            "Age",
+            "Gender",
+            "Total_Bilirubin",
+            "Direct_Bilirubin",
+            "Alkaline_Phosphotase",
+            "Alamine_Aminotransferase",
+            "Aspartate_Aminotransferase",
+            "Total_Protiens",
+            "Albumin",
+            "Albumin_and_Globulin_Ratio",
+        ],
+        "semantic_feature_names": [
+            "age",
+            "gender",
+            "total_bilirubin",
+            "direct_bilirubin",
+            "alkaline_phosphotase",
+            "alamine_aminotransferase",
+            "aspartate_aminotransferase",
+            "total_proteins",
+            "albumin",
+            "albumin_globulin_ratio",
+        ],
+        "target_column": "Dataset",
+        "positive_values": {"1", "1.0"},
+        "numeric_indices": {0, 2, 3, 4, 5, 6, 7, 8, 9},
+        "openml_url": "https://www.openml.org/search?type=data&id=43665",
+    },
+    "cardiovascular_disease": {
+        "data_id": 45547,
+        "cache_filename": "openml_cardiovascular_disease_45547.csv",
+        "raw_feature_names": [
+            "age",
+            "gender",
+            "height",
+            "weight",
+            "ap_hi",
+            "ap_lo",
+            "cholesterol",
+            "gluc",
+            "smoke",
+            "alco",
+            "active",
+        ],
+        "semantic_feature_names": [
+            "age_days",
+            "gender",
+            "height_cm",
+            "weight_kg",
+            "systolic_blood_pressure",
+            "diastolic_blood_pressure",
+            "cholesterol_level",
+            "glucose_level",
+            "smoker",
+            "alcohol_use",
+            "physically_active",
+        ],
+        "target_column": "cardio",
+        "positive_values": {"1", "1.0"},
+        "numeric_indices": {0, 2, 3, 4, 5},
+        "openml_url": "https://www.openml.org/search?type=data&id=45547",
+    },
+    "credit_g": {
+        "data_id": 31,
+        "cache_filename": "openml_credit_g_31.csv",
+        "raw_feature_names": [
+            "checking_status",
+            "duration",
+            "credit_history",
+            "purpose",
+            "credit_amount",
+            "savings_status",
+            "employment",
+            "installment_commitment",
+            "personal_status",
+            "other_parties",
+            "residence_since",
+            "property_magnitude",
+            "age",
+            "other_payment_plans",
+            "housing",
+            "existing_credits",
+            "job",
+            "num_dependents",
+            "own_telephone",
+            "foreign_worker",
+        ],
+        "semantic_feature_names": [
+            "checking_status",
+            "loan_duration_months",
+            "credit_history",
+            "loan_purpose",
+            "credit_amount",
+            "savings_status",
+            "employment_status",
+            "installment_commitment",
+            "personal_status",
+            "other_parties",
+            "residence_since",
+            "property_magnitude",
+            "age",
+            "other_payment_plans",
+            "housing",
+            "existing_credits",
+            "job_type",
+            "num_dependents",
+            "own_telephone",
+            "foreign_worker",
+        ],
+        "target_column": "class",
+        "positive_values": {"good"},
+        "numeric_indices": {1, 4, 7, 10, 12, 15, 17},
+        "openml_url": "https://www.openml.org/search?type=data&id=31",
+    },
+    "loan_prediction": {
+        "data_id": 43595,
+        "cache_filename": "openml_loan_prediction_43595.csv",
+        "raw_feature_names": [
+            "Gender",
+            "Married",
+            "Dependents",
+            "Education",
+            "Self_Employed",
+            "ApplicantIncome",
+            "CoapplicantIncome",
+            "LoanAmount",
+            "Loan_Amount_Term",
+            "Credit_History",
+            "Property_Area",
+        ],
+        "semantic_feature_names": [
+            "gender",
+            "married",
+            "dependents",
+            "education",
+            "self_employed",
+            "applicant_income",
+            "coapplicant_income",
+            "loan_amount",
+            "loan_amount_term",
+            "credit_history",
+            "property_area",
+        ],
+        "target_column": "Loan_Status",
+        "positive_values": {"Y"},
+        "numeric_indices": {5, 6, 7, 8},
+        "openml_url": "https://www.openml.org/search?type=data&id=43595",
+    },
+    "telco_customer_churn": {
+        "data_id": 42178,
+        "cache_filename": "openml_telco_customer_churn_42178.csv",
+        "raw_feature_names": [
+            "gender",
+            "SeniorCitizen",
+            "Partner",
+            "Dependents",
+            "tenure",
+            "PhoneService",
+            "MultipleLines",
+            "InternetService",
+            "OnlineSecurity",
+            "OnlineBackup",
+            "DeviceProtection",
+            "TechSupport",
+            "StreamingTV",
+            "StreamingMovies",
+            "Contract",
+            "PaperlessBilling",
+            "PaymentMethod",
+            "MonthlyCharges",
+            "TotalCharges",
+        ],
+        "semantic_feature_names": [
+            "gender",
+            "senior_citizen",
+            "partner",
+            "dependents",
+            "tenure_months",
+            "phone_service",
+            "multiple_lines",
+            "internet_service",
+            "online_security",
+            "online_backup",
+            "device_protection",
+            "tech_support",
+            "streaming_tv",
+            "streaming_movies",
+            "contract_type",
+            "paperless_billing",
+            "payment_method",
+            "monthly_charges",
+            "total_charges",
+        ],
+        "target_column": "Churn",
+        "positive_values": {"yes"},
+        "numeric_indices": {4, 17, 18},
+        "openml_url": "https://www.openml.org/search?type=data&id=42178",
+    },
+}
+
+
+class ConfiguredOpenMLBinaryDataGenerator(OpenMLSemanticBinaryDataGenerator):
+    def __init__(self, dataset_key: str, sequence_length: int, num_samples: int, device: str = 'cpu'):
+        cfg = OPENML_BINARY_DATASET_REGISTRY[dataset_key]
+        self.DATA_ID = int(cfg["data_id"])
+        self.CACHE_FILENAME = str(cfg["cache_filename"])
+        self.RAW_FEATURE_NAMES = list(cfg["raw_feature_names"])
+        self.SEMANTIC_FEATURE_NAMES = list(cfg["semantic_feature_names"])
+        self.TARGET_POSITIVE_VALUES = set(cfg["positive_values"])
+        self.NUMERIC_INDICES = set(int(idx) for idx in cfg["numeric_indices"])
+        self.TARGET_COLUMN = cfg.get("target_column")
+        super().__init__(sequence_length, num_samples, device)
 
 
 def get_data_generator(target_name: str, sequence_length: int, num_samples: int) -> BaseDataGenerator:
@@ -2815,6 +3639,15 @@ def get_data_generator(target_name: str, sequence_length: int, num_samples: int)
     
     if target_name == "chess":
         return ChessDataGenerator(sequence_length, num_samples)
+
+    if target_name == "pima_diabetes":
+        return PimaDiabetesDataGenerator(sequence_length, num_samples)
+
+    if target_name == "heart_disease":
+        return HeartDiseaseDataGenerator(sequence_length, num_samples)
+
+    if target_name in OPENML_BINARY_DATASET_REGISTRY:
+        return ConfiguredOpenMLBinaryDataGenerator(target_name, sequence_length, num_samples)
     
     if target_name in TARGET_FUNCTIONS:
         return BinaryDataGenerator(target_name, sequence_length, num_samples)

@@ -1,4 +1,0 @@
-selector,source_library,selection_mode,allow_inverted_candidates,compiled_candidates,selected_count,final_train_acc,final_val_acc,final_test_acc,stopped_reason
-online_best_ensemble_val,semantic_cdc_candidate_library_b256_r10_s1,online_best_ensemble_val,false,40,1,0.7031,0.695,0.7027,val_early_stop_restored_best_val
-posthoc_weighted_greedy,semantic_cdc_candidate_library_b256_r10_s1,weighted_greedy,true,40,1,0.7031,0.695,0.7027,no_validation_improvement
-posthoc_uniform_greedy,semantic_cdc_candidate_library_b256_r10_s1,uniform_greedy,true,40,6,0.7068,0.7045,0.7062,no_validation_improvement

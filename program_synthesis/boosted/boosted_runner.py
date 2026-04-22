@@ -5,6 +5,7 @@ import ast
 import asyncio
 import csv
 import hashlib
+import io
 import json
 import logging
 import math
@@ -271,6 +272,137 @@ def build_generation_prompt(
     return context_block + prompt
 
 
+def render_sample_file(
+    data_examples: Sequence[str],
+    *,
+    tabular: bool,
+) -> Tuple[str, str]:
+    if not tabular:
+        return "train_batch.txt", "\n".join(data_examples)
+
+    rows: List[Dict[str, Any]] = []
+    fieldnames: List[str] = []
+    for line in data_examples:
+        x_raw, y_raw = line.split("->", 1)
+        parsed = base_runner._parse_tabular_input(x_raw.strip())
+        row: Dict[str, Any] = {}
+        for key, value in parsed.items():
+            if key not in fieldnames:
+                fieldnames.append(key)
+            row[key] = value
+        row["label"] = int(y_raw.strip())
+        rows.append(row)
+
+    fieldnames_with_label = list(fieldnames) + ["label"]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames_with_label, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in fieldnames_with_label})
+    return "train_batch.csv", buffer.getvalue().strip()
+
+
+def build_analysis_prompt(
+    data_examples: Sequence[str],
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    sample_file_name, sample_file_text = render_sample_file(data_examples, tabular=tabular)
+    if tabular:
+        input_description = "labeled tabular data with one row per example"
+        file_block_type = "csv"
+    elif decimal:
+        input_description = f"labeled decimal vectors of length {seq_len}"
+        file_block_type = "text"
+    else:
+        input_description = f"labeled binary vectors of length {seq_len}"
+        file_block_type = "text"
+
+    lines = [
+        f"Analyze the following sample file of {input_description}.",
+        "Do not write code yet.",
+        "Return exactly one valid JSON object with one key, `analysis`.",
+        "The `analysis` value should be an object with these keys:",
+        "- `important_features`: short list of features or positions that appear useful.",
+        "- `threshold_hints`: short list of threshold or category conditions that look predictive.",
+        "- `interaction_hints`: short list of multi-feature patterns that may matter.",
+        "- `candidate_rules`: short list of concise if-then rules that might generalize.",
+        "- `uncertainties`: short list of ambiguous or weak patterns.",
+        "Keep the analysis concise and operational. Do not mention any dataset identity.",
+    ]
+    if tabular:
+        lines.append("Assume the eventual classifier will receive a parsed Python dict keyed by the column names in the file.")
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            f"Sample file: {sample_file_name}",
+            f"```{file_block_type}",
+            sample_file_text,
+            "```",
+            "",
+            "Output contract:",
+            '{"analysis": {"important_features": [...], "threshold_hints": [...], "interaction_hints": [...], "candidate_rules": [...], "uncertainties": [...]}}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_code_from_analysis_prompt(
+    data_examples: Sequence[str],
+    analysis_text: str,
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    sample_file_name, sample_file_text = render_sample_file(data_examples, tabular=tabular)
+    if tabular:
+        input_description = "tabular comma-separated feature:value inputs"
+        file_block_type = "csv"
+    elif decimal:
+        input_description = f"decimal vector inputs of length {seq_len}"
+        file_block_type = "text"
+    else:
+        input_description = f"binary vector inputs of length {seq_len}"
+        file_block_type = "text"
+
+    lines = [
+        f"Use the sample file and the structured analysis below to write a concise Python classifier `f(x)` for {input_description}.",
+        "Return exactly one valid JSON object with one key, `code`, whose value is the complete function.",
+        "Do not include markdown, explanation, analysis, or text before or after the JSON.",
+    ]
+    if tabular:
+        lines.append("At inference time, `x` will be a parsed Python dict keyed by the column names in the file.")
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            f"Sample file: {sample_file_name}",
+            f"```{file_block_type}",
+            sample_file_text,
+            "```",
+            "",
+            "Structured analysis:",
+            "```json",
+            (analysis_text or '{"analysis": {}}').strip(),
+            "```",
+            "",
+            "Rules:",
+            "- Keep the implementation concise and general.",
+            "- Use only built-in Python.",
+            "- Do not add file I/O, network calls, training loops, or lookup tables keyed by full rows.",
+            "- Prefer simple thresholds, categories, and short feature interactions that transfer beyond the batch.",
+            '- Output only this JSON shape: {"code": "def f(x):\\n    ..."}',
+        ]
+    )
+    return "\n".join(lines)
+
+
 def get_model_pricing(model_name: Optional[str]) -> Optional[Dict[str, float | str]]:
     lowered = (model_name or "").strip().lower()
     if not lowered:
@@ -394,6 +526,7 @@ class BoostConfig:
     cdc_representation: str = "obfuscated"
     dataset_context_mode: str = "schema"
     tabular_numeric_transform: str = "none"
+    prompt_strategy: str = "direct"
     accept_best_on_failure: bool = False
     best_fallback_max_weak_error: float = 0.499
     sampling_strategy: str = "weighted_random"
@@ -1625,10 +1758,84 @@ async def run_boosting_trial(
                 sampled_unique = len(set(sampled_indices))
 
             api_attempt_start = attempt_counter + 1
-            attempt_counter += 1
-            if dataset_context:
-                initial_prompt = build_generation_prompt(
+            candidate_source_history: List[Dict[str, Any]] = []
+            chain_prompt_tokens = 0
+            chain_completion_tokens = 0
+            chain_reasoning_tokens = 0
+            chain_input_cost = 0.0
+            chain_output_cost = 0.0
+            chain_total_cost = 0.0
+            chain_tool_uses = 0
+            chain_duration_ms = 0
+            request_model = None
+            returned_model = None
+            pricing_model = None
+            input_rate_per_million = None
+            output_rate_per_million = None
+            code_attempt_number = api_attempt_start
+
+            def merge_accounting(accounting: Dict[str, Any]) -> None:
+                nonlocal chain_prompt_tokens
+                nonlocal chain_completion_tokens
+                nonlocal chain_reasoning_tokens
+                nonlocal chain_input_cost
+                nonlocal chain_output_cost
+                nonlocal chain_total_cost
+                nonlocal chain_tool_uses
+                nonlocal chain_duration_ms
+                nonlocal request_model
+                nonlocal returned_model
+                nonlocal pricing_model
+                nonlocal input_rate_per_million
+                nonlocal output_rate_per_million
+                chain_prompt_tokens += int(accounting["prompt_tokens"] or 0)
+                chain_completion_tokens += int(accounting["completion_tokens"] or 0)
+                chain_reasoning_tokens += int(accounting["reasoning_tokens"] or 0)
+                chain_input_cost += float(accounting["estimated_input_cost_usd"] or 0.0)
+                chain_output_cost += float(accounting["estimated_output_cost_usd"] or 0.0)
+                chain_total_cost += float(accounting["estimated_total_cost_usd"] or 0.0)
+                chain_tool_uses += int(accounting["tool_uses"] or 0)
+                chain_duration_ms += int(accounting["duration_ms"] or 0)
+                request_model = accounting["request_model"] or request_model
+                returned_model = accounting["returned_model"] or returned_model
+                pricing_model = accounting["pricing_model"] or pricing_model
+                input_rate_per_million = accounting["input_rate_per_million"] or input_rate_per_million
+                output_rate_per_million = accounting["output_rate_per_million"] or output_rate_per_million
+
+            if cfg.prompt_strategy == "analyze_then_code":
+                attempt_counter += 1
+                analysis_prompt = build_analysis_prompt(
                     list(sampled_lines),
+                    length,
+                    is_decimal,
+                    is_tabular,
+                    dataset_context=dataset_context,
+                )
+                analysis_res = await client._call_once(
+                    fn,
+                    length,
+                    attempt_counter,
+                    sampled_lines,
+                    decimal=is_decimal,
+                    tabular=is_tabular,
+                    prompt_override=analysis_prompt,
+                )
+                analysis_text = analysis_res.get("text") or ""
+                analysis_accounting = add_response_accounting(analysis_res)
+                merge_accounting(analysis_accounting)
+                append_candidate_source_event(
+                    candidate_source_history,
+                    stage="analysis",
+                    api_attempt=attempt_counter,
+                    code=None,
+                    response_text=analysis_text,
+                    status="analysis_generated" if analysis_text else "analysis_empty",
+                )
+
+                attempt_counter += 1
+                initial_prompt = build_code_from_analysis_prompt(
+                    list(sampled_lines),
+                    analysis_text,
                     length,
                     is_decimal,
                     is_tabular,
@@ -1643,39 +1850,48 @@ async def run_boosting_trial(
                     tabular=is_tabular,
                     prompt_override=initial_prompt,
                 )
+                code_attempt_number = attempt_counter
             else:
-                res = await client._call_once(
-                    fn,
-                    length,
-                    attempt_counter,
-                    sampled_lines,
-                    decimal=is_decimal,
-                    tabular=is_tabular,
-                )
+                attempt_counter += 1
+                if dataset_context:
+                    initial_prompt = build_generation_prompt(
+                        list(sampled_lines),
+                        length,
+                        is_decimal,
+                        is_tabular,
+                        dataset_context=dataset_context,
+                    )
+                    res = await client._call_once(
+                        fn,
+                        length,
+                        attempt_counter,
+                        sampled_lines,
+                        decimal=is_decimal,
+                        tabular=is_tabular,
+                        prompt_override=initial_prompt,
+                    )
+                    code_attempt_number = attempt_counter
+                else:
+                    res = await client._call_once(
+                        fn,
+                        length,
+                        attempt_counter,
+                        sampled_lines,
+                        decimal=is_decimal,
+                        tabular=is_tabular,
+                    )
+                    code_attempt_number = attempt_counter
 
             response_text = res.get("text") or ""
             code_str = base_runner.extract_code_from_output(response_text)
             first_accounting = add_response_accounting(res)
-            chain_prompt_tokens = int(first_accounting["prompt_tokens"] or 0)
-            chain_completion_tokens = int(first_accounting["completion_tokens"] or 0)
-            chain_reasoning_tokens = int(first_accounting["reasoning_tokens"] or 0)
-            chain_input_cost = float(first_accounting["estimated_input_cost_usd"] or 0.0)
-            chain_output_cost = float(first_accounting["estimated_output_cost_usd"] or 0.0)
-            chain_total_cost = float(first_accounting["estimated_total_cost_usd"] or 0.0)
-            chain_tool_uses = int(first_accounting["tool_uses"] or 0)
-            chain_duration_ms = int(first_accounting["duration_ms"] or 0)
-            request_model = first_accounting["request_model"]
-            returned_model = first_accounting["returned_model"]
-            pricing_model = first_accounting["pricing_model"]
-            input_rate_per_million = first_accounting["input_rate_per_million"]
-            output_rate_per_million = first_accounting["output_rate_per_million"]
+            merge_accounting(first_accounting)
             batch_examples = [train_examples[idx] for idx in sampled_indices]
             repair_history: List[Dict[str, Any]] = []
-            candidate_source_history: List[Dict[str, Any]] = []
             append_candidate_source_event(
                 candidate_source_history,
                 stage="initial",
-                api_attempt=api_attempt_start,
+                api_attempt=code_attempt_number,
                 code=code_str,
                 response_text=response_text,
             )
@@ -1736,6 +1952,7 @@ async def run_boosting_trial(
                 "candidate_selection": cfg.candidate_selection,
                 "dataset_context_mode": cfg.dataset_context_mode,
                 "tabular_numeric_transform": cfg.tabular_numeric_transform,
+                "prompt_strategy": cfg.prompt_strategy,
                 "candidate_selected": False,
                 "candidate_reject_reason": None,
                 "candidate_ensemble_train_acc": None,
@@ -2420,6 +2637,7 @@ async def run_boosting_trial(
         "cdc_representation": cfg.cdc_representation,
         "dataset_context_mode": cfg.dataset_context_mode,
         "tabular_numeric_transform": cfg.tabular_numeric_transform,
+        "prompt_strategy": cfg.prompt_strategy,
         "accept_best_on_failure": cfg.accept_best_on_failure,
         "best_fallback_max_weak_error": cfg.best_fallback_max_weak_error,
         "sampling_strategy": cfg.sampling_strategy,
@@ -2585,6 +2803,7 @@ def build_boost_config(args: argparse.Namespace) -> BoostConfig:
         cdc_representation=cdc_representation,
         dataset_context_mode=getattr(args, "dataset_context_mode", "schema"),
         tabular_numeric_transform=getattr(args, "tabular_numeric_transform", "none"),
+        prompt_strategy=getattr(args, "prompt_strategy", "direct"),
         accept_best_on_failure=args.accept_best_on_failure,
         best_fallback_max_weak_error=args.best_fallback_max_weak_error,
         sampling_strategy=args.sampling_strategy,
@@ -2714,6 +2933,7 @@ async def main_async(args: argparse.Namespace) -> int:
                                 "cdc_representation": boost_cfg.cdc_representation,
                                 "dataset_context_mode": boost_cfg.dataset_context_mode,
                                 "tabular_numeric_transform": boost_cfg.tabular_numeric_transform,
+                                "prompt_strategy": boost_cfg.prompt_strategy,
                                 "accept_best_on_failure": boost_cfg.accept_best_on_failure,
                                 "best_fallback_max_weak_error": boost_cfg.best_fallback_max_weak_error,
                                 "dataset_dir": base_cfg.dataset_dir,
@@ -2784,6 +3004,12 @@ def parse_args() -> argparse.Namespace:
         choices=["none", "positive_affine"],
         default=os.getenv("TABULAR_NUMERIC_TRANSFORM", "none"),
         help="Optional monotone affine anonymization applied to numeric tabular fields when they are surfaced explicitly.",
+    )
+    p.add_argument(
+        "--prompt-strategy",
+        choices=["direct", "analyze_then_code"],
+        default=os.getenv("PROMPT_STRATEGY", "direct"),
+        help="How to generate code from the sampled batch. analyze_then_code runs a structured analysis step first, then synthesizes code from the same batch plus that analysis.",
     )
     p.add_argument(
         "--no-cdc-semantic-transformed-fallback",

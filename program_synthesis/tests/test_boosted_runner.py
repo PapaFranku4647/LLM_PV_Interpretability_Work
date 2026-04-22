@@ -263,6 +263,38 @@ class BoostedMathTests(unittest.TestCase):
         self.assertIn("HighBP:yes,BMI:high,Age:medium -> 1", prompt)
         self.assertIn('{"code": "<python function>"}', prompt)
 
+    def test_analysis_prompt_renders_tabular_sample_as_csv(self) -> None:
+        prompt = boosted_runner.build_analysis_prompt(
+            ["HighBP:yes,BMI:high,Age:medium -> 1"],
+            seq_len=21,
+            decimal=False,
+            tabular=True,
+            dataset_context=boosted_runner.GENERIC_SEMANTIC_SCHEMA_CONTEXT,
+        )
+
+        self.assertIn("Sample file: train_batch.csv", prompt)
+        self.assertIn("HighBP,BMI,Age,label", prompt)
+        self.assertIn("yes,high,medium,1", prompt)
+        self.assertNotIn("Dataset:", prompt)
+        self.assertNotIn("diabetes indicators", prompt.lower())
+        self.assertIn('"analysis"', prompt)
+
+    def test_code_from_analysis_prompt_includes_structured_analysis_and_json_contract(self) -> None:
+        prompt = boosted_runner.build_code_from_analysis_prompt(
+            ["glucose:140,bmi:31.5,pregnancies:2 -> 1"],
+            '{"analysis": {"important_features": ["glucose", "bmi"], "candidate_rules": ["high glucose and elevated bmi suggests class 1"]}}',
+            seq_len=8,
+            decimal=False,
+            tabular=True,
+            dataset_context=boosted_runner.GENERIC_NAMED_NUMERIC_SCHEMA_CONTEXT,
+        )
+
+        self.assertIn("Structured analysis:", prompt)
+        self.assertIn("train_batch.csv", prompt)
+        self.assertIn("glucose,bmi,pregnancies,label", prompt)
+        self.assertIn('"candidate_rules"', prompt)
+        self.assertIn('{"code": "def f(x):\\n    ..."}', prompt)
+
     def test_schema_contexts_are_selected_by_tabular_representation(self) -> None:
         self.assertIn(
             "named features",
@@ -389,6 +421,99 @@ class BoostedMathTests(unittest.TestCase):
         self.assertTrue(attempt_rows[0]["accepted"])
         self.assertTrue(attempt_rows[0]["accepted_best_on_failure"])
         self.assertFalse(attempt_rows[1]["accepted"])
+
+    def test_run_boosting_trial_analyze_then_code_uses_two_calls(self) -> None:
+        class StubClient:
+            def __init__(self) -> None:
+                self.cfg = type("Cfg", (), {"seed": 7, "model": "gpt-5"})()
+                self.prompts: list[str] = []
+
+            async def _call_once(self, fn, L, attempt_idx, data_examples, decimal, tabular=False, prompt_override=None):
+                self.prompts.append(prompt_override or "")
+                if attempt_idx == 1:
+                    text = '{"analysis": {"important_features": ["x0"], "candidate_rules": ["x0 > 0 -> 1"]}}'
+                else:
+                    text = json.dumps({"code": "def f(x):\n    return 1 if float(x['x0']) > 0 else 0\n"})
+                return {
+                    "fn": fn,
+                    "length": L,
+                    "attempt": attempt_idx,
+                    "text": text,
+                    "usage": {"prompt_tokens": 10, "completion_tokens": 5},
+                    "duration_ms": 1,
+                    "tool_uses": 0,
+                }
+
+        train_lines = [
+            "x0:1 -> 1",
+            "x0:2 -> 1",
+            "x0:-1 -> 0",
+            "x0:-2 -> 0",
+        ]
+        cfg = boosted_runner.BoostConfig(
+            boost_rounds=1,
+            batch_sizes=[4],
+            round_retries=1,
+            max_weak_error=0.499,
+            min_alpha=1e-6,
+            num_trials=1,
+            stop_on_perfect_train=False,
+            resample_each_retry=False,
+            output_dir="unused",
+            prompt_strategy="analyze_then_code",
+        )
+        log = logging.getLogger("boosted_runner_test")
+        log.handlers[:] = [logging.NullHandler()]
+        log.propagate = False
+        stub_client = StubClient()
+
+        with mock.patch.object(
+            boosted_runner,
+            "sample_training_batch",
+            return_value=(
+                [0, 1, 2, 3],
+                list(train_lines),
+                {
+                    "sampling_strategy": "weighted_random",
+                    "sampling_mistake_count": 0,
+                    "sampling_boundary_count": 0,
+                    "sampling_anchor_count": 0,
+                    "sampling_fill_count": 4,
+                    "sampling_positive_count": 2,
+                    "sampling_negative_count": 2,
+                    "sampling_score_eval_errors": 0,
+                },
+            ),
+        ):
+            summary, attempt_rows, accepted_rounds = self._run_async(
+                boosted_runner.run_boosting_trial(
+                    client=stub_client,
+                    log=log,
+                    fn="fn_o",
+                    length=21,
+                    target_name="cdc_diabetes",
+                    train_lines=train_lines,
+                    val_lines=[],
+                    test_lines=list(train_lines),
+                    is_decimal=False,
+                    is_tabular=True,
+                    cfg=cfg,
+                    batch_size=4,
+                    trial_idx=1,
+                )
+            )
+
+        self.assertEqual(summary["api_attempt_count"], 2)
+        self.assertEqual(summary["prompt_strategy"], "analyze_then_code")
+        self.assertEqual(len(accepted_rounds), 1)
+        self.assertAlmostEqual(summary["final_test_acc"], 1.0, places=10)
+        self.assertEqual(attempt_rows[0]["api_attempt_start"], 1)
+        self.assertEqual(attempt_rows[0]["api_attempt_end"], 2)
+        self.assertEqual(attempt_rows[0]["prompt_strategy"], "analyze_then_code")
+        self.assertEqual(attempt_rows[0]["candidate_source_history"][0]["stage"], "analysis")
+        self.assertEqual(attempt_rows[0]["candidate_source_history"][1]["stage"], "initial")
+        self.assertIn("Sample file: train_batch.csv", stub_client.prompts[0])
+        self.assertIn("Structured analysis:", stub_client.prompts[1])
 
     def test_semantic_cdc_generator_uses_raw_feature_names_and_bins(self) -> None:
         def raw_sample(label_shift: int) -> dict[str, str]:
