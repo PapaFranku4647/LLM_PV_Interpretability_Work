@@ -31,11 +31,11 @@
 # =====================================================================================
 
 from __future__ import annotations
-import os, sys, json, csv, time, argparse, asyncio, re, ast, random, tempfile, shutil, hashlib
-import httpx
+import os, sys, json, csv, time, argparse, asyncio, re, ast, textwrap, random, tempfile, hashlib, inspect
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional, Tuple, Mapping, Callable
 import logging
+import numpy as np
 
 import os
 import sys
@@ -43,22 +43,54 @@ current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
+
+def _load_dotenv_file(path: str) -> bool:
+    if not path or not os.path.isfile(path):
+        return False
+    loaded_any = False
+    with open(path, "r", encoding="utf-8") as handle:
+        for raw_line in handle:
+            line = raw_line.strip()
+            if not line or line.startswith("#"):
+                continue
+            if line.startswith("export "):
+                line = line[len("export "):].strip()
+            if "=" not in line:
+                continue
+            key, value = line.split("=", 1)
+            key = key.strip()
+            value = value.strip()
+            if not key or key in os.environ:
+                continue
+            if len(value) >= 2 and value[0] == value[-1] and value[0] in {"'", '"'}:
+                value = value[1:-1]
+            os.environ[key] = value
+            loaded_any = True
+    return loaded_any
+
+
+def _bootstrap_env() -> None:
+    candidate_paths = []
+    for candidate in (
+        os.path.join(os.getcwd(), ".env"),
+        os.path.join(parent_dir, ".env"),
+        os.path.join(os.path.dirname(parent_dir), ".env"),
+    ):
+        norm = os.path.abspath(candidate)
+        if norm not in candidate_paths:
+            candidate_paths.append(norm)
+    for candidate in candidate_paths:
+        _load_dotenv_file(candidate)
+
+
+_bootstrap_env()
+
+from openai import AsyncOpenAI, AsyncAzureOpenAI
+
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
 from prompt_variants import get_prompt_variant_suffix
 from code_normalizer import normalize_generated_code, sanitize_generated_code
-from llm_client import (
-    build_async_client,
-    build_chat_completions_body,
-    call_llm_async,
-    estimate_usage_cost as shared_estimate_usage_cost,
-    flatten_cost_fields as shared_flatten_cost_fields,
-    infer_default_api_mode,
-    resolve_api_key_from_env,
-    resolve_api_version_from_env,
-    resolve_azure_endpoint_from_env,
-    resolve_default_model_from_env,
-)
 
 external_get_accuracy = None
 
@@ -130,6 +162,49 @@ def normalize_usage(usage_obj) -> Dict[str, Any]:
     return u
 
 
+def normalize_gemini_usage(usage_obj: Any) -> Dict[str, Any]:
+    if usage_obj is None:
+        return {}
+    # google-genai returns usage metadata as attributes.
+    usage: Dict[str, Any] = {
+        "prompt_tokens": getattr(usage_obj, "prompt_token_count", None),
+        "completion_tokens": getattr(usage_obj, "candidates_token_count", None),
+        "total_tokens": getattr(usage_obj, "total_token_count", None),
+        "reasoning_tokens": getattr(usage_obj, "thoughts_token_count", None),
+    }
+    cached_tokens = getattr(usage_obj, "cached_content_token_count", None)
+    if cached_tokens is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": cached_tokens}
+        usage["cached_tokens"] = cached_tokens
+    return {k: v for k, v in usage.items() if v is not None}
+
+
+def normalize_anthropic_usage(usage_obj: Any) -> Dict[str, Any]:
+    if usage_obj is None:
+        return {}
+    if isinstance(usage_obj, Mapping):
+        usage: Dict[str, Any] = {
+            "prompt_tokens": usage_obj.get("input_tokens"),
+            "completion_tokens": usage_obj.get("output_tokens"),
+            "cached_tokens": usage_obj.get("cache_read_input_tokens"),
+        }
+        if usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
+            usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+        if usage.get("cached_tokens") is not None:
+            usage["prompt_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+        return {k: v for k, v in usage.items() if v is not None}
+    usage: Dict[str, Any] = {
+        "prompt_tokens": getattr(usage_obj, "input_tokens", None),
+        "completion_tokens": getattr(usage_obj, "output_tokens", None),
+        "cached_tokens": getattr(usage_obj, "cache_read_input_tokens", None),
+    }
+    if usage.get("prompt_tokens") is not None and usage.get("completion_tokens") is not None:
+        usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+    if usage.get("cached_tokens") is not None:
+        usage["prompt_tokens_details"] = {"cached_tokens": usage["cached_tokens"]}
+    return {k: v for k, v in usage.items() if v is not None}
+
+
 # =========================
 # Logging
 # =========================
@@ -164,9 +239,20 @@ def setup_logger(level: str = "INFO") -> logging.Logger:
     return logger
 
 
-# =========================
-# Config
-# =========================
+def _env_first(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value is not None and str(value).strip():
+            return str(value).strip()
+    return default
+
+
+def _env_csv_first(*names: str) -> List[str]:
+    raw = _env_first(*names)
+    if not raw:
+        return []
+    return [part.strip() for part in str(raw).split(",") if part.strip()]
+
 
 def _env_flag(name: str, default: bool) -> bool:
     value = os.getenv(name)
@@ -175,22 +261,58 @@ def _env_flag(name: str, default: bool) -> bool:
     return value.strip().lower() not in {"0", "false", "off", "no", ""}
 
 
+# =========================
+# Config
+# =========================
+
 @dataclass
 class Config:
-    api_key: str = field(default_factory=resolve_api_key_from_env)
-    api_base_url: str = os.getenv("API_BASE_URL", "").strip()
-    azure_endpoint: str = field(default_factory=resolve_azure_endpoint_from_env)
-    api_version: str = field(default_factory=resolve_api_version_from_env)
-    api_mode: str = field(default_factory=infer_default_api_mode)
-    model: str = field(default_factory=lambda: resolve_default_model_from_env("gpt-5"))
+    api_key: str = field(default_factory=lambda: _env_first(
+        "OPENAI_API_KEY",
+        "TAMU_API_KEY",
+        "TAMUS_AI_CHAT_API_KEY",
+        "AZURE_OPENAI_API_KEY",
+    ))
+    api_key_explicit: bool = False
+    api_base_url: str = field(default_factory=lambda: _env_first(
+        "OPENAI_BASE_URL",
+        "API_BASE_URL",
+        "TAMU_API_BASE_URL",
+    ))
+    azure_endpoint: str = field(default_factory=lambda: _env_first(
+        "AZURE_OPENAI_ENDPOINT",
+        "TAMU_AZURE_ENDPOINT",
+        "TAMU_API_ENDPOINT",
+        "DPF_URL",
+    ))
+    api_version: str = field(default_factory=lambda: _env_first(
+        "OPENAI_API_VERSION",
+        "AZURE_OPENAI_API_VERSION",
+        "TAMU_API_VERSION",
+    ))
+    gemini_api_key: str = field(default_factory=lambda: os.getenv("GEMINI_API_KEY", ""))
+    anthropic_api_key: str = field(default_factory=lambda: os.getenv("ANTHROPIC_API_KEY", ""))
+    model: str = os.getenv("OPENAI_MODEL", "gpt-5")
+    provider: str = os.getenv("PROVIDER", "auto")
+    api_mode: str = field(default_factory=lambda: os.getenv("API_MODE", "responses"))
     max_output_tokens: int = int(os.getenv("MAX_OUTPUT_TOKENS", "20000"))
     reasoning_effort: str = os.getenv("REASONING_EFFORT", "high")
+    thinking_level: str = os.getenv("THINKING_LEVEL", os.getenv("REASONING_EFFORT", "high"))
+    gemini_api_version: str = os.getenv("GEMINI_API_VERSION", "v1beta")
     verbosity: Optional[str] = os.getenv("TEXT_VERBOSITY", "low")
+    temperature: Optional[float] = field(default_factory=lambda: float(os.getenv("TEMPERATURE")) if os.getenv("TEMPERATURE") else None)
+    top_p: Optional[float] = field(default_factory=lambda: float(os.getenv("TOP_P")) if os.getenv("TOP_P") else None)
     tool_choice: str = os.getenv("TOOL_CHOICE", "auto")
-    sanitize_generated_code: bool = field(default_factory=lambda: _env_flag("SANITIZE_GENERATED_CODE", True))
+    sanitize_generated_code: bool = _env_flag("SANITIZE_GENERATED_CODE", True)
     prompt_variant: str = os.getenv("PROMPT_VARIANT", "standard").lower()
+    allow_tools: bool = os.getenv("ALLOW_TOOLS", "1") == "1"
     enable_code_interpreter: bool = os.getenv("ENABLE_CODE_INTERPRETER", "0") == "1"
     enable_thinking: bool = os.getenv("ENABLE_THINKING", "0") == "1"
+    anthropic_max_tokens: int = int(os.getenv("ANTHROPIC_MAX_TOKENS", "40000"))
+    hf_device_map: str = os.getenv("HF_DEVICE_MAP", "auto")
+    hf_torch_dtype: str = os.getenv("HF_TORCH_DTYPE", "auto")
+    hf_trust_remote_code: bool = os.getenv("HF_TRUST_REMOTE_CODE", "1") == "1"
+    hf_attn_implementation: Optional[str] = os.getenv("HF_ATTN_IMPLEMENTATION")
 
     dry_run: bool = os.getenv("DRY_RUN", "0") == "1"
     concurrency: int = int(os.getenv("CONCURRENCY", "5"))
@@ -203,6 +325,7 @@ class Config:
         "fn_m", "fn_n", "fn_o", "fn_p", "fn_q", "fn_aa",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
+    lengths_explicit: bool = False
     attempts: int = int(os.getenv("ATTEMPTS", "5"))
     num_trials: int = int(os.getenv("NUM_TRIALS", "5"))
 
@@ -228,13 +351,13 @@ def build_user_prompt(
     decimal: bool = False,
     tabular: bool = False,
     prompt_variant: str = "standard",
+    strict_json_only: bool = False,
 ) -> str:
     if tabular:
         problem_statement = (
             f"**Problem Statement:**\n"
             f"Given tabular input data (comma-separated feature:value pairs) and their corresponding scalar binary outputs ('0' or '1'), "
             f"find a concise Python function `f(x)` that accurately approximates the underlying relationship. "
-            f"The argument `x` is a Python dict mapping feature names to values (e.g. x['x3'] gives a float, x['x0'] gives a category string like 'c1'). "
             f"The function should not be a trainable model, but a direct logical or mathematical representation of the target function."
         )
     elif decimal:
@@ -253,11 +376,120 @@ def build_user_prompt(
         )
     prompt = f"{problem_statement}\n"
     prompt += "**Data Examples:**\n```\n" + "\n".join(data_examples) + "\n```\n\n"
-    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}. Keep the function concise (under 30 lines, no comments). Output the JSON immediately with no other text.'
+    prompt += 'You must output ONLY a single JSON object: {"code": "<python function>"}.\n'
     variant_suffix = get_prompt_variant_suffix(prompt_variant)
     if variant_suffix:
-        prompt += "\n\n" + variant_suffix
+        prompt += "\n" + variant_suffix + "\n"
+    if strict_json_only:
+        prompt += (
+            "Do NOT include analysis, reasoning, markdown, or prose.\n"
+            "Return the JSON immediately. If uncertain, still return your best single function."
+        )
     return prompt
+
+
+TABULAR_NUMERIC_TRANSFORM_MODES = {"none", "positive_affine"}
+
+
+def get_tabular_numeric_transform_mode() -> str:
+    mode = os.getenv("TABULAR_NUMERIC_TRANSFORM", "none").strip().lower()
+    if mode not in TABULAR_NUMERIC_TRANSFORM_MODES:
+        raise ValueError(
+            f"TABULAR_NUMERIC_TRANSFORM must be one of {sorted(TABULAR_NUMERIC_TRANSFORM_MODES)}, got {mode!r}."
+        )
+    return mode
+
+
+def tabular_numeric_transform_suffix(mode: str) -> str:
+    return "" if mode == "none" else f"numeric_transform_{mode}"
+
+
+def _infer_numeric_feature_keys(generator: Any) -> set[str]:
+    representation = getattr(generator, "representation", "obfuscated")
+    numeric_indices = sorted(getattr(generator, "NUMERIC_INDICES", set()))
+    semantic_feature_names = list(getattr(generator, "SEMANTIC_FEATURE_NAMES", []))
+
+    if representation in {"semantic", "obfuscated_bins"}:
+        return set()
+    if representation == "hybrid":
+        return {
+            f"{semantic_feature_names[idx]}_z"
+            for idx in numeric_indices
+            if idx < len(semantic_feature_names)
+        }
+    if representation == "named_numeric":
+        return {
+            semantic_feature_names[idx]
+            for idx in numeric_indices
+            if idx < len(semantic_feature_names)
+        }
+    return {f"x{idx}" for idx in numeric_indices}
+
+
+def _split_tabular_pairs(line: str) -> list[tuple[str, str]]:
+    pairs: list[tuple[str, str]] = []
+    for part in line.split(","):
+        item = part.strip()
+        if not item or ":" not in item:
+            continue
+        key, value = item.split(":", 1)
+        pairs.append((key.strip(), value.strip()))
+    return pairs
+
+
+def _format_numeric_token(value: float) -> str:
+    return f"{value:.6g}"
+
+
+def apply_tabular_numeric_transform(
+    dataset: list[dict[str, Any]],
+    *,
+    generator: Any,
+    seed: int,
+    mode: str,
+) -> list[dict[str, Any]]:
+    if mode == "none":
+        return dataset
+    if mode != "positive_affine":
+        raise ValueError(f"Unsupported tabular numeric transform mode: {mode!r}")
+
+    numeric_keys = _infer_numeric_feature_keys(generator)
+    if not numeric_keys:
+        return dataset
+
+    rng = np.random.default_rng(seed)
+    feature_params = {
+        key: (
+            float(rng.uniform(0.5, 2.0)),
+            float(rng.normal(0.0, 1.0)),
+        )
+        for key in sorted(numeric_keys)
+    }
+
+    transformed_dataset: list[dict[str, Any]] = []
+    for sample in dataset:
+        raw_input = sample["Input"]
+        if isinstance(raw_input, np.ndarray):
+            input_line = str(raw_input[0])
+        else:
+            input_line = str(raw_input)
+        pairs = _split_tabular_pairs(input_line)
+        rewritten: list[str] = []
+        for key, value in pairs:
+            if key not in feature_params:
+                rewritten.append(f"{key}:{value}")
+                continue
+            try:
+                numeric_value = float(value)
+            except (TypeError, ValueError):
+                rewritten.append(f"{key}:{value}")
+                continue
+            scale, offset = feature_params[key]
+            rewritten.append(f"{key}:{_format_numeric_token(scale * numeric_value + offset)}")
+        transformed_sample = dict(sample)
+        transformed_sample["Input"] = np.array([",".join(rewritten)])
+        transformed_dataset.append(transformed_sample)
+    return transformed_dataset
 
 
 # =========================
@@ -267,31 +499,43 @@ def build_user_prompt(
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
 
 DECIMAL_FNS = {"prime_decimal", "prime_decimal_tf_check", "prime_plus_47", "collatz_steps_parity"}
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+    "credit_g",
+    "loan_prediction",
+    "telco_customer_churn",
+}
 
 
 # =========================
 # Atomic file helpers
 # =========================
 
-def _ensure_parent_dir(path: str) -> None:
-    parent = os.path.dirname(path)
-    if parent:
-        os.makedirs(parent, exist_ok=True)
-
 def _safe_write_text_lines(path: str, lines: List[str]) -> None:
-    _ensure_parent_dir(path)
-    tmp_dir = os.path.dirname(path) or "."
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=tmp_dir) as tmp:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=os.path.dirname(path)) as tmp:
         for ln in lines:
             tmp.write(f"{ln}\n")
         tmp_path = tmp.name
     os.replace(tmp_path, path)
 
 def _safe_write_json(path: str, obj: Dict[str, Any]) -> None:
-    _ensure_parent_dir(path)
-    tmp_dir = os.path.dirname(path) or "."
-    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=tmp_dir) as tmp:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.NamedTemporaryFile("w", encoding="utf-8", delete=False, dir=os.path.dirname(path)) as tmp:
         json.dump(obj, tmp, ensure_ascii=False, indent=2)
         tmp_path = tmp.name
     os.replace(tmp_path, path)
@@ -299,6 +543,17 @@ def _safe_write_json(path: str, obj: Dict[str, Any]) -> None:
 def _read_lines(path: str) -> List[str]:
     with open(path, "r", encoding="utf-8") as f:
         return [ln.rstrip("\n") for ln in f]
+
+
+def should_update_best_by_val(
+    candidate_val_acc: Optional[float],
+    current_best_val_acc: Optional[float],
+) -> bool:
+    if candidate_val_acc is None:
+        return False
+    if current_best_val_acc is None:
+        return True
+    return float(candidate_val_acc) > float(current_best_val_acc)
 
 
 # =========================
@@ -342,10 +597,7 @@ class DatasetStore:
         return [f"{''.join(sample['Input'])} -> {sample['Output']}" for sample in dataset]
     
     def _stable_derived_seed(self, fn: str, L: int) -> int:
-        key = (
-            f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}"
-            f"|base_seed={self.cfg.seed}"
-        )
+        key = f"{fn}|L={L}|train={self.cfg.train_size+self.cfg.val_size}|test={self.cfg.test_size}|base_seed={self.cfg.seed}"
         digest = hashlib.sha256(key.encode("utf-8")).digest()
         return (int.from_bytes(digest[:8], "big") & 0x7FFFFFFF)
 
@@ -353,6 +605,7 @@ class DatasetStore:
         target_name = FUNCTION_NAME_MAPPING[fn]
         is_decimal = target_name in DECIMAL_FNS
         is_tabular = target_name in TABULAR_FNS
+        numeric_transform_mode = get_tabular_numeric_transform_mode()
 
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
@@ -376,6 +629,13 @@ class DatasetStore:
         total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
         generator = get_data_generator(target_name, L, total_samples)
         all_samples_dicts = generator.generate_data()
+        if is_tabular and numeric_transform_mode != "none":
+            all_samples_dicts = apply_tabular_numeric_transform(
+                all_samples_dicts,
+                generator=generator,
+                seed=derived_seed,
+                mode=numeric_transform_mode,
+            )
 
         train_split_dicts, val_split_dicts, test_split_dicts = create_stratified_splits(
             all_samples=all_samples_dicts,
@@ -399,6 +659,7 @@ class DatasetStore:
             "fn": fn, "target_name": target_name, "length": L, 
             "decimal": is_decimal, "tabular": is_tabular,
             "derived_seed": derived_seed,
+            "tabular_numeric_transform": numeric_transform_mode,
             "sizes": {"train": self.cfg.train_size, "val": self.cfg.val_size, "test": self.cfg.test_size},
             "created_ts": int(time.time())
         })
@@ -409,9 +670,6 @@ class DatasetStore:
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str], bool, bool]:
         return self._ensure_splits(fn, L)
 
-    def derived_seed(self, fn: str, L: int) -> int:
-        return self._stable_derived_seed(fn, L)
-
 
 # =========================
 # Code extraction & compilation
@@ -420,165 +678,90 @@ class DatasetStore:
 def extract_code_from_output(output_text: str) -> Optional[str]:
     if not output_text:
         return None
-    # Strip <think>...</think> blocks (e.g., from Qwen, DeepSeek reasoning models)
-    output_text = re.sub(r"<think>.*?</think>", "", output_text, flags=re.DOTALL).strip()
-    if not output_text:
-        return None
-    try:
-        obj = json.loads(output_text)
-        if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
+
+    def _extract_def_block(text: str) -> Optional[str]:
+        m = re.search(r"(def\s+[A-Za-z_]\w*\s*\([^)]*\)\s*:[^\n]*\n?)", text)
+        if not m:
+            return None
+        rest = text[m.start():]
+        lines = rest.splitlines()
+        if not lines:
+            return None
+        collected = [lines[0]]
+        # Collect only the function body (indented lines) and blank lines.
+        for ln in lines[1:]:
+            if not ln.strip():
+                collected.append(ln)
+                continue
+            if ln.startswith((" ", "\t")):
+                collected.append(ln)
+                continue
+            break
+        return "\n".join(collected).strip() or None
+
+    def _extract_code_obj(obj: Any) -> Optional[str]:
+        if isinstance(obj, dict) and isinstance(obj.get("code"), str):
             return obj["code"]
+        return None
+
+    try:
+        code = _extract_code_obj(json.loads(output_text))
+        if code is not None:
+            return code
     except Exception:
         pass
-    m = re.search(r"\{.*\}", output_text, flags=re.DOTALL)
+
+    # Prefer the last valid JSON object containing {"code": "..."} in the text.
+    decoder = json.JSONDecoder()
+    best_code: Optional[str] = None
+    for i, ch in enumerate(output_text):
+        if ch != "{":
+            continue
+        try:
+            obj, _ = decoder.raw_decode(output_text[i:])
+            code = _extract_code_obj(obj)
+            if code is not None:
+                best_code = code
+        except Exception:
+            continue
+    if best_code is not None:
+        return best_code
+
+    # Final fallback for partially noisy outputs containing a JSON-looking code field.
+    m = re.search(r'\{\s*"code"\s*:\s*"(?:\\.|[^"\\])*"\s*\}', output_text, flags=re.DOTALL)
     if m:
         try:
-            obj = json.loads(m.group(0))
-            if isinstance(obj, dict) and "code" in obj and isinstance(obj["code"], str):
-                return obj["code"]
+            code = _extract_code_obj(json.loads(m.group(0)))
+            if code is not None:
+                return code
         except Exception:
-            return None
+            pass
+
+    # If a model emits internal thinking tags, prioritize the final segment.
+    if "</think>" in output_text:
+        tail = output_text.rsplit("</think>", 1)[-1].strip()
+        if tail:
+            code = extract_code_from_output(tail)
+            if code is not None:
+                return code
+
+    # Fallback: accept fenced Python code containing a function definition.
+    for block in re.findall(r"```(?:python)?\s*([\s\S]*?)```", output_text, flags=re.IGNORECASE):
+        code = _extract_def_block(block)
+        if code is not None:
+            return code
+
+    # Last fallback: accept a raw `def ...` block from plain text outputs.
+    code = _extract_def_block(output_text)
+    if code is not None:
+        return code
     return None
-
-
-def _flatten_chat_content_text(content: Any) -> List[str]:
-    if isinstance(content, str):
-        return [content]
-    if isinstance(content, Mapping):
-        nested = content.get("text")
-        if isinstance(nested, str):
-            return [nested]
-        return _flatten_chat_content_text(content.get("content"))
-    if isinstance(content, list):
-        parts: List[str] = []
-        for item in content:
-            parts.extend(_flatten_chat_content_text(item))
-        return parts
-    text_attr = getattr(content, "text", None)
-    if isinstance(text_attr, str):
-        return [text_attr]
-    nested_attr = getattr(content, "content", None)
-    if nested_attr is not None:
-        return _flatten_chat_content_text(nested_attr)
-    return []
-
-
-def _extract_text_parts_from_chat_choice(choice: Any) -> List[str]:
-    parts: List[str] = []
-    if isinstance(choice, Mapping):
-        delta = choice.get("delta")
-        message = choice.get("message")
-        text_value = choice.get("text")
-    else:
-        delta = getattr(choice, "delta", None)
-        message = getattr(choice, "message", None)
-        text_value = getattr(choice, "text", None)
-
-    parts.extend(_flatten_chat_content_text(text_value))
-
-    if delta is not None:
-        if isinstance(delta, Mapping):
-            parts.extend(_flatten_chat_content_text(delta.get("content")))
-        else:
-            parts.extend(_flatten_chat_content_text(getattr(delta, "content", None)))
-
-    if message is not None:
-        if isinstance(message, Mapping):
-            parts.extend(_flatten_chat_content_text(message.get("content")))
-        else:
-            parts.extend(_flatten_chat_content_text(getattr(message, "content", None)))
-
-    return [p for p in parts if isinstance(p, str) and p]
-
-
-def extract_text_from_chat_completion(res: Any) -> str:
-    if isinstance(res, str):
-        return parse_chat_completion_sse(res).get("text", "")
-
-    choices = getattr(res, "choices", None)
-    if choices is None and isinstance(res, Mapping):
-        choices = res.get("choices")
-    choices = choices or []
-    if not choices:
-        return ""
-    first = choices[0]
-    direct_parts = _extract_text_parts_from_chat_choice(first)
-    if direct_parts:
-        return "".join(direct_parts).strip()
-    msg = getattr(first, "message", None)
-    if msg is None and isinstance(first, Mapping):
-        msg = first.get("message")
-    if msg is None:
-        return ""
-
-    content = getattr(msg, "content", None)
-    if content is None and isinstance(msg, Mapping):
-        content = msg.get("content")
-
-    return "".join(_flatten_chat_content_text(content)).strip()
-
-
-def parse_chat_completion_sse(raw: str) -> Dict[str, Any]:
-    text_parts: List[str] = []
-    usage: Dict[str, Any] = {}
-    model_name: Optional[str] = None
-    for ln in (raw or "").splitlines():
-        ln = ln.strip()
-        if not ln.startswith("data:"):
-            continue
-        payload = ln[5:].strip()
-        if not payload or payload == "[DONE]":
-            continue
-        try:
-            obj = json.loads(payload)
-        except Exception:
-            continue
-
-        if isinstance(obj, Mapping):
-            m = obj.get("model")
-            if isinstance(m, str) and m:
-                model_name = m
-
-            u = obj.get("usage")
-            if isinstance(u, Mapping):
-                usage = dict(u)
-
-            choices = obj.get("choices")
-            if isinstance(choices, list):
-                for c in choices:
-                    if not isinstance(c, Mapping):
-                        continue
-                    text_parts.extend(_extract_text_parts_from_chat_choice(c))
-    return {
-        "text": "".join(text_parts).strip(),
-        "usage": usage,
-        "model": model_name,
-    }
-
-
-def parse_chat_completion_http_payload(payload_text: str, content_type: str = "") -> Dict[str, Any]:
-    text = payload_text or ""
-    lowered_content_type = (content_type or "").lower()
-    if "text/event-stream" in lowered_content_type or text.lstrip().startswith("data:"):
-        parsed = parse_chat_completion_sse(text)
-        return {
-            "text": parsed.get("text", ""),
-            "usage": normalize_usage(parsed.get("usage") or {}),
-            "raw_payload": text,
-        }
-
-    data = json.loads(text)
-    usage = {}
-    if isinstance(data, Mapping):
-        usage = normalize_usage(data.get("usage") or {})
-    return {
-        "text": extract_text_from_chat_completion(data),
-        "usage": usage,
-        "raw_payload": text,
-    }
 
 def compile_callable_from_code(code_str: str, sanitize: bool = True) -> Callable[[str], int]:
     prepared_code = sanitize_generated_code(code_str) if sanitize else normalize_generated_code(code_str)
+    prepared_code = textwrap.dedent(prepared_code.strip())
+    if prepared_code.startswith("```"):
+        prepared_code = re.sub(r"^```(?:python)?\s*|\s*```$", "", prepared_code, flags=re.IGNORECASE | re.DOTALL)
     tree = ast.parse(prepared_code)
     fn_names = [n.name for n in tree.body if isinstance(n, ast.FunctionDef)]
     if not fn_names:
@@ -592,9 +775,9 @@ def compile_callable_from_code(code_str: str, sanitize: bool = True) -> Callable
         raise ValueError(f"Function '{prefer_name}' not found after exec.")
     return fn
 
+
 def analyze_code_structure(code_str: str, sanitize: bool = True) -> Dict[str, Any]:
     normalized = sanitize_generated_code(code_str) if sanitize else normalize_generated_code(code_str)
-
     non_empty_lines = [ln for ln in normalized.splitlines() if ln.strip()]
     out = {
         "code": normalized,
@@ -605,8 +788,8 @@ def analyze_code_structure(code_str: str, sanitize: bool = True) -> Dict[str, An
     try:
         tree = ast.parse(normalized)
         out["num_branches"] = sum(1 for node in ast.walk(tree) if isinstance(node, ast.If))
-    except Exception as e:
-        out["code_analysis_error"] = str(e)
+    except Exception as exc:
+        out["code_analysis_error"] = str(exc)
     return out
 
 
@@ -686,39 +869,112 @@ def evaluate_accuracy(fn_callable: Callable[[str], int], data_lines: List[str], 
     return _local_get_accuracy(fn_callable, data_lines, logger, is_tabular)
 
 
-def chat_completion_supports_reasoning_effort(model_name: str) -> bool:
-    model_l = (model_name or "").strip().lower()
-    return (
-        model_l.startswith("o3")
-        or model_l.startswith("o4")
-        or "gpt-5" in model_l
-        or model_l.startswith("openai/o3")
-        or model_l.startswith("openai/o4")
-    )
-
-def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
+def resolve_openai_client_settings(cfg: Config) -> Dict[str, Any]:
+    api_base_url = (getattr(cfg, "api_base_url", "") or "").strip()
+    azure_endpoint = (getattr(cfg, "azure_endpoint", "") or "").strip()
+    api_version = (getattr(cfg, "api_version", "") or "").strip()
+    use_azure = bool(azure_endpoint)
+    api_key = (cfg.api_key or "").strip()
+    if use_azure and not getattr(cfg, "api_key_explicit", False):
+        api_key = _env_first(
+            "AZURE_OPENAI_API_KEY",
+            "TAMU_API_KEY",
+            "TAMUS_AI_CHAT_API_KEY",
+            default=api_key,
+        )
+        if not api_version:
+            default_api_version = (
+                AZURE_RESPONSES_API_VERSION
+                if (getattr(cfg, "api_mode", "") or "").strip() == "responses"
+                else AZURE_CHAT_API_VERSION
+            )
+            api_version = _env_first(
+                "AZURE_OPENAI_API_VERSION",
+                "OPENAI_API_VERSION",
+                "TAMU_API_VERSION",
+                default=default_api_version,
+            )
     return {
-        "run_id": cfg.run_id,
-        "api_mode": cfg.api_mode,
-        "api_base_url": cfg.api_base_url,
-        "azure_endpoint": cfg.azure_endpoint,
-        "api_version": cfg.api_version,
-        "model": cfg.model,
-        "reasoning_effort": cfg.reasoning_effort,
-        "max_output_tokens": cfg.max_output_tokens,
-        "tool_choice": cfg.tool_choice,
-        "prompt_variant": cfg.prompt_variant,
-        "enable_code_interpreter": cfg.enable_code_interpreter,
-        "global_seed": cfg.seed,
-        "train_size": cfg.train_size,
-        "val_size": cfg.val_size,
-        "test_size": cfg.test_size,
-        "dataset_dir": cfg.dataset_dir,
-        "attempts_requested": cfg.attempts,
-        "num_trials_requested": cfg.num_trials,
-        "dry_run": cfg.dry_run,
-        "retry_delay_s": cfg.retry_delay_s,
+        "api_key": api_key,
+        "api_base_url": api_base_url,
+        "azure_endpoint": azure_endpoint,
+        "api_version": api_version,
+        "use_azure": use_azure,
     }
+
+
+def create_openai_client(cfg: Config) -> Tuple[Any, str]:
+    settings = resolve_openai_client_settings(cfg)
+    if not settings["api_key"]:
+        raise SystemExit("OPENAI_API_KEY or TAMU_API_KEY is required.")
+
+    if settings["use_azure"]:
+        if not settings["api_version"]:
+            raise SystemExit(
+                "OPENAI_API_VERSION or TAMU_API_VERSION is required when using an Azure/TAMU endpoint."
+            )
+        return (
+            AsyncAzureOpenAI(
+                api_key=settings["api_key"],
+                azure_endpoint=settings["azure_endpoint"].rstrip("/"),
+                api_version=settings["api_version"],
+            ),
+            "azure_openai",
+        )
+
+    client_kwargs: Dict[str, Any] = {"api_key": settings["api_key"]}
+    client_type = "openai"
+    if settings["api_base_url"]:
+        client_kwargs["base_url"] = settings["api_base_url"]
+        client_type = "openai_compatible"
+    return AsyncOpenAI(**client_kwargs), client_type
+
+
+AZURE_CHAT_API_VERSION = "2024-12-01-preview"
+AZURE_RESPONSES_API_VERSION = "2025-03-01-preview"
+
+AZURE_DEPLOYMENT_ALIASES = {
+    "protected.gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
+    "gpt-5.2": "gpt-5.2-deep-learning-fundamentals",
+    "protected.gpt-5.4": "gpt-5.4",
+    "gpt-5.4": "gpt-5.4",
+    "protected.gpt-5.4-mini": "gpt-5.4-mini",
+    "gpt-5.4-mini": "gpt-5.4-mini",
+    "protected.gpt-5.4-nano": "gpt-5.4-nano",
+    "gpt-5.4-nano": "gpt-5.4-nano",
+}
+
+
+def _is_azure_gpt_54_family(model_name: str) -> bool:
+    return "gpt-5.4" in (model_name or "").strip().lower()
+
+
+def resolve_openai_request_model(cfg: Config) -> str:
+    requested_model = (cfg.model or "").strip()
+    settings = resolve_openai_client_settings(cfg)
+    if not settings["use_azure"]:
+        return requested_model
+
+    explicit_deployments = _env_csv_first(
+        "AZURE_OPENAI_DEPLOYMENTS",
+        "TAMU_DEPLOYMENTS",
+        "OPENAI_DEPLOYMENTS",
+    )
+    if explicit_deployments:
+        return explicit_deployments[0]
+
+    explicit_deployment = _env_first(
+        "AZURE_OPENAI_DEPLOYMENT",
+        "AZURE_OPENAI_DEPLOYMENT_NAME",
+        "TAMU_DEPLOYMENT",
+        "TAMU_DEPLOYMENT_NAME",
+        "OPENAI_DEPLOYMENT",
+        "OPENAI_DEPLOYMENT_NAME",
+    )
+    if explicit_deployment:
+        return explicit_deployment
+
+    return AZURE_DEPLOYMENT_ALIASES.get(requested_model, requested_model)
 
 
 # =========================
@@ -726,110 +982,413 @@ def build_row_run_metadata(cfg: Config) -> Dict[str, Any]:
 # =========================
 
 class Runner:
+    @staticmethod
+    def _resolve_provider(provider: str, model: str) -> str:
+        requested = (provider or "auto").strip().lower()
+        if requested in {"openai", "gemini", "anthropic", "huggingface"}:
+            return requested
+        model_l = (model or "").strip().lower()
+        if model_l.startswith("gemini-") or model_l.startswith("models/gemini"):
+            return "gemini"
+        if model_l.startswith("claude-"):
+            return "anthropic"
+        if (
+            model_l.startswith("qwen/")
+            or model_l.startswith("allenai/")
+            or model_l.startswith("deepseek-ai/")
+            or model_l.startswith("deepseek/")
+        ):
+            return "huggingface"
+        return "openai"
+
     def __init__(self, cfg: Config, logger: logging.Logger):
-        if not cfg.api_key:
-            raise SystemExit("API key is required. Set TAMU_API_KEY, TAMUS_AI_CHAT_API_KEY, dpf-key, or OPENAI_API_KEY.")
-        if cfg.api_mode not in {"responses", "chat_completions"}:
-            raise SystemExit("API_MODE must be 'responses' or 'chat_completions'.")
         self.cfg = cfg
         self.log = logger
-        self.client, self.client_type = build_async_client(
-            cfg.api_key,
-            api_base_url=cfg.api_base_url,
-            azure_endpoint=cfg.azure_endpoint,
-            api_version=cfg.api_version,
-        )
+        self.provider = self._resolve_provider(cfg.provider, cfg.model)
+        self.client: Optional[AsyncOpenAI] = None
+        self.client_type = "none"
+        self.gemini_client = None
+        self.anthropic_client = None
+        self.hf_model = None
+        self._anthropic_tool_choice_warned = False
+        self._anthropic_verbosity_warned = False
+        self._anthropic_timeout_logged = False
+        self._anthropic_thinking_warned = False
+        self._anthropic_tool_use_unhandled_warned = False
+        self._openai_chat_reasoning_ignored_warned = False
+        self._openai_responses_sampling_ignored_warned = False
+        if self.provider == "openai":
+            self.client, self.client_type = create_openai_client(cfg)
+            openai_settings = resolve_openai_client_settings(cfg)
+            self.log.info(
+                "openai_provider_enabled",
+                extra={
+                    "model": cfg.model,
+                    "request_model": resolve_openai_request_model(cfg),
+                    "client_type": self.client_type,
+                    "api_mode": cfg.api_mode,
+                    "has_api_base_url": bool((cfg.api_base_url or "").strip()),
+                    "has_azure_endpoint": bool((cfg.azure_endpoint or "").strip()),
+                    "api_version": openai_settings.get("api_version") or None,
+                },
+            )
+        elif self.provider == "gemini":
+            if not cfg.gemini_api_key:
+                raise SystemExit("GEMINI_API_KEY is required for Gemini models.")
+            try:
+                from google import genai
+            except ImportError as e:
+                raise SystemExit("Gemini support requires `google-genai`. Install with: pip install google-genai") from e
+            self.gemini_client = genai.Client(
+                api_key=cfg.gemini_api_key,
+                http_options={"api_version": cfg.gemini_api_version},
+            )
+            self.log.info("gemini_provider_enabled", extra={"model": cfg.model, "api_version": cfg.gemini_api_version})
+        elif self.provider == "huggingface":
+            try:
+                from vllm.engine.arg_utils import AsyncEngineArgs
+                from vllm.engine.async_llm_engine import AsyncLLMEngine
+            except ImportError as e:
+                raise SystemExit(
+                    "vLLM support requires `vllm`. "
+                    "Install with: pip install vllm"
+                ) from e
+
+            engine_kwargs: Dict[str, Any] = {
+                "model": cfg.model,
+                "tensor_parallel_size": 1,
+                "trust_remote_code": cfg.hf_trust_remote_code,
+                "dtype": cfg.hf_torch_dtype if cfg.hf_torch_dtype in ["auto", "half", "float16", "bfloat16", "float32"] else "auto",
+                # Available only in newer vLLM versions.
+                "disable_log_requests": True,
+            }
+            supported = set(inspect.signature(AsyncEngineArgs.__init__).parameters.keys())
+            filtered_engine_kwargs = {k: v for k, v in engine_kwargs.items() if k in supported}
+            dropped_engine_kwargs = sorted(set(engine_kwargs.keys()) - set(filtered_engine_kwargs.keys()))
+
+            engine_args = AsyncEngineArgs(**filtered_engine_kwargs)
+            self.hf_model = AsyncLLMEngine.from_engine_args(engine_args)
+            self.log.info(
+                "vllm_provider_enabled",
+                extra={
+                    "model": cfg.model,
+                    "hf_torch_dtype": cfg.hf_torch_dtype,
+                    "hf_trust_remote_code": cfg.hf_trust_remote_code,
+                    "dropped_vllm_engine_args": dropped_engine_kwargs,
+                },
+            )
+        else:
+            if not cfg.anthropic_api_key:
+                raise SystemExit("ANTHROPIC_API_KEY is required for Claude models.")
+            try:
+                from anthropic import AsyncAnthropic
+            except ImportError as e:
+                raise SystemExit("Claude support requires `anthropic`. Install with: pip install anthropic") from e
+            self.anthropic_client = AsyncAnthropic(api_key=cfg.anthropic_api_key)
+            self.log.info("anthropic_provider_enabled", extra={"model": cfg.model})
         self.sem = asyncio.Semaphore(cfg.concurrency)
-        self.row_meta = {
-            **build_row_run_metadata(cfg),
-            "client_type": self.client_type,
-        }
 
         self.tools: List[Dict[str, Any]] = []
+        self.anthropic_tools: List[Dict[str, Any]] = []
+        if self.provider == "anthropic":
+            self.anthropic_tools = [
+                {"type": "web_search_20260209", "name": "web_search"},
+                {"type": "web_fetch_20260209", "name": "web_fetch"},
+                {"type": "bash_20250124", "name": "bash"},
+            ]
         if cfg.enable_code_interpreter:
-            self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+            if self.provider == "anthropic":
+                # Claude server tool for sandboxed code execution.
+                self.anthropic_tools.append({"type": "code_execution_20250522", "name": "code_execution"})
+                
+            else:
+                self.tools.append({"type": "code_interpreter", "container": {"type": "auto"}})
+            if self.provider == "gemini":
+                self.log.warning("gemini_ignoring_code_interpreter_tool", extra={"model": cfg.model})
 
         self.ds = DatasetStore(cfg, logger)
 
-    async def _call_chat_completions_raw(self, body: Dict[str, Any]) -> Dict[str, Any]:
-        if not self.cfg.api_base_url:
-            raise RuntimeError("Raw chat completions require api_base_url.")
-        url = self.cfg.api_base_url.rstrip("/") + "/chat/completions"
-        headers = {
-            "Authorization": f"Bearer {self.cfg.api_key}",
-            "Content-Type": "application/json",
-            "Accept": "application/json",
-        }
-        async with httpx.AsyncClient(timeout=self.cfg.per_call_timeout_s) as client:
-            try:
-                response = await client.post(url, headers=headers, json=body)
-                response.raise_for_status()
-                parsed = parse_chat_completion_http_payload(
-                    response.text,
-                    response.headers.get("content-type", ""),
-                )
-                if parsed.get("text") or body.get("stream") is True:
-                    return parsed
-                content_type = (response.headers.get("content-type", "") or "").lower()
-                if "text/event-stream" not in content_type:
-                    return parsed
-            except httpx.HTTPStatusError:
-                if body.get("stream") is True:
-                    raise
+    def _gemini_generate_content_sync(self, body: Dict[str, Any]) -> Any:
+        if self.gemini_client is None:
+            raise RuntimeError("Gemini client is not initialized.")
+        return self.gemini_client.models.generate_content(**body)
 
-            retry_body = dict(body)
-            retry_body["stream"] = True
-            retry_body["stream_options"] = {"include_usage": True}
-            async with client.stream("POST", url, headers=headers, json=retry_body) as response:
-                response.raise_for_status()
+    async def _gemini_generate_content(self, body: Dict[str, Any]) -> Any:
+        return await asyncio.to_thread(self._gemini_generate_content_sync, body)
+
+    @staticmethod
+    def _extract_text_from_gemini_response(res: Any) -> str:
+        txt = (getattr(res, "text", "") or "").strip()
+        if txt:
+            return txt
+        chunks: List[str] = []
+        for cand in (getattr(res, "candidates", []) or []):
+            content = getattr(cand, "content", None)
+            for part in (getattr(content, "parts", []) or []):
+                part_text = getattr(part, "text", None)
+                if isinstance(part_text, str) and part_text.strip():
+                    chunks.append(part_text.strip())
+        return "\n".join(chunks).strip()
+
+    @staticmethod
+    def _extract_text_from_anthropic_response(res: Any) -> str:
+        chunks: List[str] = []
+        content = res.get("content", []) if isinstance(res, Mapping) else getattr(res, "content", []) or []
+        for block in content:
+            if isinstance(block, Mapping):
+                if block.get("type") == "text" and isinstance(block.get("text"), str):
+                    chunks.append(block["text"])
+            else:
+                if getattr(block, "type", None) == "text":
+                    txt = getattr(block, "text", None)
+                    if isinstance(txt, str):
+                        chunks.append(txt)
+        return "".join(chunks).strip()
+
+    @staticmethod
+    def _extract_text_from_chat_completion_response(res: Any) -> str:
+        choices = res.get("choices", []) if isinstance(res, Mapping) else getattr(res, "choices", []) or []
+        if not choices:
+            return ""
+        first = choices[0]
+        if isinstance(first, Mapping):
+            message = first.get("message") or {}
+            content = message.get("content")
+            if isinstance(content, str):
+                return content.strip()
+            if isinstance(content, list):
                 chunks: List[str] = []
-                async for chunk in response.aiter_text():
-                    chunks.append(chunk)
-                return parse_chat_completion_http_payload(
-                    "".join(chunks),
-                    response.headers.get("content-type", ""),
-                )
+                for part in content:
+                    if isinstance(part, Mapping):
+                        text = part.get("text")
+                    else:
+                        text = getattr(part, "text", None)
+                    if isinstance(text, str) and text.strip():
+                        chunks.append(text.strip())
+                return "\n".join(chunks).strip()
+            text = first.get("text")
+            return text.strip() if isinstance(text, str) else ""
 
-    def _attach_meta(self, row: Dict[str, Any], dataset_seed: Optional[int] = None) -> Dict[str, Any]:
-        out = {**self.row_meta, **row}
-        if dataset_seed is not None:
-            out["dataset_seed"] = dataset_seed
-        return out
+        message = getattr(first, "message", None)
+        content = getattr(message, "content", None)
+        if isinstance(content, str):
+            return content.strip()
+        if isinstance(content, list):
+            chunks: List[str] = []
+            for part in content:
+                if isinstance(part, Mapping):
+                    text = part.get("text")
+                else:
+                    text = getattr(part, "text", None)
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+            return "\n".join(chunks).strip()
+        text = getattr(first, "text", None)
+        return text.strip() if isinstance(text, str) else ""
 
-    async def _call_once(self, fn: str, L: int, attempt_idx: int, data_examples: List[str], decimal: bool, tabular: bool = False) -> Dict[str, Any]:
-        prompt_text = build_user_prompt(
-            data_examples=data_examples,
-            seq_len=L,
-            decimal=decimal,
-            tabular=tabular,
-            prompt_variant=self.cfg.prompt_variant,
-        )
-        if self.cfg.api_mode == "chat_completions":
-            msg_payload = [{"role": "user", "content": prompt_text}]
-            body_preview_size = len(json.dumps({"messages": msg_payload}))
-            body = build_chat_completions_body(
-                model=self.cfg.model,
-                messages=msg_payload,
-                max_output_tokens=self.cfg.max_output_tokens,
-                reasoning_effort=self.cfg.reasoning_effort,
-                stream=False,
-                enable_thinking=self.cfg.enable_thinking,
-                api_base_url=self.cfg.api_base_url,
-                azure_endpoint=self.cfg.azure_endpoint,
+    @staticmethod
+    def _extract_text_from_responses_response(res: Any) -> str:
+        output_text = res.get("output_text", "") if isinstance(res, Mapping) else getattr(res, "output_text", "")
+        if isinstance(output_text, str) and output_text.strip():
+            return output_text.strip()
+
+        output = res.get("output", []) if isinstance(res, Mapping) else getattr(res, "output", []) or []
+        chunks: List[str] = []
+        for item in output:
+            item_type = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
+            if item_type == "message":
+                content = item.get("content", []) if isinstance(item, Mapping) else getattr(item, "content", []) or []
+                for block in content:
+                    block_type = block.get("type") if isinstance(block, Mapping) else getattr(block, "type", None)
+                    if block_type in {"output_text", "text"}:
+                        text = block.get("text") if isinstance(block, Mapping) else getattr(block, "text", None)
+                        if isinstance(text, str) and text.strip():
+                            chunks.append(text.strip())
+            elif item_type in {"output_text", "text"}:
+                text = item.get("text") if isinstance(item, Mapping) else getattr(item, "text", None)
+                if isinstance(text, str) and text.strip():
+                    chunks.append(text.strip())
+        return "\n".join(chunks).strip()
+
+    def _openai_responses_create_via_litellm_sync(self, body: Dict[str, Any]) -> Any:
+        settings = resolve_openai_client_settings(self.cfg)
+        if not settings["use_azure"]:
+            raise RuntimeError("LiteLLM Responses fallback is only wired for Azure/TAMU endpoints.")
+        try:
+            import litellm
+        except ImportError as exc:
+            raise RuntimeError(
+                "Azure Responses is unavailable through the installed OpenAI SDK and LiteLLM is not installed. "
+                "Install dependencies from requirements.txt or run `python -m pip install litellm`."
+            ) from exc
+
+        kwargs = dict(body)
+        kwargs["model"] = f"azure/{body['model']}"
+        kwargs["api_key"] = settings["api_key"]
+        kwargs["api_base"] = settings["azure_endpoint"].rstrip("/")
+        kwargs["api_version"] = settings["api_version"]
+        return litellm.responses(**kwargs)
+
+    async def _openai_responses_create_via_litellm(self, body: Dict[str, Any]) -> Any:
+        return await asyncio.to_thread(self._openai_responses_create_via_litellm_sync, body)
+
+    async def _anthropic_messages_create_sdk(self, body: Dict[str, Any]) -> Any:
+        if self.anthropic_client is None:
+            raise RuntimeError("Anthropic client is not initialized.")
+        # Use streaming for long Claude requests, then return a normal Message object.
+        async with self.anthropic_client.messages.stream(**body) as stream:
+            return await stream.get_final_message()
+
+    @staticmethod
+    def _format_exception(e: Exception) -> str:
+        msg = str(e).strip()
+        return msg if msg else e.__class__.__name__
+
+    async def aclose(self) -> None:
+        if self.client is not None:
+            await self.client.close()
+        if self.anthropic_client is not None:
+            close_fn = getattr(self.anthropic_client, "close", None)
+            if callable(close_fn):
+                maybe_awaitable = close_fn()
+                if inspect.isawaitable(maybe_awaitable):
+                    await maybe_awaitable
+
+    async def _call_once(
+        self,
+        fn: str,
+        L: int,
+        attempt_idx: int,
+        data_examples: List[str],
+        decimal: bool,
+        tabular: bool = False,
+        prompt_override: Optional[str] = None,
+    ) -> Dict[str, Any]:
+        if prompt_override is None:
+            prompt_text = build_user_prompt(
+                data_examples,
+                L,
+                decimal,
+                tabular,
+                prompt_variant=self.cfg.prompt_variant,
+                strict_json_only=(self.provider == "huggingface"),
             )
         else:
-            body_preview_size = len(json.dumps({"input":[{"role":"user","content":[{"type":"input_text","text": prompt_text}]}]}))
+            prompt_text = prompt_override
+        body_preview_size = len(prompt_text)
+        request_model = resolve_openai_request_model(self.cfg)
+        if self.provider == "openai":
+            openai_tool_choice = "auto" if self.cfg.allow_tools else "none"
+            if self.cfg.api_mode == "chat_completions":
+                body = {
+                    "model": request_model,
+                    "messages": [{"role": "user", "content": prompt_text}],
+                    "max_completion_tokens": self.cfg.max_output_tokens,
+                }
+                extra_body: Dict[str, Any] = {}
+                if self.cfg.reasoning_effort and not _is_azure_gpt_54_family(request_model):
+                    extra_body["reasoning_effort"] = self.cfg.reasoning_effort
+                elif self.cfg.reasoning_effort and _is_azure_gpt_54_family(request_model) and not self._openai_chat_reasoning_ignored_warned:
+                    self.log.warning(
+                        "openai_chat_reasoning_ignored_for_gpt_5_4",
+                        extra={"model": request_model, "reasoning_effort": self.cfg.reasoning_effort},
+                    )
+                    self._openai_chat_reasoning_ignored_warned = True
+                if extra_body:
+                    body["extra_body"] = extra_body
+                if self.cfg.temperature is not None:
+                    body["temperature"] = self.cfg.temperature
+                if self.cfg.top_p is not None:
+                    body["top_p"] = self.cfg.top_p
+            else:
+                body = {
+                    "model": request_model,
+                    "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
+                    "max_output_tokens": self.cfg.max_output_tokens,
+                }
+                if self.cfg.reasoning_effort:
+                    body["reasoning"] = {"effort": self.cfg.reasoning_effort}
+                if self.cfg.reasoning_effort and (
+                    self.cfg.temperature is not None or self.cfg.top_p is not None
+                ):
+                    if not self._openai_responses_sampling_ignored_warned:
+                        self.log.warning(
+                            "openai_responses_sampling_ignored_for_reasoning",
+                            extra={
+                                "model": request_model,
+                                "reasoning_effort": self.cfg.reasoning_effort,
+                                "temperature_set": self.cfg.temperature is not None,
+                                "top_p_set": self.cfg.top_p is not None,
+                            },
+                        )
+                        self._openai_responses_sampling_ignored_warned = True
+                elif self.cfg.temperature is not None:
+                    body["temperature"] = self.cfg.temperature
+                if not self.cfg.reasoning_effort and self.cfg.top_p is not None:
+                    body["top_p"] = self.cfg.top_p
+                if self.cfg.allow_tools and self.tools:
+                    body["tool_choice"] = openai_tool_choice
+                    body["tools"] = self.tools
+                if self.cfg.verbosity:
+                    body["text"] = {"verbosity": self.cfg.verbosity}
+        elif self.provider == "gemini":
+            gemini_tools: List[Dict[str, Any]] = []
+            if self.cfg.tool_choice != "none":
+                # Use Gemini built-in tools in a single-call flow.
+                gemini_tools = [
+                    {"google_search": {}},
+                    {"url_context": {}},
+                    {"code_execution": {}},
+                ]
             body = {
                 "model": self.cfg.model,
-                "input": [{"role": "user", "content": [{"type": "input_text", "text": prompt_text}]}],
-                "reasoning": {"effort": self.cfg.reasoning_effort},
-                "max_output_tokens": self.cfg.max_output_tokens,
-                "tool_choice": self.cfg.tool_choice,
+                "contents": prompt_text,
+                "config": {
+                    # Keep JSON-formatted output contract consistent with GPT-5 runs.
+                    "response_mime_type": "application/json",
+                    "max_output_tokens": self.cfg.max_output_tokens,
+                    "thinking_config": {"thinking_level": self.cfg.thinking_level},
+                    "tools": gemini_tools,
+                },
             }
-            if self.tools:
-                body["tools"] = self.tools
-            if self.cfg.verbosity:
-                body["text"] = {"verbosity": self.cfg.verbosity}
+            if self.cfg.temperature is not None:
+                body["config"]["temperature"] = self.cfg.temperature
+            if self.cfg.top_p is not None:
+                body["config"]["top_p"] = self.cfg.top_p
+            if self.cfg.tool_choice not in ("auto", "none"):
+                self.log.warning("gemini_tool_choice_not_supported", extra={"tool_choice": self.cfg.tool_choice})
+        elif self.provider == "huggingface":
+            body = {
+                "model": self.cfg.model,
+                "prompt": prompt_text,
+                "max_new_tokens": self.cfg.max_output_tokens,
+                "temperature": self.cfg.temperature,
+                "top_p": self.cfg.top_p,
+            }
+        else:
+            body = {
+                "model": "claude-opus-4-5-20251101",
+                "max_tokens": self.cfg.anthropic_max_tokens,
+                "messages": [{"role": "user", "content": prompt_text}],
+                "thinking": {
+                    "type": "enabled",
+                    "budget_tokens": 20000,
+                },
+            }
+            if self.cfg.temperature is not None:
+                body["temperature"] = self.cfg.temperature
+            if self.cfg.top_p is not None:
+                body["top_p"] = self.cfg.top_p
+            if self.anthropic_tools:
+                body["tools"] = self.anthropic_tools
+            if self.cfg.tool_choice == "auto":
+                body["tool_choice"] = {"type": "auto"}
+            elif self.cfg.tool_choice not in ("auto", "none") and not self._anthropic_tool_choice_warned:
+                self.log.warning("anthropic_tool_choice_not_supported", extra={"tool_choice": self.cfg.tool_choice})
+                self._anthropic_tool_choice_warned = True
+            if self.cfg.verbosity and self.cfg.verbosity != "low" and not self._anthropic_verbosity_warned:
+                self.log.warning("anthropic_ignoring_verbosity", extra={"verbosity": self.cfg.verbosity})
+                self._anthropic_verbosity_warned = True
 
         if self.cfg.dry_run:
             self.log.info("dry_run_input", extra={"fn": fn, "length": L, "attempt": attempt_idx, "prompt_preview": prompt_text})
@@ -841,45 +1400,187 @@ class Runner:
 
         async def _try_call(tag: str):
             t0 = time.perf_counter()
+            returned_model = None
             async with self.sem:
-                llm_result = await asyncio.wait_for(
-                    call_llm_async(
-                        client=self.client,
-                        api_mode=self.cfg.api_mode,
-                        body=body,
+                if self.provider == "openai":
+                    if self.client is None:
+                        raise RuntimeError("OpenAI client is not initialized.")
+                    if self.cfg.api_mode == "chat_completions":
+                        res = await asyncio.wait_for(
+                            self.client.chat.completions.create(**body),
+                            timeout=self.cfg.per_call_timeout_s,
+                        )
+                        tool_uses = 0
+                        tool_results_chars = 0
+                        returned_model = getattr(res, "model", None)
+                        usage = normalize_usage(getattr(res, "usage", {}))
+                        out_text = self._extract_text_from_chat_completion_response(res)
+                    else:
+                        responses_api = getattr(self.client, "responses", None)
+                        create_fn = getattr(responses_api, "create", None)
+                        if callable(create_fn):
+                            res = await asyncio.wait_for(
+                                create_fn(**body),
+                                timeout=self.cfg.per_call_timeout_s,
+                            )
+                        else:
+                            res = await asyncio.wait_for(
+                                self._openai_responses_create_via_litellm(body),
+                                timeout=self.cfg.per_call_timeout_s,
+                            )
+                        tool_uses = 0
+                        tool_results_chars = 0
+                        returned_model = res.get("model") if isinstance(res, Mapping) else getattr(res, "model", None)
+                        output_items = res.get("output", []) if isinstance(res, Mapping) else getattr(res, "output", []) or []
+                        for item in output_items:
+                            t = item.get("type") if isinstance(item, Mapping) else getattr(item, "type", None)
+                            if t == "tool_use":
+                                tool_uses += 1
+                            elif t == "tool_result":
+                                content = item.get("content") if isinstance(item, Mapping) else getattr(item, "content", None)
+                                if isinstance(content, list):
+                                    for part in content:
+                                        txt = getattr(part, "text", None) if hasattr(part, "text") else part.get("text") if isinstance(part, dict) else None
+                                        if isinstance(txt, str):
+                                            tool_results_chars += len(txt)
+                                elif isinstance(content, str):
+                                    tool_results_chars += len(content)
+                        usage_obj = res.get("usage", {}) if isinstance(res, Mapping) else getattr(res, "usage", {})
+                        usage = normalize_usage(usage_obj)
+                        out_text = self._extract_text_from_responses_response(res)
+                elif self.provider == "gemini":
+                    res = await asyncio.wait_for(
+                        self._gemini_generate_content(body),
                         timeout=self.cfg.per_call_timeout_s,
-                        api_base_url=self.cfg.api_base_url,
-                        api_key=self.cfg.api_key,
-                        azure_endpoint=self.cfg.azure_endpoint,
-                    ),
-                    timeout=self.cfg.per_call_timeout_s,
-                )
-                out_text = llm_result.text
-                usage = normalize_usage(llm_result.usage)
-                tool_uses = llm_result.tool_uses
-                tool_results_chars = llm_result.tool_results_chars
-                returned_model = llm_result.model or self.cfg.model
-                cost = shared_estimate_usage_cost(usage, returned_model)
+                    )
+                    returned_model = getattr(res, "model_version", None) or getattr(res, "model", None)
+                    usage = normalize_gemini_usage(getattr(res, "usage_metadata", None))
+                    out_text = self._extract_text_from_gemini_response(res)
+                    tool_uses = 0
+                    tool_results_chars = 0
+                elif self.provider == "huggingface":
+                    if self.hf_model is None:
+                        raise RuntimeError("vLLM engine is not initialized.")
+                    import uuid
+                    from vllm import SamplingParams
+
+                    request_id = str(uuid.uuid4())
+                    sampling_params = SamplingParams(
+                        max_tokens=self.cfg.max_output_tokens,
+                        temperature=self.cfg.temperature if self.cfg.temperature is not None else 0.0,
+                        top_p=self.cfg.top_p if self.cfg.top_p is not None else 1.0,
+                    )
+
+                    async def _generate_vllm() -> Any:
+                        final_output = None
+                        async for request_output in self.hf_model.generate(prompt_text, sampling_params, request_id):
+                            final_output = request_output
+                        return final_output
+
+                    final_output = await asyncio.wait_for(
+                        _generate_vllm(),
+                        timeout=self.cfg.per_call_timeout_s,
+                    )
+                    if final_output is None or not final_output.outputs:
+                        raise RuntimeError("vLLM returned no output.")
+
+                    out_text = final_output.outputs[0].text.strip()
+                    returned_model = self.cfg.model
+                    if "</think>" in out_text:
+                        tail = out_text.rsplit("</think>", 1)[-1].strip()
+                        if tail:
+                            out_text = tail
+
+                    usage = {
+                        "prompt_tokens": len(final_output.prompt_token_ids or []),
+                        "completion_tokens": len(final_output.outputs[0].token_ids or []),
+                    }
+                    usage["total_tokens"] = usage["prompt_tokens"] + usage["completion_tokens"]
+                    tool_uses = 0
+                    tool_results_chars = 0
+                else:
+                    if self.anthropic_client is None:
+                        raise RuntimeError("Anthropic client is not initialized.")
+                    anthropic_timeout_s = min(float(self.cfg.per_call_timeout_s), 600.0)
+                    if anthropic_timeout_s < float(self.cfg.per_call_timeout_s) and not self._anthropic_timeout_logged:
+                        self.log.info(
+                            "anthropic_timeout_capped",
+                            extra={
+                                "configured_timeout_s": self.cfg.per_call_timeout_s,
+                                "effective_timeout_s": anthropic_timeout_s,
+                            },
+                        )
+                        self._anthropic_timeout_logged = True
+                    try:
+                        res = await asyncio.wait_for(
+                            self._anthropic_messages_create_sdk(body),
+                            timeout=anthropic_timeout_s,
+                        )
+                    except Exception as e:
+                        err = self._format_exception(e)
+                        fallback_body = dict(body)
+                        fallback_body.pop("tools", None)
+                        fallback_body.pop("tool_choice", None)
+                        self.log.warning(
+                            "anthropic_sdk_fallback_no_tools",
+                            extra={"error": err},
+                        )
+                        res = await asyncio.wait_for(
+                            self._anthropic_messages_create_sdk(fallback_body),
+                            timeout=anthropic_timeout_s,
+                        )
+
+                    returned_model = res.get("model") if isinstance(res, Mapping) else getattr(res, "model", None)
+                    usage_obj = res.get("usage") if isinstance(res, Mapping) else getattr(res, "usage", None)
+                    usage = normalize_anthropic_usage(usage_obj)
+                    out_text = self._extract_text_from_anthropic_response(res)
+                    stop_reason = res.get("stop_reason") if isinstance(res, Mapping) else getattr(res, "stop_reason", None)
+                    if stop_reason == "tool_use" and not self._anthropic_tool_use_unhandled_warned:
+                        self.log.warning(
+                            "anthropic_tool_use_requires_client_loop",
+                            extra={
+                                "model": self.cfg.model,
+                                "hint": "If using client tools, execute tool_use blocks and send tool_result blocks in a follow-up call.",
+                            },
+                        )
+                        self._anthropic_tool_use_unhandled_warned = True
+                    content_blocks = (res.get("content", []) or []) if isinstance(res, Mapping) else (getattr(res, "content", []) or [])
+                    tool_uses = sum(
+                        1 for block in content_blocks
+                        if (
+                            (isinstance(block, Mapping) and block.get("type") == "tool_use")
+                            or (not isinstance(block, Mapping) and getattr(block, "type", None) == "tool_use")
+                        )
+                    )
+                    tool_results_chars = 0
 
             dt_ms = int((time.perf_counter() - t0) * 1000)
             cached = (usage.get("prompt_tokens_details") or {}).get("cached_tokens", 0)
+            if self.provider == "anthropic":
+                active_tool_count = len(self.anthropic_tools)
+            elif self.provider == "openai":
+                active_tool_count = len(body.get("tools") or []) if isinstance(body, dict) else 0
+            else:
+                active_tool_count = len(self.tools)
             self.log.info(tag, extra={
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "duration_ms": dt_ms, "prompt_chars": len(prompt_text),
                 "request_body_bytes": len(json.dumps(body)),
                 "input_section_bytes": body_preview_size,
-                "tools_enabled": bool(self.tools), "tool_count": len(self.tools),
+                "tools_enabled": active_tool_count > 0, "tool_count": active_tool_count,
                 "tool_uses": tool_uses, "tool_results_chars": tool_results_chars,
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
                 "output_tokens": usage.get("completion_tokens") or usage.get("output_tokens"),
                 "cached_tokens": cached, "completion_tokens": usage.get("completion_tokens"),
-                "estimated_total_cost_usd": cost.get("estimated_total_cost_usd"),
             })
             return {
                 "fn": fn, "length": L, "attempt": attempt_idx,
                 "prompt": prompt_text,
-                "text": out_text, "usage": usage, "cost": cost, "returned_model": returned_model,
+                "text": out_text, "usage": usage,
+                "returned_model": returned_model,
+                "request_model": request_model if self.provider == "openai" else self.cfg.model,
+                "cost": {},
                 "cached_tokens": cached, "duration_ms": dt_ms,
                 "request_body_bytes": len(json.dumps(body)),
                 "prompt_chars": len(prompt_text),
@@ -890,14 +1591,18 @@ class Runner:
         try:
             return await _try_call("attempt_ok")
         except Exception as e1:
-            self.log.warning("attempt_retry_once", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e1)})
+            self.log.warning(
+                "attempt_retry_once",
+                extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": self._format_exception(e1)},
+            )
             if self.cfg.retry_delay_s > 0:
                 await asyncio.sleep(self.cfg.retry_delay_s)
             try:
                 return await _try_call("attempt_ok_after_retry")
             except Exception as e2:
-                self.log.error("attempt_failed", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e2)})
-                return {"fn": fn, "length": L, "attempt": attempt_idx, "error": str(e2)}
+                err = self._format_exception(e2)
+                self.log.error("attempt_failed", extra={"fn": fn, "length": L, "attempt": attempt_idx, "error": err})
+                return {"fn": fn, "length": L, "attempt": attempt_idx, "error": err}
 
     async def run(self) -> List[Dict[str, Any]]:
         all_rows: List[Dict[str, Any]] = []
@@ -915,7 +1620,8 @@ class Runner:
                     continue
                 
                 task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
-                current_lengths = task_meta.get("lengths", self.cfg.lengths)
+                # If user passed --lengths explicitly, honor that exactly.
+                current_lengths = self.cfg.lengths if self.cfg.lengths_explicit else task_meta.get("lengths", self.cfg.lengths)
                 for L in current_lengths:
                     dataset_seed = self.ds.derived_seed(fn, L)
                     train_lines, val_lines, test_lines, is_decimal, is_tabular = self.ds.get(fn, L)
@@ -925,18 +1631,19 @@ class Runner:
                     trial_best_rows = []
 
                     for trial in range(self.cfg.num_trials):
-                        safe_fn = re.sub(r"[^A-Za-z0-9_]+", "_", fn)
-                        trial_jsonl_path = f"{base_name}_{safe_fn}_L{L}_trial{trial+1}{ext}"
+                        trial_jsonl_path = f"{base_name}_trial{trial+1}{ext}"
                         trial_jsonl_file = open(trial_jsonl_path, "w", encoding="utf-8")
                         
                         try:
-                            best_test_acc = -1.0
                             best_val_acc = None
                             best_row = None
                             stopped_early = False
 
                             for k in range(1, self.cfg.attempts + 1):
+                                attempt_t0 = time.perf_counter()
+                                learning_t0 = time.perf_counter()
                                 res = await self._call_once(fn, L, k, train_lines, is_decimal, is_tabular)
+                                learning_duration_ms = int((time.perf_counter() - learning_t0) * 1000)
                                 out_text = res.get("text") or ""
                                 code_str = extract_code_from_output(out_text)
                                 code_info = {
@@ -949,26 +1656,33 @@ class Runner:
                                 val_acc = None
                                 test_acc = None
                                 compile_error = None
+                                test_duration_ms = 0
 
                                 if code_str:
                                     code_info = analyze_code_structure(code_str, sanitize=self.cfg.sanitize_generated_code)
                                     try:
                                         fn_callable = compile_callable_from_code(code_str, sanitize=self.cfg.sanitize_generated_code)
                                         val_acc = evaluate_accuracy(fn_callable, val_lines, self.log, is_tabular)
+                                        test_t0 = time.perf_counter()
                                         test_acc = evaluate_accuracy(fn_callable, test_lines, self.log, is_tabular)
+                                        test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                         
-                                        if test_acc > best_test_acc:
-                                            best_test_acc = test_acc
+                                        if should_update_best_by_val(val_acc, best_val_acc):
                                             best_val_acc = val_acc
-                                            best_row = self._attach_meta({
+                                            best_row = {
                                                 **res,
+                                                "run_id": self.cfg.run_id,
+                                                "dataset_seed": dataset_seed,
                                                 **code_info,
+                                                "adaptation_duration_ms": learning_duration_ms,
+                                                "test_duration_ms": test_duration_ms,
+                                                "total_wall_clock_duration_ms": int((time.perf_counter() - attempt_t0) * 1000),
                                                 "val_acc": val_acc,
                                                 "test_acc": test_acc,
                                                 "stopped_early": stopped_early,
                                                 "compile_error": None,
                                                 "trial": trial + 1,
-                                            }, dataset_seed=dataset_seed)
+                                            }
                                         
                                         if val_acc == 1.0:
                                             stopped_early = True
@@ -980,15 +1694,21 @@ class Runner:
                                 else:
                                     compile_error = "no_code_found"
 
-                                row = self._attach_meta({
+                                total_wall_clock_duration_ms = int((time.perf_counter() - attempt_t0) * 1000)
+                                row = {
                                     **res,
+                                    "run_id": self.cfg.run_id,
+                                    "dataset_seed": dataset_seed,
                                     **code_info,
+                                    "adaptation_duration_ms": learning_duration_ms,
+                                    "test_duration_ms": test_duration_ms,
+                                    "total_wall_clock_duration_ms": total_wall_clock_duration_ms,
                                     "val_acc": val_acc,
                                     "test_acc": test_acc,
                                     "stopped_early": stopped_early,
                                     "compile_error": compile_error,
                                     "trial": trial + 1,
-                                }, dataset_seed=dataset_seed)
+                                }
                                 all_rows.append(row)
                                 
                                 trial_jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
@@ -998,8 +1718,8 @@ class Runner:
                                     self.log.info("early_stop", extra={"fn": fn, "length": L, "attempt": k, "trial": trial + 1, "val_acc": val_acc, "test_acc": test_acc})
                                     break
 
-                            if best_row and best_row.get("test_acc") is not None:
-                                trial_test_accuracies.append(best_test_acc)
+                            if best_row:
+                                trial_test_accuracies.append(float(best_row["test_acc"]))
                                 trial_val_accuracies.append(best_val_acc if best_val_acc is not None else 0.0)
                                 trial_best_rows.append(best_row)
                         finally:
@@ -1016,7 +1736,8 @@ class Runner:
                         val_acc_mean = float(np.mean(trial_val_accuracies))
                         val_acc_std = float(np.std(trial_val_accuracies))
 
-                        summary_row = self._attach_meta({
+                        summary_row = {
+                            "run_id": self.cfg.run_id,
                             "fn": fn,
                             "length": L,
                             "attempt": None,
@@ -1027,7 +1748,11 @@ class Runner:
                             "code_lines": None,
                             "num_branches": None,
                             "code_analysis_error": None,
+                            "dataset_seed": dataset_seed,
                             "duration_ms": None,
+                            "adaptation_duration_ms": None,
+                            "test_duration_ms": None,
+                            "total_wall_clock_duration_ms": None,
                             "cached_tokens": None,
                             "usage": {},
                             "tool_uses": None,
@@ -1040,15 +1765,15 @@ class Runner:
                             "compile_error": None,
                             "num_trials": self.cfg.num_trials,
                             "is_summary": True,
-                        }, dataset_seed=dataset_seed)
+                        }
 
                         all_rows.append(summary_row)
                         final_jsonl_file.write(json.dumps(summary_row, ensure_ascii=False) + "\n")
                         final_jsonl_file.flush()
 
                         self.log.info(
-                            f"{fn} L={L}: test_acc={test_acc_mean:.4f}+/-{test_acc_std:.4f} "
-                            f"(mean+/-std over {self.cfg.num_trials} trials)"
+                            f"{fn} L={L}: test_acc={test_acc_mean:.4f}±{test_acc_std:.4f} "
+                            f"(mean±std over {self.cfg.num_trials} trials)"
                         )
 
             self.log.info("dispatch_finished", extra={"total_results": len(all_rows)})
@@ -1069,15 +1794,11 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
     fieldnames = [
-        "run_id", "api_mode", "api_base_url", "azure_endpoint", "api_version", "client_type", "model", "returned_model", "reasoning_effort", "max_output_tokens", "tool_choice", "prompt_variant",
-        "enable_code_interpreter", "global_seed", "dataset_seed", "train_size", "val_size", "test_size",
-        "dataset_dir", "attempts_requested", "num_trials_requested", "dry_run",
-        "fn", "length", "attempt", "trial", "prompt", "text",
+        "run_id", "dataset_seed", "fn", "length", "attempt", "trial", "prompt", "text",
         "code", "code_lines", "num_branches", "code_analysis_error",
-        "duration_ms", "cached_tokens", "prompt_tokens", "completion_tokens",
+        "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
+        "cached_tokens", "prompt_tokens", "completion_tokens",
         "reasoning_tokens", "tool_uses", "tool_results_chars",
-        "pricing_available", "pricing_source", "pricing_model", "input_rate_per_million", "output_rate_per_million",
-        "estimated_input_cost_usd", "estimated_output_cost_usd", "estimated_total_cost_usd",
         "val_acc", "val_acc_std", "test_acc", "test_acc_std", "stopped_early", "compile_error", "num_trials", "is_summary",
     ]
     with open(path, "w", newline="", encoding="utf-8") as f:
@@ -1085,30 +1806,9 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
         w.writeheader()
         for r in rows:
             usage = r.get("usage") or {}
-            cost_fields = shared_flatten_cost_fields(r.get("cost") or {})
             w.writerow({
                 "run_id": r.get("run_id"),
-                "api_mode": r.get("api_mode"),
-                "api_base_url": r.get("api_base_url"),
-                "azure_endpoint": r.get("azure_endpoint"),
-                "api_version": r.get("api_version"),
-                "client_type": r.get("client_type"),
-                "model": r.get("model"),
-                "returned_model": r.get("returned_model"),
-                "reasoning_effort": r.get("reasoning_effort"),
-                "max_output_tokens": r.get("max_output_tokens"),
-                "tool_choice": r.get("tool_choice"),
-                "prompt_variant": r.get("prompt_variant"),
-                "enable_code_interpreter": r.get("enable_code_interpreter"),
-                "global_seed": r.get("global_seed"),
                 "dataset_seed": r.get("dataset_seed"),
-                "train_size": r.get("train_size"),
-                "val_size": r.get("val_size"),
-                "test_size": r.get("test_size"),
-                "dataset_dir": r.get("dataset_dir"),
-                "attempts_requested": r.get("attempts_requested"),
-                "num_trials_requested": r.get("num_trials_requested"),
-                "dry_run": r.get("dry_run"),
                 "fn": r.get("fn"),
                 "length": r.get("length"),
                 "attempt": r.get("attempt"),
@@ -1120,20 +1820,15 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "num_branches": r.get("num_branches"),
                 "code_analysis_error": r.get("code_analysis_error"),
                 "duration_ms": r.get("duration_ms"),
+                "adaptation_duration_ms": r.get("adaptation_duration_ms"),
+                "test_duration_ms": r.get("test_duration_ms"),
+                "total_wall_clock_duration_ms": r.get("total_wall_clock_duration_ms"),
                 "cached_tokens": r.get("cached_tokens"),
                 "prompt_tokens": usage.get("prompt_tokens"),
                 "completion_tokens": usage.get("completion_tokens"),
                 "reasoning_tokens": usage.get("reasoning_tokens"),
                 "tool_uses": r.get("tool_uses"),
                 "tool_results_chars": r.get("tool_results_chars"),
-                "pricing_available": cost_fields.get("pricing_available"),
-                "pricing_source": cost_fields.get("pricing_source"),
-                "pricing_model": cost_fields.get("pricing_model"),
-                "input_rate_per_million": cost_fields.get("input_rate_per_million"),
-                "output_rate_per_million": cost_fields.get("output_rate_per_million"),
-                "estimated_input_cost_usd": cost_fields.get("estimated_input_cost_usd"),
-                "estimated_output_cost_usd": cost_fields.get("estimated_output_cost_usd"),
-                "estimated_total_cost_usd": cost_fields.get("estimated_total_cost_usd"),
                 "val_acc": r.get("val_acc"),
                 "val_acc_std": r.get("val_acc_std"),
                 "test_acc": r.get("test_acc"),
@@ -1144,74 +1839,14 @@ def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
                 "is_summary": r.get("is_summary"),
             })
 
-def write_manifest(path: str, cfg: Config, rows: List[Dict[str, Any]]) -> None:
-    manifest = {
-        "run_id": cfg.run_id,
-        "created_ts": int(time.time()),
-        "argv": sys.argv,
-        "python_executable": sys.executable,
-        "python_version": sys.version,
-        "api_key_set": bool(cfg.api_key),
-        "openai_api_key_set": bool(cfg.api_key),
-        "config": {
-            "api_mode": cfg.api_mode,
-            "api_base_url": cfg.api_base_url,
-            "azure_endpoint": cfg.azure_endpoint,
-            "api_version": cfg.api_version,
-            "model": cfg.model,
-            "max_output_tokens": cfg.max_output_tokens,
-            "reasoning_effort": cfg.reasoning_effort,
-            "verbosity": cfg.verbosity,
-            "tool_choice": cfg.tool_choice,
-            "prompt_variant": cfg.prompt_variant,
-            "sanitize_generated_code": cfg.sanitize_generated_code,
-            "enable_code_interpreter": cfg.enable_code_interpreter,
-            "dry_run": cfg.dry_run,
-            "concurrency": cfg.concurrency,
-            "per_call_timeout_s": cfg.per_call_timeout_s,
-            "retry_delay_s": cfg.retry_delay_s,
-            "functions": cfg.functions,
-            "lengths": cfg.lengths,
-            "attempts": cfg.attempts,
-            "num_trials": cfg.num_trials,
-            "train_size": cfg.train_size,
-            "val_size": cfg.val_size,
-            "test_size": cfg.test_size,
-            "seed": cfg.seed,
-            "dataset_dir": cfg.dataset_dir,
-            "out_jsonl": cfg.out_jsonl,
-            "out_csv": cfg.out_csv,
-        },
-        "artifacts": {
-            "jsonl": cfg.out_jsonl,
-            "csv": cfg.out_csv,
-        },
-        "row_stats": {
-            "total_rows": len(rows),
-            "summary_rows": sum(1 for r in rows if r.get("is_summary")),
-            "attempt_rows": sum(1 for r in rows if r.get("attempt") is not None and not r.get("is_summary")),
-            "compile_error_rows": sum(1 for r in rows if r.get("compile_error")),
-            "attempt_estimated_total_cost_usd": sum(
-                float(((r.get("cost") or {}).get("estimated_total_cost_usd")) or 0.0)
-                for r in rows
-                if r.get("attempt") is not None and not r.get("is_summary")
-            ),
-        },
-    }
-    _safe_write_json(path, manifest)
-
 
 # =========================
 # CLI
 # =========================
 
 def parse_args() -> Config:
-    p = argparse.ArgumentParser(description="OpenAI runner (early-stop + persistent datasets)")
+    p = argparse.ArgumentParser(description="LLM runner (OpenAI/Gemini/Claude, early-stop + persistent datasets)")
 
-    p.add_argument("--api-mode", choices=["responses", "chat_completions"], help="API mode: Responses API or chat completions")
-    p.add_argument("--api-base-url", help="Override API base URL (e.g., TAMU gateway base URL)")
-    p.add_argument("--azure-endpoint", help="Azure OpenAI endpoint (e.g., https://...openai.azure.com/)")
-    p.add_argument("--api-version", help="Azure OpenAI API version (default: 2024-12-01-preview)")
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths (e.g., 100 50 30 25 20)")
     p.add_argument("--attempts", type=int, help="Attempts per (fn, length), default=5")
@@ -1220,14 +1855,29 @@ def parse_args() -> Config:
     p.add_argument("--timeout", type=float, help="Per-call timeout seconds (default: 1200)")
     p.add_argument("--retry-delay", type=float, help="Seconds to wait before retrying a failed call (default: 5)")
 
-    p.add_argument("--model", help="Model or Azure deployment name")
+    p.add_argument("--provider", choices=["auto", "openai", "gemini", "anthropic", "huggingface"], help="Inference provider (default: auto)")
+    p.add_argument("--model", help="Model name (default: gpt-5)")
+    p.add_argument("--api-mode", choices=["responses", "chat_completions"], help="OpenAI-compatible API family (default: env/API_MODE or responses)")
+    p.add_argument("--api-key", help="API key override for OpenAI-compatible or TAMU/Azure endpoints")
+    p.add_argument("--api-base-url", help="OpenAI-compatible base URL override")
+    p.add_argument("--azure-endpoint", help="Azure/TAMU endpoint override")
+    p.add_argument("--api-version", help="Azure/TAMU API version override")
+    p.add_argument("--temperature", type=float, help="Sampling temperature used across providers")
+    p.add_argument("--top-p", type=float, help="Nucleus sampling top_p used across providers")
     p.add_argument("--max-output-tokens", type=int, help="Max output tokens (default: 20000)")
     p.add_argument("--enable-code-interpreter", action="store_true", help="Enable Code Interpreter tool")
+    p.add_argument("--allow-tools", dest="allow_tools", action="store_true", help="Allow tool use for OpenAI provider")
+    p.add_argument("--no-tools", dest="allow_tools", action="store_false", help="Disable all tool use for OpenAI provider")
     p.add_argument("--tool-choice", choices=["auto","none"], help="Tool choice (default: auto)")
     p.add_argument("--sanitize-generated-code", choices=["on", "off"], help="Normalize generated code before compile/analyze (default: on)")
     p.add_argument("--prompt-variant", choices=["standard", "explain", "interview", "preview"], help="Prompt variant (default: standard)")
     p.add_argument("--verbosity", choices=["low","medium","high"], help="text.verbosity (default: low)")
-    p.add_argument("--reasoning-effort", choices=["minimal","medium","high"], help="reasoning.effort (default: high)")
+    p.add_argument("--reasoning-effort", choices=["minimal","low","medium","high","xhigh"], help="reasoning.effort (default: high)")
+    p.add_argument("--thinking-level", choices=["minimal","low","medium","high"], help="Gemini thinking level (default: high)")
+    p.add_argument("--hf-device-map", help="Hugging Face device_map (default: auto)")
+    p.add_argument("--hf-torch-dtype", choices=["auto", "float16", "bfloat16", "float32"], help="Hugging Face torch_dtype (default: auto)")
+    p.add_argument("--no-hf-trust-remote-code", action="store_true", help="Disable trust_remote_code for Hugging Face model loading")
+    p.add_argument("--hf-attn-implementation", help="Optional Hugging Face attention backend (e.g. flash_attention_2)")
 
     p.add_argument("--train-size", type=int, help="Train size per (fn, L) (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size per (fn, L) (default: 100)")
@@ -1241,23 +1891,33 @@ def parse_args() -> Config:
     p.add_argument("--run-id", help="Optional run id for artifact traceability")
     p.add_argument("--log-level", default=os.getenv("LOG_LEVEL", "INFO"), help="Logging level (default: INFO)")
     p.add_argument("--dry-run", action="store_true", help="Dry run, shows input prompt generated for each query")
-    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode (adds chat_template_kwargs for Qwen/DeepSeek models)")
+    p.add_argument("--enable-thinking", action="store_true", help="Enable thinking mode for compatible providers")
 
+    p.set_defaults(allow_tools=None)
     args = p.parse_args()
     cfg = Config()
 
     if args.functions: cfg.functions = args.functions
-    if args.lengths: cfg.lengths = args.lengths
-    if args.api_mode: cfg.api_mode = args.api_mode
-    if args.api_base_url: cfg.api_base_url = args.api_base_url
-    if args.azure_endpoint: cfg.azure_endpoint = args.azure_endpoint.strip()
-    if args.api_version: cfg.api_version = args.api_version.strip()
+    if args.lengths:
+        cfg.lengths = args.lengths
+        cfg.lengths_explicit = True
     if args.attempts: cfg.attempts = args.attempts
     if args.num_trials: cfg.num_trials = args.num_trials
     if args.concurrency: cfg.concurrency = args.concurrency
+    if args.provider: cfg.provider = args.provider
     if args.model: cfg.model = args.model
+    if args.api_mode is not None: cfg.api_mode = args.api_mode
+    if args.api_key is not None:
+        cfg.api_key = args.api_key
+        cfg.api_key_explicit = True
+    if args.api_base_url is not None: cfg.api_base_url = args.api_base_url
+    if args.azure_endpoint is not None: cfg.azure_endpoint = args.azure_endpoint
+    if args.api_version is not None: cfg.api_version = args.api_version
+    if args.temperature is not None: cfg.temperature = args.temperature
+    if args.top_p is not None: cfg.top_p = args.top_p
     if args.max_output_tokens: cfg.max_output_tokens = args.max_output_tokens
     if args.enable_code_interpreter: cfg.enable_code_interpreter = True
+    if args.allow_tools is not None: cfg.allow_tools = args.allow_tools
     if args.tool_choice: cfg.tool_choice = args.tool_choice
     if args.sanitize_generated_code is not None:
         cfg.sanitize_generated_code = args.sanitize_generated_code == "on"
@@ -1267,7 +1927,16 @@ def parse_args() -> Config:
     if args.out_manifest: cfg.out_manifest = args.out_manifest
     if args.run_id: cfg.run_id = args.run_id
     if args.verbosity: cfg.verbosity = args.verbosity
-    if args.reasoning_effort: cfg.reasoning_effort = args.reasoning_effort
+    if args.reasoning_effort:
+        cfg.reasoning_effort = args.reasoning_effort
+        # Keep Gemini thinking aligned with OpenAI-style reasoning unless explicitly overridden.
+        if not args.thinking_level:
+            cfg.thinking_level = args.reasoning_effort
+    if args.thinking_level: cfg.thinking_level = args.thinking_level
+    if args.hf_device_map: cfg.hf_device_map = args.hf_device_map
+    if args.hf_torch_dtype: cfg.hf_torch_dtype = args.hf_torch_dtype
+    if args.no_hf_trust_remote_code: cfg.hf_trust_remote_code = False
+    if args.hf_attn_implementation: cfg.hf_attn_implementation = args.hf_attn_implementation
     if args.timeout: cfg.per_call_timeout_s = args.timeout
     if args.retry_delay is not None: cfg.retry_delay_s = args.retry_delay
     if args.train_size: cfg.train_size = args.train_size
@@ -1288,11 +1957,9 @@ async def _amain(cfg: Config) -> None:
     try:
         rows = await runner.run()
     finally:
-        await runner.client.close()
+        await runner.aclose()
     write_csv(cfg.out_csv, rows)
-    manifest_path = cfg.out_manifest or (os.path.splitext(cfg.out_jsonl)[0] + "_manifest.json")
-    write_manifest(manifest_path, cfg, rows)
-    log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv, "manifest": manifest_path, "run_id": cfg.run_id})
+    log.info("artifacts_written", extra={"jsonl": cfg.out_jsonl, "csv": cfg.out_csv, "manifest": cfg.out_manifest or None, "run_id": cfg.run_id})
 
 
 def main() -> None:

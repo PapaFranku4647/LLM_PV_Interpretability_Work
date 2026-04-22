@@ -1,26 +1,31 @@
-# LLM_ERM_Testing Program Synthesis
+# Program Synthesis
 
-This repo evaluates the interpretability of executable classifiers and raw exported model artifacts.
+This repo now carries the unified CodeBoost, baseline, and interpretability workflows in one branch.
 
 ## Main entry points
 
-- `thesis_runner.py`: matrix runner for thesis generation, Code1 verification, and equation metrics
+- `boosted/boosted_runner.py`: CodeBoost runner for tabular synthesis experiments
+- `baseline_runner.py`: matched classical tabular baseline runner
+- `export_interpretability_artifacts.py`: raw textual artifact exporter for downstream interpretability runs
+- `runner.py`: core dataset split generation, tabular transforms, and general runner utilities
+- `thesis_runner.py`: interpretability matrix runner for thesis generation, Code1 verification, coverage, and faithfulness
 - `thesis_evaluator.py`: shared coverage and faithfulness evaluator
-- `prompt_variants.py`: thesis prompt builders
 - `code1_verifier.py`: Code1 verifier generation and validation
 
-## Canonical paper-facing results
+## Canonical paper-facing tables
 
-Use `program_synthesis/docs/PAPER_INTERPRETABILITY_TABLES.md` as the source of truth for the current raw-artifact interpretability table.
+- Accuracy: `program_synthesis/docs/PAPER_ACCURACY_TABLES.md`
+- Interpretability: `program_synthesis/docs/PAPER_INTERPRETABILITY_TABLES.md`
 
-## Current mainline protocol
+## Current clean protocol
 
-- raw textual artifact only
-- no summarization
-- thesis prompt sees the artifact plus one unseen test sample and predicted label
-- coverage and faithfulness are computed locally against the training split afterward
+- no dataset names in prompts
+- no dataset-specific descriptions in the clean setting
+- numeric anonymization via coordinate-wise positive affine transforms
+- matched transformed splits for CodeBoost and all baselines
+- raw textual artifact evaluation for interpretability
 
 ## Notes
 
-- External artifact mode consumes `artifact.json` exports produced by the sibling `LLM_PV` repo.
-- Generated runs, matrix outputs, and local planning notes are intentionally kept out of version control.
+- Generated runs, CSVs, JSONLs, local planning notes, and temporary matrices are intentionally gitignored.
+- The repo keeps the code paths for both tabular synthesis and interpretability evaluation; generated outputs are not treated as source.

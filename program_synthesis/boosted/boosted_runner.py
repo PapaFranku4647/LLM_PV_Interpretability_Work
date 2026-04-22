@@ -1,0 +1,3111 @@
+from __future__ import annotations
+
+import argparse
+import ast
+import asyncio
+import csv
+import hashlib
+import io
+import json
+import logging
+import math
+import os
+import random
+import sys
+import tempfile
+import textwrap
+import time
+from dataclasses import dataclass
+from typing import Any, Dict, List, Optional, Sequence, Set, Tuple
+
+import numpy as np
+
+
+CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
+PROGRAM_SYNTHESIS_DIR = os.path.dirname(CURRENT_DIR)
+if PROGRAM_SYNTHESIS_DIR not in sys.path:
+    sys.path.insert(0, PROGRAM_SYNTHESIS_DIR)
+
+import runner as base_runner  # noqa: E402
+
+
+DEFAULT_DATASET_DIR = os.path.join("program_synthesis", "boosted", "datasets")
+DEFAULT_OUTPUT_DIR = os.path.join("program_synthesis", "boosted", "outputs")
+CSV_EXCLUDED_FIELDS = {"candidate_code", "candidate_source_history"}
+
+CDC_FEATURE_NAMES = [
+    "HighBP", "HighChol", "CholCheck", "BMI", "Smoker", "Stroke",
+    "HeartDiseaseorAttack", "PhysActivity", "Fruits", "Veggies",
+    "HvyAlcoholConsump", "AnyHealthcare", "NoDocbcCost", "GenHlth",
+    "MentHlth", "PhysHlth", "DiffWalk", "Sex", "Age", "Education", "Income",
+]
+
+CDC_NUMERIC_FEATURES = ["BMI", "GenHlth", "MentHlth", "PhysHlth", "Age", "Education", "Income"]
+
+CDC_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: CDC diabetes indicators. The target output is binary: 1 means the person has diabetes, 0 means no diabetes.
+    Inputs are dictionaries with named CDC features. Binary health/lifestyle fields use yes/no strings; Sex uses female/male.
+    Numeric or ordinal fields are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Important fields include HighBP, HighChol, BMI, Smoker, Stroke, HeartDiseaseorAttack, PhysActivity, GenHlth, DiffWalk, Age, Education, and Income.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x["BMI"] == "high"` or `x.get("HighBP") == "yes"`.
+    """
+).strip()
+
+
+MUSHROOM_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: secondary mushroom attributes. The target output is binary: 1 means edible, 0 means poisonous.
+    Inputs are dictionaries with named mushroom morphology fields such as cap_shape, cap_surface, cap_color, gill_attachment, gill_color, stem_root, stem_surface, stem_color, has_ring, ring_type, spore_print_color, habitat, and season.
+    Numeric size fields cap_diameter, stem_height, and stem_width are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Categorical fields use readable category names such as convex, flat, smooth, sticky, brown, white, close, distant, bulbous, rooted, pendant, woods, grasses, summer, and autumn; missing values use unknown.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x["cap_shape"] == "convex"` or `x.get("stem_width") in ("high", "very high")`.
+    """
+).strip()
+
+
+HTRU2_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named numeric profile features converted to qualitative bins: very low, low, medium, high, very high.
+    Pulse profile fields include profile_mean, profile_stdev, profile_skewness, and profile_kurtosis.
+    Dispersion-measure signal-to-noise fields include dm_snr_mean, dm_snr_stdev, dm_snr_skewness, and dm_snr_kurtosis.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x["profile_skewness"] in ("high", "very high")`.
+    """
+).strip()
+
+
+CHESS_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: chess King-Rook versus King-Pawn on a7 endgames. The target output is binary: 1 means white can win, 0 means no win.
+    Inputs are dictionaries with UCI KRKPA7 feature abbreviations such as bkblk, bkon8, bkxwp, cntxt, dsopp, hdchk, katri, rimmx, rkxwp, simpl, skach, stlmt, thrsk, wkcti, wkna8, wknck, wkovl, and wkpos.
+    Most values are true/false tactical or geometric flags. A few fields use categorical values such as black, white, none, greater, or lesser.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("bkxwp") == "true"` or `x.get("wkpos") != "none"`.
+    """
+).strip()
+
+
+ADULT_INCOME_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: UCI Adult income. The target output is binary: 1 means income over 50K, 0 means income at or below 50K.
+    Inputs are dictionaries with named demographic and employment fields such as age, workclass, education, education_num, marital_status, occupation, relationship, race, sex, capital_gain, capital_loss, hours_per_week, and native_country.
+    Numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Useful risk factors often include high education_num, high capital_gain, high hours_per_week, age, marital_status, occupation, and relationship.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("education_num") in ("high", "very high")` or `x.get("capital_gain") == "very high"`.
+    """
+).strip()
+
+
+PIMA_DIABETES_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: Pima Indians diabetes. The target output is binary: 1 means tested positive for diabetes, 0 means tested negative.
+    Inputs are dictionaries with named medical fields: pregnancies, plasma_glucose, diastolic_blood_pressure, triceps_skinfold, serum_insulin, bmi, diabetes_pedigree, and age.
+    All numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Important risk factors include high plasma_glucose, high bmi, high diabetes_pedigree, higher age, and more pregnancies.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("plasma_glucose") in ("high", "very high")`.
+    """
+).strip()
+
+
+HEART_DISEASE_SEMANTIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: Statlog heart disease. The target output is binary: 1 means heart disease is present, 0 means absent.
+    Inputs are dictionaries with named clinical fields such as age, sex, chest_pain_type, resting_blood_pressure, serum_cholesterol, fasting_blood_sugar, resting_ecg, max_heart_rate, exercise_angina, st_depression, st_slope, major_vessels, and thalassemia.
+    Numeric fields are discretized into five qualitative bins: very low, low, medium, high, very high; categorical fields use readable tokens.
+    Useful risk factors often include exercise_angina, high st_depression, lower max_heart_rate, chest_pain_type, major_vessels, thalassemia, and age.
+    Write `f(x)` to accept this parsed dictionary directly, e.g. `x.get("exercise_angina") == "1"` or `x.get("st_depression") in ("high", "very high")`.
+    """
+).strip()
+
+
+MUSHROOM_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: secondary mushroom attributes. The target output is binary: 1 means edible, 0 means poisonous.
+    Inputs are dictionaries with named mushroom morphology fields. Numeric size fields are represented twice: cap_diameter_bin, stem_height_bin, stem_width_bin use qualitative bins, and cap_diameter_z, stem_height_z, stem_width_z are numeric z-scores centered on the dataset.
+    Categorical fields use compact readable strings that preserve the original code and missingness, e.g. convex|missing_no|code_x or unknown|missing_yes|code_missing.
+    Prefer rules that combine readable categories with numeric z-score thresholds, e.g. x.get("cap_shape", "").startswith("convex") or float(x.get("stem_width_z", 0)) > 1.0.
+    """
+).strip()
+
+
+HTRU2_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named pulse-profile and dispersion-measure features. Each numeric feature has a qualitative bin field ending in _bin and a numeric z-score field ending in _z.
+    Pulse profile fields include profile_mean, profile_stdev, profile_skewness, and profile_kurtosis. Dispersion-measure signal-to-noise fields include dm_snr_mean, dm_snr_stdev, dm_snr_skewness, and dm_snr_kurtosis.
+    Pulsars often have lower profile_mean/profile_stdev, higher profile_skewness/profile_kurtosis, higher dm_snr_mean/dm_snr_stdev, and lower dm_snr_skewness/dm_snr_kurtosis than non-pulsars.
+    Prefer rules that threshold z-scores while using bins for readable guards, e.g. float(x.get("profile_skewness_z", 0)) > 1.0 or x.get("dm_snr_kurtosis_bin") in ("high", "very high").
+    """
+).strip()
+
+
+HTRU2_NAMED_NUMERIC_CONTEXT = textwrap.dedent(
+    """
+    Dataset: HTRU2 pulsar candidates. The target output is binary: 1 means pulsar, 0 means non-pulsar.
+    Inputs are dictionaries with named real-valued numeric features, not bins. Convert values with float(...) before thresholding.
+    Pulse profile fields: profile_mean, profile_stdev, profile_skewness, profile_kurtosis.
+    Dispersion-measure signal-to-noise fields: dm_snr_mean, dm_snr_stdev, dm_snr_skewness, dm_snr_kurtosis.
+    Pulsars often have lower profile_mean/profile_stdev, higher profile_skewness/profile_kurtosis, higher dm_snr_mean/dm_snr_stdev, and lower dm_snr_skewness/dm_snr_kurtosis than non-pulsars.
+    Useful HTRU2 threshold ranges are often around: profile_skewness > 0.7 to 1.4, profile_kurtosis > 1 to 4, profile_mean < 85 to 100, dm_snr_mean > 8 to 12, dm_snr_stdev > 15, dm_snr_skewness < 4 to 6, and dm_snr_kurtosis < 20 to 80.
+    A strong rule should usually combine several of these conditions instead of relying on only one feature.
+    Prefer concise numeric threshold rules and interactions, e.g. float(x.get("profile_skewness", 0)) > 1.5 and float(x.get("profile_mean", 999)) < 90.
+    """
+).strip()
+
+
+CHESS_HYBRID_CONTEXT = textwrap.dedent(
+    """
+    Dataset: chess King-Rook versus King-Pawn on a7 endgames. The target output is binary: 1 means white can win, 0 means no win.
+    Inputs are dictionaries with UCI KRKPA7 feature abbreviations. Values preserve both readable labels and original UCI codes, e.g. true|code_t, false|code_f, none|code_n, greater|code_g, lesser|code_l.
+    Write rules against the readable prefix or the code token, e.g. x.get("bkxwp", "").startswith("true") or "code_t" in x.get("skach", "").
+    """
+).strip()
+
+
+GENERIC_SEMANTIC_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric or ordinal features, when present, are discretized into five qualitative bins: very low, low, medium, high, very high.
+    Categorical features use short readable tokens such as yes, no, unknown, or normalized category strings.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
+GENERIC_NAMED_NUMERIC_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric features are stored as compact strings and should be converted with `float(...)` before thresholding.
+    Categorical features use short readable tokens such as yes, no, unknown, or normalized category strings.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
+GENERIC_HYBRID_SCHEMA_CONTEXT = textwrap.dedent(
+    """
+    Inputs are dictionaries with named features.
+    Numeric features may appear both as qualitative bin fields ending in `_bin` and numeric standardized fields ending in `_z`.
+    Categorical features use short readable tokens and may include compact code suffixes.
+    Write `f(x)` to use only the provided fields and values. Do not assume any external dataset identity or domain knowledge beyond the examples.
+    """
+).strip()
+
+
+def default_cdc_representation(tabular_representation: str) -> str:
+    if tabular_representation in {"semantic", "named_numeric", "anonymous_numeric", "obfuscated_bins"}:
+        return tabular_representation
+    if tabular_representation == "hybrid":
+        return "semantic"
+    return "obfuscated"
+
+
+def get_dataset_context(
+    target_name: str,
+    cdc_representation: str,
+    tabular_representation: str = "obfuscated",
+    context_mode: str = "schema",
+) -> Optional[str]:
+    if context_mode == "none":
+        return None
+    if context_mode == "schema":
+        if target_name == "cdc_diabetes" and cdc_representation == "semantic":
+            return GENERIC_SEMANTIC_SCHEMA_CONTEXT
+        if tabular_representation == "semantic":
+            return GENERIC_SEMANTIC_SCHEMA_CONTEXT
+        if tabular_representation == "hybrid":
+            return GENERIC_HYBRID_SCHEMA_CONTEXT
+        if tabular_representation == "named_numeric":
+            return GENERIC_NAMED_NUMERIC_SCHEMA_CONTEXT
+        return None
+    if context_mode not in {"hints", "legacy_hints"}:
+        raise ValueError(f"Unsupported dataset context mode: {context_mode!r}")
+    if target_name == "cdc_diabetes" and cdc_representation == "semantic":
+        return CDC_SEMANTIC_CONTEXT
+    if tabular_representation == "semantic":
+        if target_name == "adult_income":
+            return ADULT_INCOME_SEMANTIC_CONTEXT
+        if target_name == "mushroom":
+            return MUSHROOM_SEMANTIC_CONTEXT
+        if target_name == "htru2":
+            return HTRU2_SEMANTIC_CONTEXT
+        if target_name == "chess":
+            return CHESS_SEMANTIC_CONTEXT
+        if target_name == "pima_diabetes":
+            return PIMA_DIABETES_SEMANTIC_CONTEXT
+        if target_name == "heart_disease":
+            return HEART_DISEASE_SEMANTIC_CONTEXT
+    if tabular_representation == "hybrid":
+        if target_name == "mushroom":
+            return MUSHROOM_HYBRID_CONTEXT
+        if target_name == "htru2":
+            return HTRU2_HYBRID_CONTEXT
+        if target_name == "chess":
+            return CHESS_HYBRID_CONTEXT
+        return None
+    if tabular_representation == "named_numeric":
+        if target_name == "htru2":
+            return HTRU2_NAMED_NUMERIC_CONTEXT
+        return None
+    return None
+
+
+def build_generation_prompt(
+    data_examples: List[str],
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    prompt = base_runner.build_user_prompt(
+        data_examples,
+        seq_len,
+        decimal,
+        tabular,
+    )
+    if not dataset_context:
+        return prompt
+    context_block = f"**Dataset Context:**\n{dataset_context}\n\n"
+    marker = "**Data Examples:**"
+    if marker in prompt:
+        return prompt.replace(marker, context_block + marker, 1)
+    return context_block + prompt
+
+
+def render_sample_file(
+    data_examples: Sequence[str],
+    *,
+    tabular: bool,
+) -> Tuple[str, str]:
+    if not tabular:
+        return "train_batch.txt", "\n".join(data_examples)
+
+    rows: List[Dict[str, Any]] = []
+    fieldnames: List[str] = []
+    for line in data_examples:
+        x_raw, y_raw = line.split("->", 1)
+        parsed = base_runner._parse_tabular_input(x_raw.strip())
+        row: Dict[str, Any] = {}
+        for key, value in parsed.items():
+            if key not in fieldnames:
+                fieldnames.append(key)
+            row[key] = value
+        row["label"] = int(y_raw.strip())
+        rows.append(row)
+
+    fieldnames_with_label = list(fieldnames) + ["label"]
+    buffer = io.StringIO()
+    writer = csv.DictWriter(buffer, fieldnames=fieldnames_with_label, extrasaction="ignore")
+    writer.writeheader()
+    for row in rows:
+        writer.writerow({name: row.get(name, "") for name in fieldnames_with_label})
+    return "train_batch.csv", buffer.getvalue().strip()
+
+
+def build_analysis_prompt(
+    data_examples: Sequence[str],
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    sample_file_name, sample_file_text = render_sample_file(data_examples, tabular=tabular)
+    if tabular:
+        input_description = "labeled tabular data with one row per example"
+        file_block_type = "csv"
+    elif decimal:
+        input_description = f"labeled decimal vectors of length {seq_len}"
+        file_block_type = "text"
+    else:
+        input_description = f"labeled binary vectors of length {seq_len}"
+        file_block_type = "text"
+
+    lines = [
+        f"Analyze the following sample file of {input_description}.",
+        "Do not write code yet.",
+        "Return exactly one valid JSON object with one key, `analysis`.",
+        "The `analysis` value should be an object with these keys:",
+        "- `important_features`: short list of features or positions that appear useful.",
+        "- `threshold_hints`: short list of threshold or category conditions that look predictive.",
+        "- `interaction_hints`: short list of multi-feature patterns that may matter.",
+        "- `candidate_rules`: short list of concise if-then rules that might generalize.",
+        "- `uncertainties`: short list of ambiguous or weak patterns.",
+        "Keep the analysis concise and operational. Do not mention any dataset identity.",
+    ]
+    if tabular:
+        lines.append("Assume the eventual classifier will receive a parsed Python dict keyed by the column names in the file.")
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            f"Sample file: {sample_file_name}",
+            f"```{file_block_type}",
+            sample_file_text,
+            "```",
+            "",
+            "Output contract:",
+            '{"analysis": {"important_features": [...], "threshold_hints": [...], "interaction_hints": [...], "candidate_rules": [...], "uncertainties": [...]}}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_code_from_analysis_prompt(
+    data_examples: Sequence[str],
+    analysis_text: str,
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    sample_file_name, sample_file_text = render_sample_file(data_examples, tabular=tabular)
+    if tabular:
+        input_description = "tabular comma-separated feature:value inputs"
+        file_block_type = "csv"
+    elif decimal:
+        input_description = f"decimal vector inputs of length {seq_len}"
+        file_block_type = "text"
+    else:
+        input_description = f"binary vector inputs of length {seq_len}"
+        file_block_type = "text"
+
+    lines = [
+        f"Use the sample file and the structured analysis below to write a concise Python classifier `f(x)` for {input_description}.",
+        "Return exactly one valid JSON object with one key, `code`, whose value is the complete function.",
+        "Do not include markdown, explanation, analysis, or text before or after the JSON.",
+    ]
+    if tabular:
+        lines.append("At inference time, `x` will be a parsed Python dict keyed by the column names in the file.")
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            f"Sample file: {sample_file_name}",
+            f"```{file_block_type}",
+            sample_file_text,
+            "```",
+            "",
+            "Structured analysis:",
+            "```json",
+            (analysis_text or '{"analysis": {}}').strip(),
+            "```",
+            "",
+            "Rules:",
+            "- Keep the implementation concise and general.",
+            "- Use only built-in Python.",
+            "- Do not add file I/O, network calls, training loops, or lookup tables keyed by full rows.",
+            "- Prefer simple thresholds, categories, and short feature interactions that transfer beyond the batch.",
+            '- Output only this JSON shape: {"code": "def f(x):\\n    ..."}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def get_model_pricing(model_name: Optional[str]) -> Optional[Dict[str, float | str]]:
+    lowered = (model_name or "").strip().lower()
+    if not lowered:
+        return None
+    if "gpt-5.4" in lowered:
+        return None
+    if "gpt-5.2" in lowered:
+        return {"name": "gpt-5.2", "input": 1.75, "output": 14.00}
+    if "gpt-5.1" in lowered:
+        return {"name": "gpt-5.1", "input": 1.25, "output": 10.00}
+    if "gpt-5" in lowered:
+        return {"name": "gpt-5", "input": 1.25, "output": 10.00}
+    if "gpt-4.1" in lowered:
+        return {"name": "gpt-4.1", "input": 2.00, "output": 8.00}
+    if "gpt-4o" in lowered:
+        return {"name": "gpt-4o", "input": 2.50, "output": 10.00}
+    if "o3-mini" in lowered:
+        return {"name": "o3-mini", "input": 1.10, "output": 4.40}
+    if "o4-mini" in lowered:
+        return {"name": "o4-mini", "input": 1.10, "output": 4.40}
+    return None
+
+
+def estimate_cost_usd(
+    model_name: Optional[str],
+    prompt_tokens: Any,
+    completion_tokens: Any,
+) -> Dict[str, Optional[float | str]]:
+    pricing = get_model_pricing(model_name)
+    if pricing is None:
+        return {
+            "pricing_model": None,
+            "input_rate_per_million": None,
+            "output_rate_per_million": None,
+            "estimated_input_cost_usd": None,
+            "estimated_output_cost_usd": None,
+            "estimated_total_cost_usd": None,
+        }
+    prompt = float(prompt_tokens or 0.0)
+    completion = float(completion_tokens or 0.0)
+    input_cost = (prompt / 1_000_000.0) * float(pricing["input"])
+    output_cost = (completion / 1_000_000.0) * float(pricing["output"])
+    return {
+        "pricing_model": str(pricing["name"]),
+        "input_rate_per_million": float(pricing["input"]),
+        "output_rate_per_million": float(pricing["output"]),
+        "estimated_input_cost_usd": input_cost,
+        "estimated_output_cost_usd": output_cost,
+        "estimated_total_cost_usd": input_cost + output_cost,
+    }
+
+
+class JsonFormatter(logging.Formatter):
+    def format(self, record: logging.LogRecord) -> str:
+        base = {
+            "level": record.levelname,
+            "ts": int(time.time() * 1000),
+            "msg": record.getMessage(),
+            "logger": record.name,
+        }
+        if record.exc_info:
+            base["exc"] = self.formatException(record.exc_info)
+        for k, v in getattr(record, "__dict__", {}).items():
+            if k not in base and k not in ("msg", "args", "levelname", "name"):
+                base[k] = v
+        return json.dumps(base, ensure_ascii=False)
+
+
+def setup_logger(level: str = "INFO") -> logging.Logger:
+    logger = logging.getLogger("boosted_runner")
+    logger.setLevel(level.upper())
+
+    os.makedirs(CURRENT_DIR, exist_ok=True)
+    stream_handler = logging.StreamHandler(sys.stdout)
+    stream_handler.setFormatter(JsonFormatter())
+
+    file_handler = logging.FileHandler(
+        os.path.join(CURRENT_DIR, "boosted_runner.log"),
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(JsonFormatter())
+
+    logger.handlers[:] = [stream_handler, file_handler]
+    logger.propagate = False
+    return logger
+
+
+@dataclass
+class Example:
+    line: str
+    x: Any
+    y01: int
+    ypm: int
+
+
+@dataclass
+class BoostConfig:
+    boost_rounds: int
+    batch_sizes: List[int]
+    round_retries: int
+    max_weak_error: float
+    min_alpha: float
+    num_trials: int
+    stop_on_perfect_train: bool
+    resample_each_retry: bool
+    output_dir: str
+    repair_rounds: int = 0
+    repair_mistake_limit: int = 128
+    repair_anchor_count: int = 16
+    repair_trigger_batch_acc_below: Optional[float] = None
+    repair_trigger_weighted_error_above: Optional[float] = None
+    repair_trigger_min_mistakes: int = 1
+    sample_without_replacement: bool = False
+    strict_acceptance: bool = False
+    whole_train_repair_rounds: int = 0
+    whole_train_repair_batch_size: int = 256
+    whole_train_mistake_frac: float = 0.7
+    whole_train_recent_fix_frac: float = 0.2
+    whole_train_anchor_frac: float = 0.1
+    tabular_representation: str = "obfuscated"
+    cdc_representation: str = "obfuscated"
+    dataset_context_mode: str = "schema"
+    tabular_numeric_transform: str = "none"
+    prompt_strategy: str = "direct"
+    accept_best_on_failure: bool = False
+    best_fallback_max_weak_error: float = 0.499
+    sampling_strategy: str = "weighted_random"
+    sampler_mistake_frac: float = 0.6
+    sampler_boundary_frac: float = 0.2
+    sampler_anchor_frac: float = 0.2
+    sampler_pool_multiplier: int = 8
+    sampler_feature_hash_dim: int = 256
+    candidate_selection: str = "first_acceptable"
+    ensemble_val_drop_tolerance: float = 1.0
+    early_stop_val_patience: int = 0
+    early_stop_val_min_delta: float = 0.0
+    restore_best_val_ensemble: bool = False
+
+
+@dataclass
+class BatchCandidate:
+    code: str
+    fn_callable: Any
+    batch_acc: float
+    misclassified_lines: List[str]
+    correct_lines: List[str]
+    eval_errors: int
+
+
+@dataclass
+class TrainCandidateState:
+    correct_lines: List[str]
+    misclassified_lines: List[str]
+    train_acc: float
+    weighted_error: float
+    train_preds_pm: List[int]
+    eval_errors: int
+
+
+def _safe_write_text(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        delete=False,
+        dir=os.path.dirname(path),
+    ) as tmp:
+        tmp.write(text)
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+
+
+def _safe_write_json(path: str, obj: Any) -> None:
+    _safe_write_text(path, json.dumps(obj, ensure_ascii=False, indent=2))
+
+
+def _stable_seed(*parts: Any) -> int:
+    key = "|".join(str(p) for p in parts)
+    digest = hashlib.sha256(key.encode("utf-8")).digest()
+    return int.from_bytes(digest[:8], "big") & 0x7FFFFFFF
+
+
+def _hash_text(text: str) -> str:
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
+def append_candidate_source_event(
+    history: List[Dict[str, Any]],
+    *,
+    stage: str,
+    api_attempt: int,
+    code: Optional[str],
+    response_text: str,
+    status: Optional[str] = None,
+) -> None:
+    event: Dict[str, Any] = {
+        "stage": stage,
+        "api_attempt": api_attempt,
+        "status": status or ("code_found" if code else "no_code_found"),
+        "response_chars": len(response_text),
+    }
+    if code:
+        event.update(
+            {
+                "code": code,
+                "code_chars": len(code),
+                "code_sha256": _hash_text(code),
+            }
+        )
+    history.append(event)
+
+
+def set_candidate_source_metadata(
+    row: Dict[str, Any],
+    *,
+    final_code: Optional[str],
+    source_history: Sequence[Dict[str, Any]],
+) -> None:
+    source_events = [event for event in source_history if event.get("code")]
+    row["candidate_source_count"] = len(source_events)
+    row["candidate_source_stages"] = ",".join(str(event.get("stage") or "") for event in source_events)
+    row["candidate_source_history"] = list(source_history)
+    if final_code:
+        row["candidate_code"] = final_code
+        row["candidate_code_chars"] = len(final_code)
+        row["candidate_code_sha256"] = _hash_text(final_code)
+    else:
+        row["candidate_code"] = None
+        row["candidate_code_chars"] = 0
+        row["candidate_code_sha256"] = None
+
+
+def parse_examples(lines: Sequence[str], is_tabular: bool) -> List[Example]:
+    examples: List[Example] = []
+    for line in lines:
+        x_raw, y_raw = line.split("->", 1)
+        x_value = x_raw.strip()
+        if is_tabular:
+            x_value = base_runner._parse_tabular_input(x_value)
+        y01 = int(y_raw.strip())
+        examples.append(
+            Example(
+                line=line,
+                x=x_value,
+                y01=y01,
+                ypm=1 if y01 == 1 else -1,
+            )
+        )
+    return examples
+
+
+def predict_01(fn_callable, x_value: Any) -> int:
+    pred = fn_callable(x_value)
+    return base_runner._normalize_pred_to01(pred)
+
+
+def evaluate_weighted_error(
+    fn_callable,
+    examples: Sequence[Example],
+    weights: Sequence[float],
+) -> Tuple[float, List[int], int]:
+    if len(examples) != len(weights):
+        raise ValueError("examples and weights must have identical length.")
+    if not examples:
+        return 1.0, [], 0
+
+    weighted_errors = 0.0
+    predictions_pm: List[int] = []
+    eval_errors = 0
+    total_weight = float(sum(weights))
+    if total_weight <= 0.0:
+        total_weight = 1.0
+
+    for example, weight in zip(examples, weights):
+        try:
+            pred01 = predict_01(fn_callable, example.x)
+        except Exception:
+            pred01 = 1 - example.y01
+            eval_errors += 1
+        pred_pm = 1 if pred01 == 1 else -1
+        predictions_pm.append(pred_pm)
+        if pred01 != example.y01:
+            weighted_errors += weight
+
+    return weighted_errors / total_weight, predictions_pm, eval_errors
+
+
+def update_distribution(
+    weights: Sequence[float],
+    labels_pm: Sequence[int],
+    preds_pm: Sequence[int],
+    alpha: float,
+) -> List[float]:
+    updated = [
+        float(w) * math.exp(-alpha * float(y_pm) * float(h_pm))
+        for w, y_pm, h_pm in zip(weights, labels_pm, preds_pm)
+    ]
+    normalizer = sum(updated)
+    if not math.isfinite(normalizer) or normalizer <= 0:
+        return [1.0 / len(weights)] * len(weights)
+    return [w / normalizer for w in updated]
+
+
+def sample_weighted_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    without_replacement: bool = False,
+) -> Tuple[List[int], List[str]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if without_replacement:
+        target_size = min(batch_size, len(examples))
+        weighted_keys: List[Tuple[float, int]] = []
+        for idx, weight in enumerate(weights):
+            if float(weight) <= 0.0:
+                continue
+            u = max(rng.random(), 1e-12)
+            weighted_keys.append((math.log(u) / float(weight), idx))
+        weighted_keys.sort(reverse=True)
+        indices = [idx for _score, idx in weighted_keys[:target_size]]
+        if len(indices) < target_size:
+            remaining = [idx for idx in range(len(examples)) if idx not in set(indices)]
+            rng.shuffle(remaining)
+            indices.extend(remaining[: target_size - len(indices)])
+    else:
+        indices = rng.choices(range(len(examples)), weights=weights, k=batch_size)
+    return indices, [examples[idx].line for idx in indices]
+
+
+def _as_float(value: Any) -> Optional[float]:
+    try:
+        result = float(value)
+    except (TypeError, ValueError):
+        return None
+    if not math.isfinite(result):
+        return None
+    return result
+
+
+def _hashed_bucket(token: str, hash_dim: int) -> Tuple[int, float]:
+    digest = hashlib.sha256(token.encode("utf-8")).digest()
+    raw = int.from_bytes(digest[:8], "big")
+    bucket = raw % hash_dim
+    sign = 1.0 if (digest[8] & 1) == 0 else -1.0
+    return bucket, sign
+
+
+def build_feature_matrix(examples: Sequence[Example], hash_dim: int = 256) -> np.ndarray:
+    if not examples:
+        return np.zeros((0, 0), dtype=np.float32)
+    hash_dim = max(1, int(hash_dim))
+    matrix = np.zeros((len(examples), hash_dim), dtype=np.float32)
+
+    for row_idx, example in enumerate(examples):
+        if isinstance(example.x, dict):
+            for name, raw_value in example.x.items():
+                value = str(raw_value).strip()
+                numeric_value = _as_float(value)
+                if numeric_value is not None:
+                    bucket, sign = _hashed_bucket(f"num:{name}", hash_dim)
+                    matrix[row_idx, bucket] += sign * float(numeric_value)
+                else:
+                    normalized = value.lower() if value else "?"
+                    bucket, sign = _hashed_bucket(f"cat:{name}={normalized}", hash_dim)
+                    matrix[row_idx, bucket] += sign
+        else:
+            text = str(example.x)
+            for pos, token in enumerate(text):
+                bucket, sign = _hashed_bucket(f"char:{pos}:{token}", hash_dim)
+                matrix[row_idx, bucket] += sign
+
+    if matrix.size == 0:
+        return matrix
+    means = matrix.mean(axis=0)
+    stds = matrix.std(axis=0)
+    stds[stds < 1e-6] = 1.0
+    return ((matrix - means) / stds).astype(np.float32)
+
+
+def ensemble_scores(
+    learners: Sequence[Dict[str, Any]],
+    examples: Sequence[Example],
+) -> Tuple[List[float], List[Optional[int]], int]:
+    scores: List[float] = []
+    preds_pm: List[Optional[int]] = []
+    eval_errors = 0
+    if not learners:
+        return [0.0 for _ in examples], [None for _ in examples], 0
+
+    for example in examples:
+        score = 0.0
+        for learner in learners:
+            try:
+                pred01 = predict_01(learner["callable"], example.x)
+            except Exception:
+                pred01 = 1 - example.y01
+                eval_errors += 1
+            score += float(learner["alpha"]) * (1.0 if pred01 == 1 else -1.0)
+        scores.append(score)
+        preds_pm.append(1 if score >= 0.0 else -1)
+    return scores, preds_pm, eval_errors
+
+
+def _select_weighted_diverse_indices(
+    candidate_indices: Sequence[int],
+    count: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    weights: Sequence[float],
+    excluded: Optional[Set[int]] = None,
+    pool_multiplier: int = 8,
+) -> List[int]:
+    excluded = excluded or set()
+    candidates = [idx for idx in candidate_indices if idx not in excluded]
+    if count <= 0 or not candidates:
+        return []
+    if count >= len(candidates):
+        selected = list(candidates)
+        rng.shuffle(selected)
+        return selected
+
+    max_pool = max(count * max(1, pool_multiplier), count, 256)
+    if len(candidates) > max_pool:
+        candidates = sorted(candidates, key=lambda idx: float(weights[idx]), reverse=True)[:max_pool]
+
+    if vectors.size == 0:
+        selected: List[int] = []
+        pool = list(candidates)
+        while pool and len(selected) < count:
+            pool_weights = [max(float(weights[idx]), 1e-12) for idx in pool]
+            picked = rng.choices(pool, weights=pool_weights, k=1)[0]
+            selected.append(picked)
+            pool.remove(picked)
+        return selected
+
+    candidate_array = np.asarray(candidates, dtype=int)
+    candidate_vectors = vectors[candidate_array]
+    candidate_weights = np.asarray([max(float(weights[idx]), 1e-12) for idx in candidates], dtype=np.float64)
+    max_weight = float(candidate_weights.max()) if candidate_weights.size else 1.0
+    normalized_weights = candidate_weights / max(max_weight, 1e-12)
+
+    first_pos = int(np.argmax(candidate_weights))
+    selected_positions = [first_pos]
+    selected_mask = np.zeros(len(candidates), dtype=bool)
+    selected_mask[first_pos] = True
+    nearest_dist = np.sum((candidate_vectors - candidate_vectors[first_pos]) ** 2, axis=1)
+
+    while len(selected_positions) < count and not bool(np.all(selected_mask)):
+        scores = nearest_dist * (0.25 + normalized_weights)
+        scores[selected_mask] = -1.0
+        next_pos = int(np.argmax(scores))
+        if scores[next_pos] < 0.0:
+            break
+        selected_positions.append(next_pos)
+        selected_mask[next_pos] = True
+        dist = np.sum((candidate_vectors - candidate_vectors[next_pos]) ** 2, axis=1)
+        nearest_dist = np.minimum(nearest_dist, dist)
+
+    return [int(candidate_array[pos]) for pos in selected_positions]
+
+
+def _select_label_balanced_diverse_indices(
+    candidate_indices: Sequence[int],
+    count: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    weights: Sequence[float],
+    examples: Sequence[Example],
+    excluded: Optional[Set[int]] = None,
+    pool_multiplier: int = 8,
+) -> List[int]:
+    excluded = excluded or set()
+    candidates = [idx for idx in candidate_indices if idx not in excluded]
+    if count <= 0 or not candidates:
+        return []
+
+    positives = [idx for idx in candidates if examples[idx].y01 == 1]
+    negatives = [idx for idx in candidates if examples[idx].y01 == 0]
+    pos_target = min(len(positives), count // 2)
+    neg_target = min(len(negatives), count - pos_target)
+    pos_target = min(len(positives), count - neg_target)
+
+    selected: List[int] = []
+    selected.extend(
+        _select_weighted_diverse_indices(
+            positives,
+            pos_target,
+            rng,
+            vectors,
+            weights,
+            excluded=excluded,
+            pool_multiplier=pool_multiplier,
+        )
+    )
+    selected_set = set(selected) | set(excluded)
+    selected.extend(
+        _select_weighted_diverse_indices(
+            negatives,
+            neg_target,
+            rng,
+            vectors,
+            weights,
+            excluded=selected_set,
+            pool_multiplier=pool_multiplier,
+        )
+    )
+    selected_set = set(selected) | set(excluded)
+    if len(selected) < count:
+        selected.extend(
+            _select_weighted_diverse_indices(
+                candidates,
+                count - len(selected),
+                rng,
+                vectors,
+                weights,
+                excluded=selected_set,
+                pool_multiplier=pool_multiplier,
+            )
+        )
+    rng.shuffle(selected)
+    return selected[:count]
+
+
+def sample_stratified_diverse_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    learners: Sequence[Dict[str, Any]],
+    vectors: np.ndarray,
+    mistake_frac: float,
+    boundary_frac: float,
+    anchor_frac: float,
+    pool_multiplier: int,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    if batch_size <= 0:
+        raise ValueError("batch_size must be positive.")
+    if not examples:
+        return [], [], {"sampling_strategy": "stratified_diverse"}
+
+    target_size = min(batch_size, len(examples))
+    all_indices = list(range(len(examples)))
+    selected: List[int] = []
+    selected_set: Set[int] = set()
+    component_counts = {"mistake": 0, "boundary": 0, "anchor": 0, "fill": 0}
+
+    scores, preds_pm, score_eval_errors = ensemble_scores(learners, examples)
+    if learners:
+        mistakes = [idx for idx, pred in enumerate(preds_pm) if pred is not None and pred != examples[idx].ypm]
+        correct = [idx for idx, pred in enumerate(preds_pm) if pred is not None and pred == examples[idx].ypm]
+    else:
+        mistakes = []
+        correct = []
+
+    if not learners:
+        selected = _select_label_balanced_diverse_indices(
+            all_indices,
+            target_size,
+            rng,
+            vectors,
+            weights,
+            examples,
+            pool_multiplier=pool_multiplier,
+        )
+        component_counts["fill"] = len(selected)
+    else:
+        mistake_target = max(0, int(round(target_size * mistake_frac)))
+        boundary_target = max(0, int(round(target_size * boundary_frac)))
+        anchor_target = max(0, target_size - mistake_target - boundary_target)
+        if anchor_frac > 0:
+            total_frac = max(mistake_frac + boundary_frac + anchor_frac, 1e-12)
+            anchor_target = max(0, int(round(target_size * anchor_frac / total_frac)))
+            remaining = target_size - anchor_target
+            mistake_target = max(0, int(round(remaining * mistake_frac / max(mistake_frac + boundary_frac, 1e-12))))
+            boundary_target = max(0, remaining - mistake_target)
+
+        mistake_selected = _select_label_balanced_diverse_indices(
+            mistakes,
+            mistake_target,
+            rng,
+            vectors,
+            weights,
+            examples,
+            excluded=selected_set,
+            pool_multiplier=pool_multiplier,
+        )
+        selected.extend(mistake_selected)
+        selected_set.update(mistake_selected)
+        component_counts["mistake"] = len(mistake_selected)
+
+        boundary_pool = sorted(
+            [idx for idx in all_indices if idx not in selected_set],
+            key=lambda idx: (abs(scores[idx]), -float(weights[idx])),
+        )
+        boundary_pool = boundary_pool[: max(boundary_target * max(pool_multiplier, 1), boundary_target, 256)]
+        boundary_selected = _select_label_balanced_diverse_indices(
+            boundary_pool,
+            boundary_target,
+            rng,
+            vectors,
+            weights,
+            examples,
+            excluded=selected_set,
+            pool_multiplier=pool_multiplier,
+        )
+        selected.extend(boundary_selected)
+        selected_set.update(boundary_selected)
+        component_counts["boundary"] = len(boundary_selected)
+
+        anchor_selected = _select_label_balanced_diverse_indices(
+            correct,
+            anchor_target,
+            rng,
+            vectors,
+            weights,
+            examples,
+            excluded=selected_set,
+            pool_multiplier=pool_multiplier,
+        )
+        selected.extend(anchor_selected)
+        selected_set.update(anchor_selected)
+        component_counts["anchor"] = len(anchor_selected)
+
+        if len(selected) < target_size:
+            fill_selected = _select_label_balanced_diverse_indices(
+                all_indices,
+                target_size - len(selected),
+                rng,
+                vectors,
+                weights,
+                examples,
+                excluded=selected_set,
+                pool_multiplier=pool_multiplier,
+            )
+            selected.extend(fill_selected)
+            selected_set.update(fill_selected)
+            component_counts["fill"] = len(fill_selected)
+
+    selected = selected[:target_size]
+    rng.shuffle(selected)
+    metadata = {
+        "sampling_strategy": "stratified_diverse",
+        "sampling_mistake_count": component_counts["mistake"],
+        "sampling_boundary_count": component_counts["boundary"],
+        "sampling_anchor_count": component_counts["anchor"],
+        "sampling_fill_count": component_counts["fill"],
+        "sampling_positive_count": sum(1 for idx in selected if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in selected if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": score_eval_errors,
+    }
+    return selected, [examples[idx].line for idx in selected], metadata
+
+
+def sample_feature_diverse_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    pool_multiplier: int,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    target_size = min(batch_size, len(examples))
+    selected = _select_weighted_diverse_indices(
+        list(range(len(examples))),
+        target_size,
+        rng,
+        vectors,
+        weights,
+        pool_multiplier=pool_multiplier,
+    )
+    metadata = {
+        "sampling_strategy": "feature_diverse",
+        "sampling_mistake_count": None,
+        "sampling_boundary_count": None,
+        "sampling_anchor_count": None,
+        "sampling_fill_count": len(selected),
+        "sampling_positive_count": sum(1 for idx in selected if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in selected if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": None,
+    }
+    return selected, [examples[idx].line for idx in selected], metadata
+
+
+def sample_label_balanced_diverse_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    vectors: np.ndarray,
+    pool_multiplier: int,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    target_size = min(batch_size, len(examples))
+    selected = _select_label_balanced_diverse_indices(
+        list(range(len(examples))),
+        target_size,
+        rng,
+        vectors,
+        weights,
+        examples,
+        pool_multiplier=pool_multiplier,
+    )
+    metadata = {
+        "sampling_strategy": "label_balanced_diverse",
+        "sampling_mistake_count": None,
+        "sampling_boundary_count": None,
+        "sampling_anchor_count": None,
+        "sampling_fill_count": len(selected),
+        "sampling_positive_count": sum(1 for idx in selected if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in selected if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": None,
+    }
+    return selected, [examples[idx].line for idx in selected], metadata
+
+
+def sample_training_batch(
+    examples: Sequence[Example],
+    weights: Sequence[float],
+    batch_size: int,
+    rng: random.Random,
+    cfg: BoostConfig,
+    learners: Sequence[Dict[str, Any]],
+    vectors: Optional[np.ndarray] = None,
+) -> Tuple[List[int], List[str], Dict[str, Any]]:
+    if cfg.sampling_strategy in {"feature_diverse", "label_balanced_diverse", "stratified_diverse"}:
+        if vectors is None:
+            vectors = build_feature_matrix(examples, cfg.sampler_feature_hash_dim)
+
+    if cfg.sampling_strategy == "feature_diverse":
+        return sample_feature_diverse_batch(
+            examples,
+            weights,
+            batch_size,
+            rng,
+            vectors,
+            cfg.sampler_pool_multiplier,
+        )
+
+    if cfg.sampling_strategy == "label_balanced_diverse":
+        return sample_label_balanced_diverse_batch(
+            examples,
+            weights,
+            batch_size,
+            rng,
+            vectors,
+            cfg.sampler_pool_multiplier,
+        )
+
+    if cfg.sampling_strategy == "stratified_diverse":
+        return sample_stratified_diverse_batch(
+            examples,
+            weights,
+            batch_size,
+            rng,
+            learners,
+            vectors,
+            cfg.sampler_mistake_frac,
+            cfg.sampler_boundary_frac,
+            cfg.sampler_anchor_frac,
+            cfg.sampler_pool_multiplier,
+        )
+
+    without_replacement = cfg.sampling_strategy == "weighted_without_replacement" or (
+        cfg.sampling_strategy == "weighted_random" and cfg.sample_without_replacement
+    )
+    indices, lines = sample_weighted_batch(
+        examples,
+        weights,
+        batch_size,
+        rng,
+        without_replacement=without_replacement,
+    )
+    metadata = {
+        "sampling_strategy": cfg.sampling_strategy,
+        "sampling_mistake_count": None,
+        "sampling_boundary_count": None,
+        "sampling_anchor_count": None,
+        "sampling_fill_count": None,
+        "sampling_positive_count": sum(1 for idx in indices if examples[idx].y01 == 1),
+        "sampling_negative_count": sum(1 for idx in indices if examples[idx].y01 == 0),
+        "sampling_score_eval_errors": None,
+    }
+    return indices, lines, metadata
+
+
+def split_prediction_outcomes(
+    fn_callable,
+    examples: Sequence[Example],
+) -> Tuple[List[str], List[str], int]:
+    correct_lines: List[str] = []
+    misclassified_lines: List[str] = []
+    eval_errors = 0
+    for example in examples:
+        try:
+            pred01 = predict_01(fn_callable, example.x)
+        except Exception:
+            pred01 = 1 - example.y01
+            eval_errors += 1
+        if pred01 == example.y01:
+            correct_lines.append(example.line)
+        else:
+            misclassified_lines.append(example.line)
+    return correct_lines, misclassified_lines, eval_errors
+
+
+def evaluate_batch_candidate(
+    code_str: str,
+    batch_examples: Sequence[Example],
+) -> BatchCandidate:
+    fn_callable = base_runner.compile_callable_from_code(code_str)
+    correct_lines, misclassified_lines, eval_errors = split_prediction_outcomes(
+        fn_callable,
+        batch_examples,
+    )
+    batch_acc = len(correct_lines) / len(batch_examples) if batch_examples else 0.0
+    return BatchCandidate(
+        code=code_str,
+        fn_callable=fn_callable,
+        batch_acc=batch_acc,
+        misclassified_lines=misclassified_lines,
+        correct_lines=correct_lines,
+        eval_errors=eval_errors,
+    )
+
+
+def evaluate_train_candidate(
+    fn_callable,
+    train_examples: Sequence[Example],
+    weights: Sequence[float],
+) -> TrainCandidateState:
+    correct_lines, misclassified_lines, _split_eval_errors = split_prediction_outcomes(
+        fn_callable,
+        train_examples,
+    )
+    weighted_error, train_preds_pm, eval_errors = evaluate_weighted_error(
+        fn_callable,
+        train_examples,
+        weights,
+    )
+    train_acc = len(correct_lines) / len(train_examples) if train_examples else 0.0
+    return TrainCandidateState(
+        correct_lines=correct_lines,
+        misclassified_lines=misclassified_lines,
+        train_acc=train_acc,
+        weighted_error=weighted_error,
+        train_preds_pm=train_preds_pm,
+        eval_errors=eval_errors,
+    )
+
+
+def _limited_lines(lines: Sequence[str], limit: int) -> List[str]:
+    if limit <= 0:
+        return []
+    return list(lines[:limit])
+
+
+def build_repair_prompt(
+    current_code: str,
+    mistake_lines: Sequence[str],
+    anchor_lines: Sequence[str],
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    if tabular:
+        input_description = "tabular comma-separated feature:value inputs"
+    elif decimal:
+        input_description = f"decimal vector inputs of length {seq_len}"
+    else:
+        input_description = f"binary vector inputs of length {seq_len}"
+
+    mistakes_block = "\n".join(mistake_lines) if mistake_lines else "(none)"
+    anchors_block = "\n".join(anchor_lines) if anchor_lines else "(none)"
+    code_block = textwrap.dedent(current_code).strip()
+    lines = [
+            f"Repair this Python classifier `f(x)` for {input_description}.",
+            "Return exactly one valid JSON object with one key, `code`, whose value is the complete revised function.",
+            "Do not include markdown, explanation, analysis, or text before or after the JSON.",
+    ]
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            "Current code:",
+            "```",
+            code_block,
+            "```",
+            "",
+            "Wrong examples, formatted as `input -> correct_output`:",
+            "```",
+            mistakes_block,
+            "```",
+            "",
+            "Correct anchor examples to preserve:",
+            "```",
+            anchors_block,
+            "```",
+            "",
+            "Rules:",
+            "- Keep the implementation concise and general.",
+            "- Use only built-in Python.",
+            "- Do not add file I/O, network calls, training loops, or lookup tables keyed by full rows.",
+            "- If uncertain, make the smallest general code change that fixes the wrong examples.",
+            '- Output only this JSON shape: {"code": "def f(x):\\n    ..."}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_minimal_repair_prompt(
+    current_code: str,
+    mistake_lines: Sequence[str],
+    anchor_lines: Sequence[str],
+    dataset_context: Optional[str] = None,
+) -> str:
+    mistakes_block = "\n".join(mistake_lines) if mistake_lines else "(none)"
+    anchors_block = "\n".join(anchor_lines) if anchor_lines else "(none)"
+    code_block = textwrap.dedent(current_code).strip()
+    lines = [
+            "Return only valid JSON. No markdown. No explanation.",
+            'JSON schema: {"code": "def f(x):\\n    ..."}',
+    ]
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            "Revise this function:",
+            "```",
+            code_block,
+            "```",
+            "",
+            "It is wrong on:",
+            "```",
+            mistakes_block,
+            "```",
+            "",
+            "Keep these correct if possible:",
+            "```",
+            anchors_block,
+            "```",
+        ]
+    )
+    return "\n".join(lines)
+
+
+def build_whole_train_repair_prompt(
+    current_code: str,
+    mistake_lines: Sequence[str],
+    recently_fixed_lines: Sequence[str],
+    anchor_lines: Sequence[str],
+    seq_len: int,
+    decimal: bool,
+    tabular: bool,
+    dataset_context: Optional[str] = None,
+) -> str:
+    if tabular:
+        input_description = "tabular comma-separated feature:value inputs"
+    elif decimal:
+        input_description = f"decimal vector inputs of length {seq_len}"
+    else:
+        input_description = f"binary vector inputs of length {seq_len}"
+
+    mistakes_block = "\n".join(mistake_lines) if mistake_lines else "(none)"
+    recent_block = "\n".join(recently_fixed_lines) if recently_fixed_lines else "(none)"
+    anchors_block = "\n".join(anchor_lines) if anchor_lines else "(none)"
+    code_block = textwrap.dedent(current_code).strip()
+    lines = [
+            f"Repair this Python classifier `f(x)` for {input_description}.",
+            "You are in an iterative curriculum repair loop over the whole training set.",
+            "Return exactly one valid JSON object with one key, `code`, whose value is the complete revised function.",
+            "Do not include markdown, explanation, analysis, or text before or after the JSON.",
+    ]
+    if dataset_context:
+        lines.extend(["", "Dataset context:", dataset_context])
+    lines.extend(
+        [
+            "",
+            "Current code:",
+            "```",
+            code_block,
+            "```",
+            "",
+            "Wrong examples that still need to be fixed:",
+            "```",
+            mistakes_block,
+            "```",
+            "",
+            "Recently fixed examples that should stay fixed:",
+            "```",
+            recent_block,
+            "```",
+            "",
+            "Correct anchor examples to preserve:",
+            "```",
+            anchors_block,
+            "```",
+            "",
+            "Rules:",
+            "- Keep the implementation concise and general.",
+            "- Use only built-in Python.",
+            "- Do not add file I/O, network calls, training loops, or lookup tables keyed by full rows.",
+            "- Prefer small general rule changes over memorizing examples.",
+            '- Output only this JSON shape: {"code": "def f(x):\\n    ..."}',
+        ]
+    )
+    return "\n".join(lines)
+
+
+def _sample_unique_lines(lines: Sequence[str], count: int, rng: random.Random) -> List[str]:
+    if count <= 0 or not lines:
+        return []
+    if count >= len(lines):
+        return list(lines)
+    return rng.sample(list(lines), count)
+
+
+def compose_whole_train_repair_batch(
+    mistake_lines: Sequence[str],
+    recently_fixed_lines: Sequence[str],
+    anchor_lines: Sequence[str],
+    total_size: int,
+    mistake_frac: float,
+    recent_fix_frac: float,
+    anchor_frac: float,
+    rng: random.Random,
+) -> Dict[str, List[str]]:
+    if total_size <= 0:
+        return {"mistakes": [], "recently_fixed": [], "anchors": [], "combined": []}
+
+    target_recent = max(0, int(round(total_size * recent_fix_frac)))
+    target_anchor = max(0, int(round(total_size * anchor_frac)))
+    target_mistakes = max(0, total_size - target_recent - target_anchor)
+
+    selected_mistakes = _sample_unique_lines(mistake_lines, target_mistakes, rng)
+    selected_recent = _sample_unique_lines(recently_fixed_lines, target_recent, rng)
+    selected_anchors = _sample_unique_lines(anchor_lines, target_anchor, rng)
+
+    combined = list(selected_mistakes) + list(selected_recent) + list(selected_anchors)
+    selected_set = set(combined)
+    remaining_pools = [
+        [line for line in mistake_lines if line not in selected_set],
+        [line for line in recently_fixed_lines if line not in selected_set],
+        [line for line in anchor_lines if line not in selected_set],
+    ]
+    while len(combined) < total_size:
+        filled = False
+        for pool in remaining_pools:
+            if not pool:
+                continue
+            pick_idx = rng.randrange(len(pool))
+            picked = pool.pop(pick_idx)
+            if picked in selected_set:
+                continue
+            combined.append(picked)
+            selected_set.add(picked)
+            filled = True
+            if len(combined) >= total_size:
+                break
+        if not filled:
+            break
+
+    rng.shuffle(combined)
+    return {
+        "mistakes": selected_mistakes,
+        "recently_fixed": selected_recent,
+        "anchors": selected_anchors,
+        "combined": combined,
+    }
+
+
+def should_run_batch_repair(
+    candidate: BatchCandidate,
+    cfg: BoostConfig,
+    initial_weighted_error: Optional[float],
+) -> Tuple[bool, str]:
+    if cfg.repair_rounds <= 0:
+        return False, "repair_disabled"
+    if len(candidate.misclassified_lines) < cfg.repair_trigger_min_mistakes:
+        return False, "skipped_gate_min_mistakes"
+
+    batch_gate = cfg.repair_trigger_batch_acc_below
+    weighted_gate = cfg.repair_trigger_weighted_error_above
+    if batch_gate is None and weighted_gate is None:
+        return True, "run_default"
+
+    trigger_reasons: List[str] = []
+    if batch_gate is not None and candidate.batch_acc < batch_gate:
+        trigger_reasons.append("batch_acc")
+    if weighted_gate is not None and initial_weighted_error is not None and initial_weighted_error > weighted_gate:
+        trigger_reasons.append("weighted_error")
+    if trigger_reasons:
+        return True, "run_gate_" + "_".join(trigger_reasons)
+
+    if batch_gate is not None and candidate.batch_acc >= batch_gate:
+        return False, "skipped_gate_batch_acc"
+    if weighted_gate is not None:
+        return False, "skipped_gate_weighted_error"
+    return False, "skipped_gate"
+
+
+def should_accept_whole_train_repair(
+    current_state: TrainCandidateState,
+    candidate_state: TrainCandidateState,
+) -> bool:
+    eps = 1e-12
+    if candidate_state.train_acc > current_state.train_acc + eps:
+        return True
+    if candidate_state.train_acc < current_state.train_acc - eps:
+        return False
+    if candidate_state.weighted_error < current_state.weighted_error - eps:
+        return True
+    if candidate_state.weighted_error > current_state.weighted_error + eps:
+        return False
+    return len(candidate_state.misclassified_lines) < len(current_state.misclassified_lines)
+
+
+def evaluate_ensemble_accuracy(
+    learners: Sequence[Dict[str, Any]],
+    examples: Sequence[Example],
+) -> float:
+    if not learners or not examples:
+        return 0.0
+    correct = 0
+    for example in examples:
+        score = 0.0
+        for learner in learners:
+            try:
+                pred01 = predict_01(learner["callable"], example.x)
+            except Exception:
+                pred01 = 0
+            score += learner["alpha"] * (1.0 if pred01 == 1 else -1.0)
+        pred01 = 1 if score >= 0.0 else 0
+        correct += int(pred01 == example.y01)
+    return correct / len(examples)
+
+
+def extract_function_name(code_str: str) -> str:
+    tree = ast.parse(textwrap.dedent(code_str.strip()))
+    for node in tree.body:
+        if isinstance(node, ast.FunctionDef):
+            return node.name
+    raise ValueError("No function definition found in learner code.")
+
+
+def build_ensemble_module(learners: Sequence[Dict[str, Any]]) -> str:
+    parts: List[str] = [
+        '"""Auto-generated boosted ensemble wrapper."""',
+        "from typing import Any",
+        "",
+    ]
+
+    for idx, learner in enumerate(learners, start=1):
+        code = textwrap.dedent(learner["code"]).strip()
+        fn_name = extract_function_name(code)
+        parts.append(f"# Learner {idx}")
+        parts.append(code)
+        parts.append(f"h_{idx} = {fn_name}")
+        parts.append("")
+
+    alpha_str = ", ".join(f"{learner['alpha']:.16g}" for learner in learners)
+    learner_refs = ", ".join(f"h_{idx}" for idx in range(1, len(learners) + 1))
+    parts.extend(
+        [
+            f"ALPHAS = [{alpha_str}]",
+            f"LEARNERS = [{learner_refs}]",
+            "",
+            "def _normalize_pred_to_pm1(pred: Any) -> int:",
+            "    try:",
+            "        if hasattr(pred, 'item'):",
+            "            pred = pred.item()",
+            "    except Exception:",
+            "        pass",
+            "    if isinstance(pred, bool):",
+            "        return 1 if pred else -1",
+            "    if isinstance(pred, int):",
+            "        return 1 if pred != 0 else -1",
+            "    if isinstance(pred, str):",
+            "        s = pred.strip().strip(\"\\\"'\")",
+            "        if s in ('1', 'true', 'True'):",
+            "            return 1",
+            "        if s in ('0', 'false', 'False', ''):",
+            "            return -1",
+            "        try:",
+            "            return 1 if int(float(s)) != 0 else -1",
+            "        except Exception:",
+            "            return 1 if s else -1",
+            "    return 1 if pred else -1",
+            "",
+            "def f(x: Any) -> int:",
+            "    score = 0.0",
+            "    for alpha, learner in zip(ALPHAS, LEARNERS):",
+            "        score += alpha * _normalize_pred_to_pm1(learner(x))",
+            "    return 1 if score >= 0.0 else 0",
+            "",
+        ]
+    )
+    return "\n".join(parts)
+
+
+def serialize_attempt_row(row: Dict[str, Any]) -> Dict[str, Any]:
+    serializable = dict(row)
+    serializable.pop("callable", None)
+    return serializable
+
+
+def summarize_response_accounting(
+    res: Dict[str, Any],
+    fallback_model: Optional[str],
+) -> Dict[str, Any]:
+    usage = res.get("usage") or {}
+    prompt_tokens = usage.get("prompt_tokens")
+    completion_tokens = usage.get("completion_tokens")
+    reasoning_tokens = usage.get("reasoning_tokens")
+    returned_model = res.get("returned_model")
+    request_model = res.get("request_model") or fallback_model
+    pricing_model_name = returned_model or request_model or fallback_model
+    cost_info = estimate_cost_usd(pricing_model_name, prompt_tokens, completion_tokens)
+    return {
+        "request_model": request_model,
+        "returned_model": returned_model,
+        "pricing_known": cost_info["pricing_model"] is not None,
+        "prompt_tokens": int(prompt_tokens or 0),
+        "completion_tokens": int(completion_tokens or 0),
+        "reasoning_tokens": int(reasoning_tokens or 0),
+        "pricing_model": cost_info["pricing_model"],
+        "input_rate_per_million": cost_info["input_rate_per_million"],
+        "output_rate_per_million": cost_info["output_rate_per_million"],
+        "estimated_input_cost_usd": float(cost_info["estimated_input_cost_usd"] or 0.0),
+        "estimated_output_cost_usd": float(cost_info["estimated_output_cost_usd"] or 0.0),
+        "estimated_total_cost_usd": float(cost_info["estimated_total_cost_usd"] or 0.0),
+        "tool_uses": int(res.get("tool_uses") or 0),
+        "duration_ms": int(res.get("duration_ms") or 0),
+    }
+
+
+async def run_boosting_trial(
+    client: base_runner.Runner,
+    log: logging.Logger,
+    fn: str,
+    length: int,
+    target_name: str,
+    train_lines: Sequence[str],
+    val_lines: Sequence[str],
+    test_lines: Sequence[str],
+    is_decimal: bool,
+    is_tabular: bool,
+    cfg: BoostConfig,
+    batch_size: int,
+    trial_idx: int,
+) -> Tuple[Dict[str, Any], List[Dict[str, Any]], List[Dict[str, Any]]]:
+    train_examples = parse_examples(train_lines, is_tabular)
+    val_examples = parse_examples(val_lines, is_tabular)
+    test_examples = parse_examples(test_lines, is_tabular)
+    if not train_examples:
+        raise ValueError("Training split is empty.")
+
+    weights = [1.0 / len(train_examples)] * len(train_examples)
+    learners: List[Dict[str, Any]] = []
+    accepted_rounds: List[Dict[str, Any]] = []
+    attempt_rows: List[Dict[str, Any]] = []
+    labels_pm = [example.ypm for example in train_examples]
+    rng = random.Random(_stable_seed("boost", fn, length, batch_size, trial_idx, client.cfg.seed))
+    attempt_counter = 0
+    stopped_reason = "max_rounds_reached"
+    best_val_acc = -1.0
+    best_val_round_count = 0
+    val_rounds_without_improvement = 0
+    total_prompt_tokens = 0
+    total_completion_tokens = 0
+    total_reasoning_tokens = 0
+    total_estimated_cost_usd = 0.0
+    total_estimated_cost_pricing_known = True
+    fallback_model = getattr(getattr(client, "cfg", None), "model", None)
+    dataset_context = get_dataset_context(
+        target_name,
+        cfg.cdc_representation,
+        cfg.tabular_representation,
+        cfg.dataset_context_mode,
+    )
+    feature_matrix = (
+        build_feature_matrix(train_examples, cfg.sampler_feature_hash_dim)
+        if cfg.sampling_strategy in {"feature_diverse", "label_balanced_diverse", "stratified_diverse"}
+        else None
+    )
+
+    def add_response_accounting(res: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal total_prompt_tokens
+        nonlocal total_completion_tokens
+        nonlocal total_reasoning_tokens
+        nonlocal total_estimated_cost_usd
+        nonlocal total_estimated_cost_pricing_known
+        accounting = summarize_response_accounting(res, fallback_model)
+        total_prompt_tokens += int(accounting["prompt_tokens"] or 0)
+        total_completion_tokens += int(accounting["completion_tokens"] or 0)
+        total_reasoning_tokens += int(accounting["reasoning_tokens"] or 0)
+        if not accounting.get("pricing_known", False):
+            total_estimated_cost_pricing_known = False
+        total_estimated_cost_usd += float(accounting["estimated_total_cost_usd"] or 0.0)
+        return accounting
+
+    def update_validation_progress(ensemble_val_acc: Optional[float], learner_count: int) -> None:
+        nonlocal best_val_acc
+        nonlocal best_val_round_count
+        nonlocal val_rounds_without_improvement
+        nonlocal stopped_reason
+        if ensemble_val_acc is None or cfg.early_stop_val_patience <= 0:
+            return
+        current_val_acc = float(ensemble_val_acc)
+        if current_val_acc > best_val_acc + cfg.early_stop_val_min_delta:
+            best_val_acc = current_val_acc
+            best_val_round_count = learner_count
+            val_rounds_without_improvement = 0
+        else:
+            val_rounds_without_improvement += 1
+            if val_rounds_without_improvement >= cfg.early_stop_val_patience:
+                stopped_reason = "val_early_stop"
+
+    for round_idx in range(1, cfg.boost_rounds + 1):
+        sampled_indices, sampled_lines, sample_metadata = sample_training_batch(
+            train_examples,
+            weights,
+            batch_size,
+            rng,
+            cfg,
+            learners,
+            feature_matrix,
+        )
+        sampled_unique = len(set(sampled_indices))
+        accepted_this_round = False
+        best_fallback: Optional[Dict[str, Any]] = None
+        round_candidates: List[Dict[str, Any]] = []
+        baseline_ensemble_val_acc = (
+            evaluate_ensemble_accuracy(learners, val_examples)
+            if learners and val_examples
+            else None
+        )
+
+        for retry_idx in range(1, cfg.round_retries + 1):
+            if retry_idx > 1 and cfg.resample_each_retry:
+                sampled_indices, sampled_lines, sample_metadata = sample_training_batch(
+                    train_examples,
+                    weights,
+                    batch_size,
+                    rng,
+                    cfg,
+                    learners,
+                    feature_matrix,
+                )
+                sampled_unique = len(set(sampled_indices))
+
+            api_attempt_start = attempt_counter + 1
+            candidate_source_history: List[Dict[str, Any]] = []
+            chain_prompt_tokens = 0
+            chain_completion_tokens = 0
+            chain_reasoning_tokens = 0
+            chain_input_cost = 0.0
+            chain_output_cost = 0.0
+            chain_total_cost = 0.0
+            chain_tool_uses = 0
+            chain_duration_ms = 0
+            request_model = None
+            returned_model = None
+            pricing_model = None
+            input_rate_per_million = None
+            output_rate_per_million = None
+            code_attempt_number = api_attempt_start
+
+            def merge_accounting(accounting: Dict[str, Any]) -> None:
+                nonlocal chain_prompt_tokens
+                nonlocal chain_completion_tokens
+                nonlocal chain_reasoning_tokens
+                nonlocal chain_input_cost
+                nonlocal chain_output_cost
+                nonlocal chain_total_cost
+                nonlocal chain_tool_uses
+                nonlocal chain_duration_ms
+                nonlocal request_model
+                nonlocal returned_model
+                nonlocal pricing_model
+                nonlocal input_rate_per_million
+                nonlocal output_rate_per_million
+                chain_prompt_tokens += int(accounting["prompt_tokens"] or 0)
+                chain_completion_tokens += int(accounting["completion_tokens"] or 0)
+                chain_reasoning_tokens += int(accounting["reasoning_tokens"] or 0)
+                chain_input_cost += float(accounting["estimated_input_cost_usd"] or 0.0)
+                chain_output_cost += float(accounting["estimated_output_cost_usd"] or 0.0)
+                chain_total_cost += float(accounting["estimated_total_cost_usd"] or 0.0)
+                chain_tool_uses += int(accounting["tool_uses"] or 0)
+                chain_duration_ms += int(accounting["duration_ms"] or 0)
+                request_model = accounting["request_model"] or request_model
+                returned_model = accounting["returned_model"] or returned_model
+                pricing_model = accounting["pricing_model"] or pricing_model
+                input_rate_per_million = accounting["input_rate_per_million"] or input_rate_per_million
+                output_rate_per_million = accounting["output_rate_per_million"] or output_rate_per_million
+
+            if cfg.prompt_strategy == "analyze_then_code":
+                attempt_counter += 1
+                analysis_prompt = build_analysis_prompt(
+                    list(sampled_lines),
+                    length,
+                    is_decimal,
+                    is_tabular,
+                    dataset_context=dataset_context,
+                )
+                analysis_res = await client._call_once(
+                    fn,
+                    length,
+                    attempt_counter,
+                    sampled_lines,
+                    decimal=is_decimal,
+                    tabular=is_tabular,
+                    prompt_override=analysis_prompt,
+                )
+                analysis_text = analysis_res.get("text") or ""
+                analysis_accounting = add_response_accounting(analysis_res)
+                merge_accounting(analysis_accounting)
+                append_candidate_source_event(
+                    candidate_source_history,
+                    stage="analysis",
+                    api_attempt=attempt_counter,
+                    code=None,
+                    response_text=analysis_text,
+                    status="analysis_generated" if analysis_text else "analysis_empty",
+                )
+
+                attempt_counter += 1
+                initial_prompt = build_code_from_analysis_prompt(
+                    list(sampled_lines),
+                    analysis_text,
+                    length,
+                    is_decimal,
+                    is_tabular,
+                    dataset_context=dataset_context,
+                )
+                res = await client._call_once(
+                    fn,
+                    length,
+                    attempt_counter,
+                    sampled_lines,
+                    decimal=is_decimal,
+                    tabular=is_tabular,
+                    prompt_override=initial_prompt,
+                )
+                code_attempt_number = attempt_counter
+            else:
+                attempt_counter += 1
+                if dataset_context:
+                    initial_prompt = build_generation_prompt(
+                        list(sampled_lines),
+                        length,
+                        is_decimal,
+                        is_tabular,
+                        dataset_context=dataset_context,
+                    )
+                    res = await client._call_once(
+                        fn,
+                        length,
+                        attempt_counter,
+                        sampled_lines,
+                        decimal=is_decimal,
+                        tabular=is_tabular,
+                        prompt_override=initial_prompt,
+                    )
+                    code_attempt_number = attempt_counter
+                else:
+                    res = await client._call_once(
+                        fn,
+                        length,
+                        attempt_counter,
+                        sampled_lines,
+                        decimal=is_decimal,
+                        tabular=is_tabular,
+                    )
+                    code_attempt_number = attempt_counter
+
+            response_text = res.get("text") or ""
+            code_str = base_runner.extract_code_from_output(response_text)
+            first_accounting = add_response_accounting(res)
+            merge_accounting(first_accounting)
+            batch_examples = [train_examples[idx] for idx in sampled_indices]
+            repair_history: List[Dict[str, Any]] = []
+            append_candidate_source_event(
+                candidate_source_history,
+                stage="initial",
+                api_attempt=code_attempt_number,
+                code=code_str,
+                response_text=response_text,
+            )
+            row: Dict[str, Any] = {
+                "fn": fn,
+                "target_name": target_name,
+                "length": length,
+                "batch_size": batch_size,
+                "trial": trial_idx,
+                "round": round_idx,
+                "retry": retry_idx,
+                "attempt": api_attempt_start,
+                "api_attempt_start": api_attempt_start,
+                "api_attempt_end": attempt_counter,
+                "accepted": False,
+                "sampled_unique": sampled_unique,
+                "sampled_duplicate_count": len(sampled_indices) - sampled_unique,
+                "sampling_strategy": sample_metadata.get("sampling_strategy"),
+                "sampling_mistake_count": sample_metadata.get("sampling_mistake_count"),
+                "sampling_boundary_count": sample_metadata.get("sampling_boundary_count"),
+                "sampling_anchor_count": sample_metadata.get("sampling_anchor_count"),
+                "sampling_fill_count": sample_metadata.get("sampling_fill_count"),
+                "sampling_positive_count": sample_metadata.get("sampling_positive_count"),
+                "sampling_negative_count": sample_metadata.get("sampling_negative_count"),
+                "sampling_score_eval_errors": sample_metadata.get("sampling_score_eval_errors"),
+                "compile_error": None,
+                "weighted_error": None,
+                "alpha": None,
+                "batch_acc": None,
+                "train_acc": None,
+                "val_acc": None,
+                "test_acc": None,
+                "ensemble_train_acc": None,
+                "ensemble_val_acc": None,
+                "ensemble_test_acc": None,
+                "request_model": request_model,
+                "returned_model": returned_model,
+                "prompt_tokens": chain_prompt_tokens,
+                "completion_tokens": chain_completion_tokens,
+                "reasoning_tokens": chain_reasoning_tokens,
+                "pricing_model": pricing_model,
+                "input_rate_per_million": input_rate_per_million,
+                "output_rate_per_million": output_rate_per_million,
+                "estimated_input_cost_usd": chain_input_cost,
+                "estimated_output_cost_usd": chain_output_cost,
+                "estimated_total_cost_usd": chain_total_cost,
+                "tool_uses": chain_tool_uses,
+                "duration_ms": chain_duration_ms,
+                "repair_rounds_requested": cfg.repair_rounds,
+                "repair_calls": 0,
+                "repair_best_step": None,
+                "repair_gate_reason": None,
+                "repair_gate_weighted_error": None,
+                "repair_initial_batch_acc": None,
+                "repair_final_batch_acc": None,
+                "repair_history": None,
+                "whole_train_repair_rounds_requested": cfg.whole_train_repair_rounds,
+                "candidate_selection": cfg.candidate_selection,
+                "dataset_context_mode": cfg.dataset_context_mode,
+                "tabular_numeric_transform": cfg.tabular_numeric_transform,
+                "prompt_strategy": cfg.prompt_strategy,
+                "candidate_selected": False,
+                "candidate_reject_reason": None,
+                "candidate_ensemble_train_acc": None,
+                "candidate_ensemble_val_acc": None,
+                "candidate_ensemble_test_acc": None,
+                "candidate_ensemble_val_drop": None,
+                "candidate_code_sha256": None,
+                "candidate_code_chars": 0,
+                "candidate_source_count": 0,
+                "candidate_source_stages": None,
+                "candidate_code": None,
+                "candidate_source_history": [],
+            }
+
+            if not code_str:
+                row["compile_error"] = "no_code_found"
+                set_candidate_source_metadata(
+                    row,
+                    final_code=None,
+                    source_history=candidate_source_history,
+                )
+                attempt_rows.append(serialize_attempt_row(row))
+                continue
+
+            try:
+                best_candidate = evaluate_batch_candidate(code_str, batch_examples)
+                repair_history.append(
+                    {
+                        "step": 0,
+                        "status": "initial",
+                        "batch_acc": best_candidate.batch_acc,
+                        "mistakes": len(best_candidate.misclassified_lines),
+                        "eval_errors": best_candidate.eval_errors,
+                        "accepted_as_best": True,
+                    }
+                )
+                initial_train_state: Optional[TrainCandidateState] = None
+                initial_weighted_error_for_gate: Optional[float] = None
+                if cfg.repair_trigger_weighted_error_above is not None:
+                    initial_train_state = evaluate_train_candidate(best_candidate.fn_callable, train_examples, weights)
+                    initial_weighted_error_for_gate = initial_train_state.weighted_error
+
+                should_repair, repair_gate_reason = should_run_batch_repair(
+                    best_candidate,
+                    cfg,
+                    initial_weighted_error_for_gate,
+                )
+                row["repair_gate_reason"] = repair_gate_reason
+                row["repair_gate_weighted_error"] = initial_weighted_error_for_gate
+
+                if should_repair:
+                    for repair_step in range(1, cfg.repair_rounds + 1):
+                        if not best_candidate.misclassified_lines:
+                            repair_history.append(
+                                {
+                                    "step": repair_step,
+                                    "status": "skipped_no_mistakes",
+                                    "batch_acc": best_candidate.batch_acc,
+                                    "mistakes": 0,
+                                    "accepted_as_best": False,
+                                }
+                            )
+                            break
+
+                        mistake_lines = _limited_lines(
+                            best_candidate.misclassified_lines,
+                            cfg.repair_mistake_limit,
+                        )
+                        anchor_lines = _limited_lines(
+                            best_candidate.correct_lines,
+                            cfg.repair_anchor_count,
+                        )
+                        repair_prompt = build_repair_prompt(
+                            best_candidate.code,
+                            mistake_lines,
+                            anchor_lines,
+                            length,
+                            is_decimal,
+                            is_tabular,
+                            dataset_context=dataset_context,
+                        )
+
+                        attempt_counter += 1
+                        repair_res = await client._call_once(
+                            fn,
+                            length,
+                            attempt_counter,
+                            mistake_lines,
+                            decimal=is_decimal,
+                            tabular=is_tabular,
+                            prompt_override=repair_prompt,
+                        )
+                        repair_accounting = add_response_accounting(repair_res)
+                        chain_prompt_tokens += int(repair_accounting["prompt_tokens"] or 0)
+                        chain_completion_tokens += int(repair_accounting["completion_tokens"] or 0)
+                        chain_reasoning_tokens += int(repair_accounting["reasoning_tokens"] or 0)
+                        chain_input_cost += float(repair_accounting["estimated_input_cost_usd"] or 0.0)
+                        chain_output_cost += float(repair_accounting["estimated_output_cost_usd"] or 0.0)
+                        chain_total_cost += float(repair_accounting["estimated_total_cost_usd"] or 0.0)
+                        chain_tool_uses += int(repair_accounting["tool_uses"] or 0)
+                        chain_duration_ms += int(repair_accounting["duration_ms"] or 0)
+                        request_model = repair_accounting["request_model"] or request_model
+                        returned_model = repair_accounting["returned_model"] or returned_model
+                        pricing_model = repair_accounting["pricing_model"] or pricing_model
+                        input_rate_per_million = repair_accounting["input_rate_per_million"] or input_rate_per_million
+                        output_rate_per_million = repair_accounting["output_rate_per_million"] or output_rate_per_million
+
+                        repair_text = repair_res.get("text") or ""
+                        repaired_code = base_runner.extract_code_from_output(repair_text)
+                        append_candidate_source_event(
+                            candidate_source_history,
+                            stage="batch_repair",
+                            api_attempt=attempt_counter,
+                            code=repaired_code,
+                            response_text=repair_text,
+                        )
+                        repair_status = "repair"
+                        if not repaired_code:
+                            repair_history.append(
+                                {
+                                    "step": repair_step,
+                                    "status": "no_code_found",
+                                    "response_chars": len(repair_text),
+                                    "empty_response": len(repair_text.strip()) == 0,
+                                    "batch_acc": best_candidate.batch_acc,
+                                    "mistakes": len(best_candidate.misclassified_lines),
+                                    "accepted_as_best": False,
+                                }
+                            )
+                            fallback_prompt = build_minimal_repair_prompt(
+                                best_candidate.code,
+                                _limited_lines(mistake_lines, min(len(mistake_lines), 8)),
+                                _limited_lines(anchor_lines, min(len(anchor_lines), 4)),
+                                dataset_context=dataset_context,
+                            )
+                            attempt_counter += 1
+                            fallback_res = await client._call_once(
+                                fn,
+                                length,
+                                attempt_counter,
+                                mistake_lines,
+                                decimal=is_decimal,
+                                tabular=is_tabular,
+                                prompt_override=fallback_prompt,
+                            )
+                            fallback_accounting = add_response_accounting(fallback_res)
+                            chain_prompt_tokens += int(fallback_accounting["prompt_tokens"] or 0)
+                            chain_completion_tokens += int(fallback_accounting["completion_tokens"] or 0)
+                            chain_reasoning_tokens += int(fallback_accounting["reasoning_tokens"] or 0)
+                            chain_input_cost += float(fallback_accounting["estimated_input_cost_usd"] or 0.0)
+                            chain_output_cost += float(fallback_accounting["estimated_output_cost_usd"] or 0.0)
+                            chain_total_cost += float(fallback_accounting["estimated_total_cost_usd"] or 0.0)
+                            chain_tool_uses += int(fallback_accounting["tool_uses"] or 0)
+                            chain_duration_ms += int(fallback_accounting["duration_ms"] or 0)
+                            request_model = fallback_accounting["request_model"] or request_model
+                            returned_model = fallback_accounting["returned_model"] or returned_model
+                            pricing_model = fallback_accounting["pricing_model"] or pricing_model
+                            input_rate_per_million = fallback_accounting["input_rate_per_million"] or input_rate_per_million
+                            output_rate_per_million = fallback_accounting["output_rate_per_million"] or output_rate_per_million
+
+                            fallback_text = fallback_res.get("text") or ""
+                            repaired_code = base_runner.extract_code_from_output(fallback_text)
+                            append_candidate_source_event(
+                                candidate_source_history,
+                                stage="batch_repair_fallback",
+                                api_attempt=attempt_counter,
+                                code=repaired_code,
+                                response_text=fallback_text,
+                            )
+                            repair_status = "fallback_repair"
+                            if not repaired_code:
+                                repair_history.append(
+                                    {
+                                        "step": repair_step,
+                                        "status": "fallback_no_code_found",
+                                        "response_chars": len(fallback_text),
+                                        "empty_response": len(fallback_text.strip()) == 0,
+                                        "batch_acc": best_candidate.batch_acc,
+                                        "mistakes": len(best_candidate.misclassified_lines),
+                                        "accepted_as_best": False,
+                                    }
+                                )
+                                break
+
+                        try:
+                            repaired_candidate = evaluate_batch_candidate(repaired_code, batch_examples)
+                        except Exception as repair_exc:
+                            repair_history.append(
+                                {
+                                    "step": repair_step,
+                                    "status": f"{repair_status}_compile_error",
+                                    "error": str(repair_exc),
+                                    "batch_acc": best_candidate.batch_acc,
+                                    "mistakes": len(best_candidate.misclassified_lines),
+                                    "accepted_as_best": False,
+                                }
+                            )
+                            break
+
+                        accepted_repair = repaired_candidate.batch_acc >= best_candidate.batch_acc
+                        if accepted_repair:
+                            best_candidate = repaired_candidate
+                        repair_history.append(
+                            {
+                                "step": repair_step,
+                                "status": repair_status,
+                                "batch_acc": repaired_candidate.batch_acc,
+                                "mistakes": len(repaired_candidate.misclassified_lines),
+                                "eval_errors": repaired_candidate.eval_errors,
+                                "accepted_as_best": accepted_repair,
+                            }
+                        )
+                else:
+                    repair_history.append(
+                        {
+                            "step": 1,
+                            "status": repair_gate_reason,
+                            "batch_acc": best_candidate.batch_acc,
+                            "mistakes": len(best_candidate.misclassified_lines),
+                            "accepted_as_best": False,
+                        }
+                    )
+
+                code_str = best_candidate.code
+                fn_callable = best_candidate.fn_callable
+                batch_acc = best_candidate.batch_acc
+                train_state = evaluate_train_candidate(fn_callable, train_examples, weights)
+                current_recently_fixed_lines: List[str] = []
+                previous_mistake_lines = list(train_state.misclassified_lines)
+
+                for repair_step in range(1, cfg.whole_train_repair_rounds + 1):
+                    if not train_state.misclassified_lines:
+                        repair_history.append(
+                            {
+                                "step": cfg.repair_rounds + repair_step,
+                                "status": "whole_train_skipped_no_mistakes",
+                                "train_acc": train_state.train_acc,
+                                "mistakes": 0,
+                                "accepted_as_best": False,
+                            }
+                        )
+                        break
+
+                    sampled_curriculum = compose_whole_train_repair_batch(
+                        train_state.misclassified_lines,
+                        current_recently_fixed_lines,
+                        train_state.correct_lines,
+                        cfg.whole_train_repair_batch_size,
+                        cfg.whole_train_mistake_frac,
+                        cfg.whole_train_recent_fix_frac,
+                        cfg.whole_train_anchor_frac,
+                        rng,
+                    )
+                    whole_prompt = build_whole_train_repair_prompt(
+                        code_str,
+                        sampled_curriculum["mistakes"],
+                        sampled_curriculum["recently_fixed"],
+                        sampled_curriculum["anchors"],
+                        length,
+                        is_decimal,
+                        is_tabular,
+                        dataset_context=dataset_context,
+                    )
+
+                    attempt_counter += 1
+                    whole_res = await client._call_once(
+                        fn,
+                        length,
+                        attempt_counter,
+                        sampled_curriculum["combined"],
+                        decimal=is_decimal,
+                        tabular=is_tabular,
+                        prompt_override=whole_prompt,
+                    )
+                    whole_accounting = add_response_accounting(whole_res)
+                    chain_prompt_tokens += int(whole_accounting["prompt_tokens"] or 0)
+                    chain_completion_tokens += int(whole_accounting["completion_tokens"] or 0)
+                    chain_reasoning_tokens += int(whole_accounting["reasoning_tokens"] or 0)
+                    chain_input_cost += float(whole_accounting["estimated_input_cost_usd"] or 0.0)
+                    chain_output_cost += float(whole_accounting["estimated_output_cost_usd"] or 0.0)
+                    chain_total_cost += float(whole_accounting["estimated_total_cost_usd"] or 0.0)
+                    chain_tool_uses += int(whole_accounting["tool_uses"] or 0)
+                    chain_duration_ms += int(whole_accounting["duration_ms"] or 0)
+                    request_model = whole_accounting["request_model"] or request_model
+                    returned_model = whole_accounting["returned_model"] or returned_model
+                    pricing_model = whole_accounting["pricing_model"] or pricing_model
+                    input_rate_per_million = whole_accounting["input_rate_per_million"] or input_rate_per_million
+                    output_rate_per_million = whole_accounting["output_rate_per_million"] or output_rate_per_million
+
+                    whole_text = whole_res.get("text") or ""
+                    whole_code = base_runner.extract_code_from_output(whole_text)
+                    append_candidate_source_event(
+                        candidate_source_history,
+                        stage="whole_train_repair",
+                        api_attempt=attempt_counter,
+                        code=whole_code,
+                        response_text=whole_text,
+                    )
+                    history_step = cfg.repair_rounds + repair_step
+                    if not whole_code:
+                        repair_history.append(
+                            {
+                                "step": history_step,
+                                "status": "whole_train_no_code_found",
+                                "response_chars": len(whole_text),
+                                "empty_response": len(whole_text.strip()) == 0,
+                                "train_acc": train_state.train_acc,
+                                "mistakes": len(train_state.misclassified_lines),
+                                "sampled_mistakes": len(sampled_curriculum["mistakes"]),
+                                "sampled_recently_fixed": len(sampled_curriculum["recently_fixed"]),
+                                "sampled_anchors": len(sampled_curriculum["anchors"]),
+                                "accepted_as_best": False,
+                            }
+                        )
+                        break
+
+                    try:
+                        whole_candidate_callable = base_runner.compile_callable_from_code(whole_code)
+                        candidate_train_state = evaluate_train_candidate(
+                            whole_candidate_callable,
+                            train_examples,
+                            weights,
+                        )
+                    except Exception as whole_exc:
+                        repair_history.append(
+                            {
+                                "step": history_step,
+                                "status": "whole_train_compile_error",
+                                "error": str(whole_exc),
+                                "train_acc": train_state.train_acc,
+                                "mistakes": len(train_state.misclassified_lines),
+                                "accepted_as_best": False,
+                            }
+                        )
+                        break
+
+                    accepted_whole_train = should_accept_whole_train_repair(train_state, candidate_train_state)
+                    if accepted_whole_train:
+                        code_str = whole_code
+                        fn_callable = whole_candidate_callable
+                        train_state = candidate_train_state
+                        current_recently_fixed_lines = [
+                            line for line in previous_mistake_lines if line not in set(train_state.misclassified_lines)
+                        ]
+                        previous_mistake_lines = list(train_state.misclassified_lines)
+
+                    repair_history.append(
+                        {
+                            "step": history_step,
+                            "status": "whole_train_repair",
+                            "train_acc": candidate_train_state.train_acc,
+                            "weighted_error": candidate_train_state.weighted_error,
+                            "mistakes": len(candidate_train_state.misclassified_lines),
+                            "sampled_mistakes": len(sampled_curriculum["mistakes"]),
+                            "sampled_recently_fixed": len(sampled_curriculum["recently_fixed"]),
+                            "sampled_anchors": len(sampled_curriculum["anchors"]),
+                            "accepted_as_best": accepted_whole_train,
+                        }
+                    )
+
+                batch_acc = evaluate_batch_candidate(code_str, batch_examples).batch_acc
+                train_acc = train_state.train_acc
+                val_acc = (
+                    base_runner.evaluate_accuracy(fn_callable, list(val_lines), log, is_tabular)
+                    if val_lines
+                    else None
+                )
+                test_acc = base_runner.evaluate_accuracy(fn_callable, list(test_lines), log, is_tabular)
+                weighted_error = train_state.weighted_error
+                train_preds_pm = train_state.train_preds_pm
+                eval_errors = train_state.eval_errors
+
+                eps = min(max(weighted_error, 1e-12), 1.0 - 1e-12)
+                alpha = 0.5 * math.log((1.0 - eps) / eps)
+
+                row.update(
+                    {
+                        "weighted_error": weighted_error,
+                        "alpha": alpha,
+                        "batch_acc": batch_acc,
+                        "train_acc": train_acc,
+                        "val_acc": val_acc,
+                        "test_acc": test_acc,
+                        "eval_errors": eval_errors,
+                        "api_attempt_end": attempt_counter,
+                        "request_model": request_model,
+                        "returned_model": returned_model,
+                        "prompt_tokens": chain_prompt_tokens,
+                        "completion_tokens": chain_completion_tokens,
+                        "reasoning_tokens": chain_reasoning_tokens,
+                        "pricing_model": pricing_model,
+                        "input_rate_per_million": input_rate_per_million,
+                        "output_rate_per_million": output_rate_per_million,
+                        "estimated_input_cost_usd": chain_input_cost,
+                        "estimated_output_cost_usd": chain_output_cost,
+                        "estimated_total_cost_usd": chain_total_cost,
+                        "tool_uses": chain_tool_uses,
+                        "duration_ms": chain_duration_ms,
+                        "repair_calls": max(0, attempt_counter - api_attempt_start),
+                        "repair_best_step": next(
+                            (
+                                item["step"]
+                                for item in reversed(repair_history)
+                                if item.get("accepted_as_best")
+                            ),
+                            0,
+                        ),
+                        "repair_initial_batch_acc": repair_history[0]["batch_acc"] if repair_history else batch_acc,
+                        "repair_final_batch_acc": batch_acc,
+                        "repair_history": json.dumps(repair_history, ensure_ascii=False),
+                    }
+                )
+                set_candidate_source_metadata(
+                    row,
+                    final_code=code_str,
+                    source_history=candidate_source_history,
+                )
+
+                learner = {
+                        "round": round_idx,
+                        "retry": retry_idx,
+                        "alpha": alpha,
+                        "weighted_error": weighted_error,
+                        "code": code_str,
+                        "callable": fn_callable,
+                        "batch_acc": batch_acc,
+                        "train_acc": train_acc,
+                        "val_acc": val_acc,
+                        "test_acc": test_acc,
+                }
+                candidate_learners = learners + [learner]
+                candidate_ensemble_train_acc = evaluate_ensemble_accuracy(candidate_learners, train_examples)
+                candidate_ensemble_val_acc = (
+                    evaluate_ensemble_accuracy(candidate_learners, val_examples) if val_examples else None
+                )
+                candidate_ensemble_test_acc = evaluate_ensemble_accuracy(candidate_learners, test_examples)
+                candidate_ensemble_val_drop = (
+                    max(0.0, float(baseline_ensemble_val_acc) - float(candidate_ensemble_val_acc))
+                    if baseline_ensemble_val_acc is not None and candidate_ensemble_val_acc is not None
+                    else None
+                )
+                row.update(
+                    {
+                        "candidate_ensemble_train_acc": candidate_ensemble_train_acc,
+                        "candidate_ensemble_val_acc": candidate_ensemble_val_acc,
+                        "candidate_ensemble_test_acc": candidate_ensemble_test_acc,
+                        "candidate_ensemble_val_drop": candidate_ensemble_val_drop,
+                    }
+                )
+
+                valid_weak_learner = weighted_error <= cfg.max_weak_error and alpha >= cfg.min_alpha
+                valid_val_drop = (
+                    candidate_ensemble_val_drop is None
+                    or candidate_ensemble_val_drop <= cfg.ensemble_val_drop_tolerance
+                )
+                if valid_weak_learner and valid_val_drop:
+                    if cfg.candidate_selection != "first_acceptable":
+                        serialized_row = serialize_attempt_row(row)
+                        round_candidates.append(
+                            {
+                                "attempt_row_index": len(attempt_rows),
+                                "row": serialized_row,
+                                "learner": learner,
+                                "train_preds_pm": train_preds_pm,
+                                "ensemble_train_acc": candidate_ensemble_train_acc,
+                                "ensemble_val_acc": candidate_ensemble_val_acc,
+                                "ensemble_test_acc": candidate_ensemble_test_acc,
+                            }
+                        )
+                        attempt_rows.append(serialized_row)
+                        continue
+
+                    weights = update_distribution(weights, labels_pm, train_preds_pm, alpha)
+                    learners.append(learner)
+                    accepted_rounds.append(
+                        {
+                            k: v for k, v in learner.items() if k != "callable"
+                        }
+                    )
+
+                    row["accepted"] = True
+                    row["candidate_selected"] = True
+                    row["ensemble_train_acc"] = candidate_ensemble_train_acc
+                    row["ensemble_val_acc"] = candidate_ensemble_val_acc
+                    row["ensemble_test_acc"] = candidate_ensemble_test_acc
+                    attempt_rows.append(serialize_attempt_row(row))
+                    accepted_this_round = True
+
+                    update_validation_progress(candidate_ensemble_val_acc, len(learners))
+
+                    if cfg.stop_on_perfect_train and row["ensemble_train_acc"] >= 1.0:
+                        stopped_reason = "perfect_train_acc"
+                    break
+                if valid_weak_learner and not valid_val_drop:
+                    row["candidate_reject_reason"] = "ensemble_val_drop"
+
+                serialized_row = serialize_attempt_row(row)
+                if (
+                    cfg.accept_best_on_failure
+                    and weighted_error <= cfg.best_fallback_max_weak_error
+                    and alpha >= cfg.min_alpha
+                    and (
+                        best_fallback is None
+                        or weighted_error < float(best_fallback["weighted_error"])
+                    )
+                ):
+                    best_fallback = {
+                        "attempt_row_index": len(attempt_rows),
+                        "row": serialized_row,
+                        "round": round_idx,
+                        "retry": retry_idx,
+                        "alpha": alpha,
+                        "weighted_error": weighted_error,
+                        "code": code_str,
+                        "fn_callable": fn_callable,
+                        "batch_acc": batch_acc,
+                        "train_acc": train_acc,
+                        "val_acc": val_acc,
+                        "test_acc": test_acc,
+                        "train_preds_pm": train_preds_pm,
+                    }
+                attempt_rows.append(serialized_row)
+            except Exception as exc:
+                row["compile_error"] = str(exc)
+                set_candidate_source_metadata(
+                    row,
+                    final_code=code_str,
+                    source_history=candidate_source_history,
+                )
+                attempt_rows.append(serialize_attempt_row(row))
+
+        if not accepted_this_round:
+            if round_candidates:
+                if cfg.candidate_selection == "best_weighted_error":
+                    selected_candidate = min(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["learner"]["weighted_error"]),
+                            -float(item["ensemble_val_acc"] if item["ensemble_val_acc"] is not None else item["ensemble_train_acc"]),
+                        ),
+                    )
+                elif cfg.candidate_selection == "best_val_acc":
+                    selected_candidate = max(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["learner"]["val_acc"] if item["learner"]["val_acc"] is not None else item["learner"]["train_acc"]),
+                            -float(item["learner"]["weighted_error"]),
+                        ),
+                    )
+                else:
+                    selected_candidate = max(
+                        round_candidates,
+                        key=lambda item: (
+                            float(item["ensemble_val_acc"] if item["ensemble_val_acc"] is not None else item["ensemble_train_acc"]),
+                            -float(item["learner"]["weighted_error"]),
+                        ),
+                    )
+
+                weights = update_distribution(
+                    weights,
+                    labels_pm,
+                    selected_candidate["train_preds_pm"],
+                    float(selected_candidate["learner"]["alpha"]),
+                )
+                learner = selected_candidate["learner"]
+                learners.append(learner)
+                accepted_rounds.append({k: v for k, v in learner.items() if k != "callable"})
+                row_idx = int(selected_candidate["attempt_row_index"])
+                attempt_rows[row_idx]["accepted"] = True
+                attempt_rows[row_idx]["candidate_selected"] = True
+                attempt_rows[row_idx]["ensemble_train_acc"] = selected_candidate["ensemble_train_acc"]
+                attempt_rows[row_idx]["ensemble_val_acc"] = selected_candidate["ensemble_val_acc"]
+                attempt_rows[row_idx]["ensemble_test_acc"] = selected_candidate["ensemble_test_acc"]
+                accepted_this_round = True
+                stopped_reason = "max_rounds_reached"
+                update_validation_progress(selected_candidate["ensemble_val_acc"], len(learners))
+                if cfg.stop_on_perfect_train and selected_candidate["ensemble_train_acc"] >= 1.0:
+                    stopped_reason = "perfect_train_acc"
+            elif best_fallback is not None:
+                weights = update_distribution(
+                    weights,
+                    labels_pm,
+                    best_fallback["train_preds_pm"],
+                    float(best_fallback["alpha"]),
+                )
+                learner = {
+                    "round": best_fallback["round"],
+                    "retry": best_fallback["retry"],
+                    "alpha": best_fallback["alpha"],
+                    "weighted_error": best_fallback["weighted_error"],
+                    "code": best_fallback["code"],
+                    "callable": best_fallback["fn_callable"],
+                    "batch_acc": best_fallback["batch_acc"],
+                    "train_acc": best_fallback["train_acc"],
+                    "val_acc": best_fallback["val_acc"],
+                    "test_acc": best_fallback["test_acc"],
+                    "accepted_best_on_failure": True,
+                }
+                learners.append(learner)
+                accepted_rounds.append({k: v for k, v in learner.items() if k != "callable"})
+                row_idx = int(best_fallback["attempt_row_index"])
+                attempt_rows[row_idx]["accepted"] = True
+                attempt_rows[row_idx]["accepted_best_on_failure"] = True
+                attempt_rows[row_idx]["ensemble_train_acc"] = evaluate_ensemble_accuracy(learners, train_examples)
+                attempt_rows[row_idx]["ensemble_val_acc"] = (
+                    evaluate_ensemble_accuracy(learners, val_examples) if val_examples else None
+                )
+                attempt_rows[row_idx]["ensemble_test_acc"] = evaluate_ensemble_accuracy(learners, test_examples)
+                accepted_this_round = True
+                stopped_reason = "max_rounds_reached"
+                if val_examples and cfg.early_stop_val_patience > 0:
+                    current_val_acc = float(attempt_rows[row_idx]["ensemble_val_acc"] or 0.0)
+                    if current_val_acc > best_val_acc + cfg.early_stop_val_min_delta:
+                        best_val_acc = current_val_acc
+                        best_val_round_count = len(learners)
+                        val_rounds_without_improvement = 0
+                    else:
+                        val_rounds_without_improvement += 1
+                        if val_rounds_without_improvement >= cfg.early_stop_val_patience:
+                            stopped_reason = "val_early_stop"
+                if cfg.stop_on_perfect_train and attempt_rows[row_idx]["ensemble_train_acc"] >= 1.0:
+                    stopped_reason = "perfect_train_acc"
+            else:
+                stopped_reason = "no_acceptable_weak_learner"
+                break
+        if stopped_reason in {"perfect_train_acc", "val_early_stop"}:
+            break
+
+    if (
+        cfg.restore_best_val_ensemble
+        and val_examples
+        and best_val_round_count > 0
+        and best_val_round_count < len(learners)
+    ):
+        learners = learners[:best_val_round_count]
+        accepted_rounds = accepted_rounds[:best_val_round_count]
+        stopped_reason = f"{stopped_reason}_restored_best_val"
+
+    final_train_acc = evaluate_ensemble_accuracy(learners, train_examples)
+    final_val_acc = evaluate_ensemble_accuracy(learners, val_examples) if val_examples else None
+    final_test_acc = evaluate_ensemble_accuracy(learners, test_examples)
+    client_provider = getattr(client, "provider", None)
+    openai_settings = (
+        base_runner.resolve_openai_client_settings(client.cfg)
+        if client_provider == "openai"
+        else {}
+    )
+    request_model = (
+        base_runner.resolve_openai_request_model(client.cfg)
+        if client_provider == "openai"
+        else getattr(client.cfg, "model", None)
+    )
+
+    summary = {
+        "fn": fn,
+        "target_name": target_name,
+        "length": length,
+        "model": getattr(client.cfg, "model", None),
+        "provider": client_provider,
+        "client_type": getattr(client, "client_type", None),
+        "api_mode": getattr(client.cfg, "api_mode", None),
+        "api_version": openai_settings.get("api_version") or getattr(client.cfg, "api_version", None),
+        "request_model": request_model,
+        "reasoning_effort": getattr(client.cfg, "reasoning_effort", None),
+        "max_output_tokens": getattr(client.cfg, "max_output_tokens", None),
+        "allow_tools": getattr(client.cfg, "allow_tools", None),
+        "batch_size": batch_size,
+        "trial": trial_idx,
+        "accepted_rounds": len(learners),
+        "requested_rounds": cfg.boost_rounds,
+        "repair_rounds": cfg.repair_rounds,
+        "repair_mistake_limit": cfg.repair_mistake_limit,
+        "repair_anchor_count": cfg.repair_anchor_count,
+        "repair_trigger_batch_acc_below": cfg.repair_trigger_batch_acc_below,
+        "repair_trigger_weighted_error_above": cfg.repair_trigger_weighted_error_above,
+        "repair_trigger_min_mistakes": cfg.repair_trigger_min_mistakes,
+        "whole_train_repair_rounds": cfg.whole_train_repair_rounds,
+        "whole_train_repair_batch_size": cfg.whole_train_repair_batch_size,
+        "sample_without_replacement": cfg.sample_without_replacement,
+        "strict_acceptance": cfg.strict_acceptance,
+        "tabular_representation": cfg.tabular_representation,
+        "cdc_representation": cfg.cdc_representation,
+        "dataset_context_mode": cfg.dataset_context_mode,
+        "tabular_numeric_transform": cfg.tabular_numeric_transform,
+        "prompt_strategy": cfg.prompt_strategy,
+        "accept_best_on_failure": cfg.accept_best_on_failure,
+        "best_fallback_max_weak_error": cfg.best_fallback_max_weak_error,
+        "sampling_strategy": cfg.sampling_strategy,
+        "sampler_mistake_frac": cfg.sampler_mistake_frac,
+        "sampler_boundary_frac": cfg.sampler_boundary_frac,
+        "sampler_anchor_frac": cfg.sampler_anchor_frac,
+        "sampler_pool_multiplier": cfg.sampler_pool_multiplier,
+        "sampler_feature_hash_dim": cfg.sampler_feature_hash_dim,
+        "candidate_selection": cfg.candidate_selection,
+        "ensemble_val_drop_tolerance": cfg.ensemble_val_drop_tolerance,
+        "early_stop_val_patience": cfg.early_stop_val_patience,
+        "early_stop_val_min_delta": cfg.early_stop_val_min_delta,
+        "restore_best_val_ensemble": cfg.restore_best_val_ensemble,
+        "best_val_acc": best_val_acc if best_val_acc >= 0.0 else None,
+        "best_val_round_count": best_val_round_count,
+        "final_train_acc": final_train_acc,
+        "final_val_acc": final_val_acc,
+        "final_test_acc": final_test_acc,
+        "api_attempt_count": attempt_counter,
+        "total_prompt_tokens": total_prompt_tokens,
+        "total_completion_tokens": total_completion_tokens,
+        "total_reasoning_tokens": total_reasoning_tokens,
+        "total_estimated_cost_usd": total_estimated_cost_usd,
+        "total_estimated_cost_pricing_known": total_estimated_cost_pricing_known,
+        "stopped_reason": stopped_reason,
+    }
+    return summary, attempt_rows, accepted_rounds
+
+
+def ensure_dir(path: str) -> None:
+    os.makedirs(path, exist_ok=True)
+
+
+def write_csv(path: str, rows: Sequence[Dict[str, Any]]) -> None:
+    ensure_dir(os.path.dirname(path))
+    if not rows:
+        _safe_write_text(path, "")
+        return
+    csv_rows = [
+        {k: v for k, v in row.items() if k not in CSV_EXCLUDED_FIELDS}
+        for row in rows
+    ]
+    fieldnames: List[str] = []
+    for row in csv_rows:
+        for key in row.keys():
+            if key not in fieldnames:
+                fieldnames.append(key)
+
+    with tempfile.NamedTemporaryFile(
+        "w",
+        encoding="utf-8",
+        newline="",
+        delete=False,
+        dir=os.path.dirname(path),
+    ) as tmp:
+        writer = csv.DictWriter(tmp, fieldnames=fieldnames)
+        writer.writeheader()
+        writer.writerows(csv_rows)
+        tmp_path = tmp.name
+    os.replace(tmp_path, path)
+
+
+def write_jsonl(path: str, rows: Sequence[Dict[str, Any]]) -> None:
+    ensure_dir(os.path.dirname(path))
+    body = "\n".join(json.dumps(row, ensure_ascii=False) for row in rows)
+    if body:
+        body += "\n"
+    _safe_write_text(path, body)
+
+
+def build_base_config(args: argparse.Namespace) -> base_runner.Config:
+    cfg = base_runner.Config()
+    cfg.functions = list(args.functions)
+    cfg.lengths = list(args.lengths)
+    cfg.lengths_explicit = True
+    cfg.train_size = args.train_size
+    cfg.val_size = args.val_size
+    cfg.test_size = args.test_size
+    cfg.seed = args.seed
+    tabular_representation = getattr(args, "tabular_representation", "obfuscated")
+    cdc_representation = getattr(args, "cdc_representation", None) or default_cdc_representation(tabular_representation)
+    os.environ["TABULAR_REPRESENTATION"] = tabular_representation
+    os.environ["MUSHROOM_REPRESENTATION"] = tabular_representation
+    os.environ["HTRU2_REPRESENTATION"] = tabular_representation
+    os.environ["CHESS_REPRESENTATION"] = tabular_representation
+    os.environ["ADULT_INCOME_REPRESENTATION"] = tabular_representation
+    os.environ["OPENML_TABULAR_REPRESENTATION"] = tabular_representation
+    os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
+    os.environ["TABULAR_NUMERIC_TRANSFORM"] = getattr(args, "tabular_numeric_transform", "none")
+    os.environ["CDC_DIABETES_SEMANTIC_FALLBACK"] = (
+        "1" if getattr(args, "cdc_semantic_allow_transformed_fallback", True) else "0"
+    )
+    cfg.dataset_dir = args.dataset_dir
+    if tabular_representation != "obfuscated":
+        cfg.dataset_dir = os.path.join(args.dataset_dir, f"tabular_representation_{tabular_representation}")
+    elif cdc_representation != "obfuscated":
+        cfg.dataset_dir = os.path.join(args.dataset_dir, f"cdc_representation_{cdc_representation}")
+    numeric_transform_suffix = base_runner.tabular_numeric_transform_suffix(
+        getattr(args, "tabular_numeric_transform", "none")
+    )
+    if numeric_transform_suffix:
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, numeric_transform_suffix)
+    cfg.model = args.model
+    cfg.provider = args.provider
+    cfg.api_mode = args.api_mode
+    if args.api_key is not None:
+        cfg.api_key = args.api_key
+        cfg.api_key_explicit = True
+    if args.api_base_url is not None:
+        cfg.api_base_url = args.api_base_url
+    if args.azure_endpoint is not None:
+        cfg.azure_endpoint = args.azure_endpoint
+    if args.api_version is not None:
+        cfg.api_version = args.api_version
+    cfg.max_output_tokens = args.max_output_tokens
+    cfg.reasoning_effort = args.reasoning_effort
+    cfg.thinking_level = args.reasoning_effort
+    cfg.verbosity = args.verbosity
+    cfg.temperature = args.temperature
+    cfg.top_p = args.top_p
+    cfg.tool_choice = args.tool_choice
+    cfg.allow_tools = args.allow_tools
+    cfg.enable_code_interpreter = args.enable_code_interpreter
+    cfg.concurrency = args.concurrency
+    cfg.per_call_timeout_s = args.timeout
+    cfg.num_trials = args.num_trials
+    return cfg
+
+
+def build_boost_config(args: argparse.Namespace) -> BoostConfig:
+    max_weak_error = args.max_weak_error
+    min_alpha = args.min_alpha
+    if args.strict_acceptance:
+        max_weak_error = min(max_weak_error, 0.35)
+        min_alpha = max(min_alpha, 0.05)
+    tabular_representation = getattr(args, "tabular_representation", "obfuscated")
+    cdc_representation = getattr(args, "cdc_representation", None) or default_cdc_representation(tabular_representation)
+
+    return BoostConfig(
+        boost_rounds=args.boost_rounds,
+        batch_sizes=list(args.batch_sizes),
+        round_retries=args.round_retries,
+        max_weak_error=max_weak_error,
+        min_alpha=min_alpha,
+        num_trials=args.num_trials,
+        stop_on_perfect_train=args.stop_on_perfect_train,
+        resample_each_retry=args.resample_each_retry,
+        output_dir=args.output_dir,
+        repair_rounds=args.repair_rounds,
+        repair_mistake_limit=args.repair_mistake_limit,
+        repair_anchor_count=args.repair_anchor_count,
+        repair_trigger_batch_acc_below=args.repair_trigger_batch_acc_below,
+        repair_trigger_weighted_error_above=args.repair_trigger_weighted_error_above,
+        repair_trigger_min_mistakes=args.repair_trigger_min_mistakes,
+        sample_without_replacement=args.sample_without_replacement,
+        strict_acceptance=args.strict_acceptance,
+        whole_train_repair_rounds=args.whole_train_repair_rounds,
+        whole_train_repair_batch_size=args.whole_train_repair_batch_size,
+        whole_train_mistake_frac=args.whole_train_mistake_frac,
+        whole_train_recent_fix_frac=args.whole_train_recent_fix_frac,
+        whole_train_anchor_frac=args.whole_train_anchor_frac,
+        tabular_representation=tabular_representation,
+        cdc_representation=cdc_representation,
+        dataset_context_mode=getattr(args, "dataset_context_mode", "schema"),
+        tabular_numeric_transform=getattr(args, "tabular_numeric_transform", "none"),
+        prompt_strategy=getattr(args, "prompt_strategy", "direct"),
+        accept_best_on_failure=args.accept_best_on_failure,
+        best_fallback_max_weak_error=args.best_fallback_max_weak_error,
+        sampling_strategy=args.sampling_strategy,
+        sampler_mistake_frac=args.sampler_mistake_frac,
+        sampler_boundary_frac=args.sampler_boundary_frac,
+        sampler_anchor_frac=args.sampler_anchor_frac,
+        sampler_pool_multiplier=args.sampler_pool_multiplier,
+        sampler_feature_hash_dim=args.sampler_feature_hash_dim,
+        candidate_selection=args.candidate_selection,
+        ensemble_val_drop_tolerance=args.ensemble_val_drop_tolerance,
+        early_stop_val_patience=args.early_stop_val_patience,
+        early_stop_val_min_delta=args.early_stop_val_min_delta,
+        restore_best_val_ensemble=args.restore_best_val_ensemble,
+    )
+
+
+async def main_async(args: argparse.Namespace) -> int:
+    log = setup_logger(args.log_level)
+    base_cfg = build_base_config(args)
+    boost_cfg = build_boost_config(args)
+    ensure_dir(boost_cfg.output_dir)
+
+    client = base_runner.Runner(base_cfg, log)
+    summary_rows: List[Dict[str, Any]] = []
+    attempt_rows: List[Dict[str, Any]] = []
+
+    try:
+        for fn in base_cfg.functions:
+            if fn not in base_runner.FUNCTION_NAME_MAPPING:
+                raise ValueError(f"Unknown function id: {fn}")
+
+            target_name = base_runner.FUNCTION_NAME_MAPPING[fn]
+            if target_name != "cdc_diabetes":
+                log.warning(
+                    "non_cdc_target_requested",
+                    extra={"fn": fn, "target_name": target_name},
+                )
+
+            for length in base_cfg.lengths:
+                train_lines, val_lines, test_lines, is_decimal, is_tabular = client.ds.get(fn, length)
+                for batch_size in boost_cfg.batch_sizes:
+                    for trial_idx in range(1, boost_cfg.num_trials + 1):
+                        log.info(
+                            "boost_trial_start",
+                            extra={
+                                "fn": fn,
+                                "target_name": target_name,
+                                "length": length,
+                                "batch_size": batch_size,
+                                "trial": trial_idx,
+                                "boost_rounds": boost_cfg.boost_rounds,
+                            },
+                        )
+
+                        summary, trial_attempt_rows, accepted_rounds = await run_boosting_trial(
+                            client,
+                            log,
+                            fn,
+                            length,
+                            target_name,
+                            train_lines,
+                            val_lines,
+                            test_lines,
+                            is_decimal,
+                            is_tabular,
+                            boost_cfg,
+                            batch_size,
+                            trial_idx,
+                        )
+
+                        summary_rows.append(summary)
+                        attempt_rows.extend(trial_attempt_rows)
+
+                        run_dir = os.path.join(
+                            boost_cfg.output_dir,
+                            target_name,
+                            f"L{length}",
+                            f"batch{batch_size}",
+                            f"trial{trial_idx}",
+                        )
+                        ensure_dir(run_dir)
+
+                        manifest = {
+                            "summary": summary,
+                            "accepted_rounds": accepted_rounds,
+                            "config": {
+                                "model": base_cfg.model,
+                                "provider": client.provider,
+                                "client_type": getattr(client, "client_type", None),
+                                "api_mode": base_cfg.api_mode,
+                                "api_version": (
+                                    base_runner.resolve_openai_client_settings(base_cfg).get("api_version")
+                                    if client.provider == "openai"
+                                    else base_cfg.api_version
+                                ),
+                                "request_model": (
+                                    base_runner.resolve_openai_request_model(base_cfg)
+                                    if client.provider == "openai"
+                                    else base_cfg.model
+                                ),
+                                "reasoning_effort": base_cfg.reasoning_effort,
+                                "max_output_tokens": base_cfg.max_output_tokens,
+                                "allow_tools": base_cfg.allow_tools,
+                                "train_size": base_cfg.train_size,
+                                "val_size": base_cfg.val_size,
+                                "test_size": base_cfg.test_size,
+                                "seed": base_cfg.seed,
+                                "boost_rounds": boost_cfg.boost_rounds,
+                                "batch_size": batch_size,
+                                "round_retries": boost_cfg.round_retries,
+                                "max_weak_error": boost_cfg.max_weak_error,
+                                "min_alpha": boost_cfg.min_alpha,
+                                "strict_acceptance": boost_cfg.strict_acceptance,
+                                "tabular_representation": boost_cfg.tabular_representation,
+                                "sample_without_replacement": boost_cfg.sample_without_replacement,
+                                "repair_rounds": boost_cfg.repair_rounds,
+                                "repair_mistake_limit": boost_cfg.repair_mistake_limit,
+                                "repair_anchor_count": boost_cfg.repair_anchor_count,
+                                "repair_trigger_batch_acc_below": boost_cfg.repair_trigger_batch_acc_below,
+                                "repair_trigger_weighted_error_above": boost_cfg.repair_trigger_weighted_error_above,
+                                "repair_trigger_min_mistakes": boost_cfg.repair_trigger_min_mistakes,
+                                "whole_train_repair_rounds": boost_cfg.whole_train_repair_rounds,
+                                "whole_train_repair_batch_size": boost_cfg.whole_train_repair_batch_size,
+                                "whole_train_mistake_frac": boost_cfg.whole_train_mistake_frac,
+                                "whole_train_recent_fix_frac": boost_cfg.whole_train_recent_fix_frac,
+                                "whole_train_anchor_frac": boost_cfg.whole_train_anchor_frac,
+                                "cdc_representation": boost_cfg.cdc_representation,
+                                "dataset_context_mode": boost_cfg.dataset_context_mode,
+                                "tabular_numeric_transform": boost_cfg.tabular_numeric_transform,
+                                "prompt_strategy": boost_cfg.prompt_strategy,
+                                "accept_best_on_failure": boost_cfg.accept_best_on_failure,
+                                "best_fallback_max_weak_error": boost_cfg.best_fallback_max_weak_error,
+                                "dataset_dir": base_cfg.dataset_dir,
+                            },
+                        }
+                        _safe_write_json(os.path.join(run_dir, "manifest.json"), manifest)
+                        write_jsonl(os.path.join(run_dir, "attempts.jsonl"), trial_attempt_rows)
+
+                        if accepted_rounds:
+                            module_text = build_ensemble_module(accepted_rounds)
+                            _safe_write_text(os.path.join(run_dir, "ensemble.py"), module_text)
+
+                        log.info(
+                            "boost_trial_done",
+                            extra={
+                                "fn": fn,
+                                "target_name": target_name,
+                                "length": length,
+                                "batch_size": batch_size,
+                                "trial": trial_idx,
+                                "accepted_rounds": summary["accepted_rounds"],
+                                "final_train_acc": summary["final_train_acc"],
+                                "final_test_acc": summary["final_test_acc"],
+                                "stopped_reason": summary["stopped_reason"],
+                            },
+                        )
+    finally:
+        await client.aclose()
+
+    write_csv(os.path.join(boost_cfg.output_dir, "summary.csv"), summary_rows)
+    write_csv(os.path.join(boost_cfg.output_dir, "attempts.csv"), attempt_rows)
+    write_jsonl(os.path.join(boost_cfg.output_dir, "attempts.jsonl"), attempt_rows)
+    return 0
+
+
+def parse_args() -> argparse.Namespace:
+    p = argparse.ArgumentParser(
+        description="AdaBoost-style symbolic program synthesis experiments.",
+    )
+    p.add_argument("--functions", nargs="*", default=["fn_o"], help="Function ids. CDC diabetes is fn_o.")
+    p.add_argument("--lengths", nargs="*", type=int, default=[21], help="Sequence lengths / tabular feature counts.")
+    p.add_argument("--train-size", type=int, default=200, help="Train split size.")
+    p.add_argument("--val-size", type=int, default=0, help="Validation split size. Defaults to 0 for train/test only.")
+    p.add_argument("--test-size", type=int, default=1000, help="Test split size.")
+    p.add_argument("--seed", type=int, default=42, help="Dataset seed.")
+    p.add_argument("--dataset-dir", default=DEFAULT_DATASET_DIR, help="Dataset cache directory.")
+    p.add_argument("--output-dir", default=DEFAULT_OUTPUT_DIR, help="Directory for summaries and saved ensembles.")
+    p.add_argument(
+        "--tabular-representation",
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "hybrid", "named_numeric"],
+        default=os.getenv("TABULAR_REPRESENTATION", "obfuscated"),
+        help="Input representation for non-CDC tabular datasets. semantic uses names plus bins; named_numeric uses names plus raw numeric values; anonymous_numeric uses x_i names plus raw numeric values; obfuscated_bins uses x_i names plus binned numeric values.",
+    )
+    p.add_argument(
+        "--cdc-representation",
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "named_numeric"],
+        default=os.getenv("CDC_DIABETES_REPRESENTATION"),
+        help="Optional CDC-specific representation override. Defaults to the matching tabular representation when supported.",
+    )
+    p.add_argument(
+        "--dataset-context-mode",
+        choices=["schema", "none", "legacy_hints", "hints"],
+        default=os.getenv("DATASET_CONTEXT_MODE", "schema"),
+        help="schema adds only representation-format instructions; none uses only the generic prompt and examples; legacy_hints preserves the older dataset-specific descriptions.",
+    )
+    p.add_argument(
+        "--tabular-numeric-transform",
+        choices=["none", "positive_affine"],
+        default=os.getenv("TABULAR_NUMERIC_TRANSFORM", "none"),
+        help="Optional monotone affine anonymization applied to numeric tabular fields when they are surfaced explicitly.",
+    )
+    p.add_argument(
+        "--prompt-strategy",
+        choices=["direct", "analyze_then_code"],
+        default=os.getenv("PROMPT_STRATEGY", "direct"),
+        help="How to generate code from the sampled batch. analyze_then_code runs a structured analysis step first, then synthesizes code from the same batch plus that analysis.",
+    )
+    p.add_argument(
+        "--no-cdc-semantic-transformed-fallback",
+        dest="cdc_semantic_allow_transformed_fallback",
+        action="store_false",
+        help="Fail semantic CDC generation if raw UCI/cache data is unavailable instead of using transformed bootstrap fallback.",
+    )
+    p.set_defaults(cdc_semantic_allow_transformed_fallback=True)
+
+    p.add_argument("--boost-rounds", "--T", dest="boost_rounds", type=int, default=8, help="Maximum number of boosting rounds.")
+    p.add_argument("--batch-sizes", nargs="+", type=int, default=[32, 64, 128], help="Weighted train batch sizes to test.")
+    p.add_argument("--round-retries", type=int, default=3, help="How many proposals to try for each round before giving up.")
+    p.add_argument("--max-weak-error", type=float, default=0.499, help="Maximum weighted train error for accepting a learner.")
+    p.add_argument("--min-alpha", type=float, default=1e-6, help="Reject learners with alpha below this value.")
+    p.add_argument("--strict-acceptance", action="store_true", help="Clamp acceptance to max_weak_error<=0.35 and min_alpha>=0.05.")
+    p.add_argument("--num-trials", type=int, default=3, help="Trials per batch size.")
+    p.add_argument("--resample-each-retry", action="store_true", help="Resample a new weighted batch for each retry within a round.")
+    p.add_argument("--sample-without-replacement", action="store_true", help="Sample weighted train batches without replacement.")
+    p.add_argument(
+        "--sampling-strategy",
+        choices=[
+            "weighted_random",
+            "weighted_without_replacement",
+            "feature_diverse",
+            "label_balanced_diverse",
+            "stratified_diverse",
+        ],
+        default=os.getenv("SAMPLING_STRATEGY", "weighted_random"),
+        help="How to choose prompt batches. Diverse strategies use hashed feature vectors so they work across tabular tasks.",
+    )
+    p.add_argument("--sampler-mistake-frac", type=float, default=0.6, help="Target fraction of stratified_diverse batches from current ensemble mistakes.")
+    p.add_argument("--sampler-boundary-frac", type=float, default=0.2, help="Target fraction of stratified_diverse batches from low-margin boundary examples.")
+    p.add_argument("--sampler-anchor-frac", type=float, default=0.2, help="Target fraction of stratified_diverse batches from currently correct anchors.")
+    p.add_argument("--sampler-pool-multiplier", type=int, default=8, help="Candidate pool multiplier for diverse farthest-point sampling.")
+    p.add_argument("--sampler-feature-hash-dim", type=int, default=256, help="Fixed hashed feature dimension for sampler-only diversity vectors.")
+    p.add_argument(
+        "--candidate-selection",
+        choices=["first_acceptable", "best_weighted_error", "best_val_acc", "best_ensemble_val"],
+        default=os.getenv("CANDIDATE_SELECTION", "first_acceptable"),
+        help="How to choose among valid retries in a boosting round.",
+    )
+    p.add_argument("--ensemble-val-drop-tolerance", type=float, default=1.0, help="Reject otherwise valid learners if ensemble validation drops by more than this tolerance. Set near 0 for strict validation-preserving boosting.")
+    p.add_argument("--stop-on-perfect-train", action="store_true", help="Stop a trial once ensemble train accuracy reaches 1.0.")
+    p.add_argument("--early-stop-val-patience", type=int, default=0, help="Stop after this many accepted rounds without validation improvement. Disabled at 0.")
+    p.add_argument("--early-stop-val-min-delta", type=float, default=0.0, help="Minimum validation improvement needed to reset early-stop patience.")
+    p.add_argument("--restore-best-val-ensemble", action="store_true", help="Trim final saved ensemble back to the best validation round when early stopping runs.")
+    p.add_argument("--repair-rounds", type=int, default=0, help="LLM repair iterations to run after each initial weak learner proposal.")
+    p.add_argument("--repair-mistake-limit", type=int, default=128, help="Maximum misclassified batch examples to include in each repair prompt.")
+    p.add_argument("--repair-anchor-count", type=int, default=16, help="Maximum correctly classified anchor examples to include in each repair prompt.")
+    p.add_argument("--repair-trigger-batch-acc-below", type=float, default=None, help="Only run batch repair when initial batch_acc is below this threshold.")
+    p.add_argument("--repair-trigger-weighted-error-above", type=float, default=None, help="Only run batch repair when initial weighted train error is above this threshold.")
+    p.add_argument("--repair-trigger-min-mistakes", type=int, default=1, help="Minimum number of initial batch mistakes required before running repair.")
+    p.add_argument("--whole-train-repair-rounds", type=int, default=0, help="Additional repair iterations that resample from whole-train mistakes/recent-fixes/anchors.")
+    p.add_argument("--whole-train-repair-batch-size", type=int, default=256, help="Prompt example budget for each whole-train repair iteration.")
+    p.add_argument("--whole-train-mistake-frac", type=float, default=0.7, help="Fraction of whole-train repair prompt reserved for current mistakes.")
+    p.add_argument("--whole-train-recent-fix-frac", type=float, default=0.2, help="Fraction of whole-train repair prompt reserved for recently fixed examples.")
+    p.add_argument("--whole-train-anchor-frac", type=float, default=0.1, help="Fraction of whole-train repair prompt reserved for correct anchors.")
+    p.add_argument(
+        "--accept-best-on-failure",
+        action="store_true",
+        help="If no retry satisfies max_weak_error/min_alpha, accept the best valid weak learner instead of failing the round.",
+    )
+    p.add_argument(
+        "--best-fallback-max-weak-error",
+        type=float,
+        default=0.499,
+        help="Maximum weighted error allowed for --accept-best-on-failure fallback candidates.",
+    )
+
+    p.add_argument("--model", default=os.getenv("OPENAI_MODEL", "gpt-5"), help="Model name.")
+    p.add_argument("--provider", default=os.getenv("PROVIDER", "auto"), help="Provider override.")
+    p.add_argument("--api-mode", choices=["responses", "chat_completions"], default=os.getenv("API_MODE", "responses"))
+    p.add_argument("--api-key", help="API key override for OpenAI-compatible or TAMU/Azure endpoints.")
+    p.add_argument("--api-base-url", help="OpenAI-compatible base URL override.")
+    p.add_argument("--azure-endpoint", help="Azure/TAMU endpoint override.")
+    p.add_argument("--api-version", help="Azure/TAMU API version override.")
+    p.add_argument("--max-output-tokens", type=int, default=int(os.getenv("MAX_OUTPUT_TOKENS", "20000")))
+    p.add_argument("--reasoning-effort", default=os.getenv("REASONING_EFFORT", "high"))
+    p.add_argument("--verbosity", default=os.getenv("TEXT_VERBOSITY", "low"))
+    p.add_argument("--temperature", type=float, default=float(os.getenv("TEMPERATURE")) if os.getenv("TEMPERATURE") else None)
+    p.add_argument("--top-p", type=float, default=float(os.getenv("TOP_P")) if os.getenv("TOP_P") else None)
+    p.add_argument("--tool-choice", default=os.getenv("TOOL_CHOICE", "auto"))
+    p.add_argument("--allow-tools", dest="allow_tools", action="store_true")
+    p.add_argument("--no-tools", dest="allow_tools", action="store_false")
+    p.set_defaults(allow_tools=os.getenv("ALLOW_TOOLS", "1") == "1")
+    p.add_argument("--enable-code-interpreter", action="store_true", help="Enable code interpreter where supported.")
+    p.add_argument("--concurrency", type=int, default=int(os.getenv("CONCURRENCY", "1")))
+    p.add_argument("--timeout", type=float, default=float(os.getenv("PER_CALL_TIMEOUT_S", "1200")))
+    p.add_argument("--log-level", default="INFO")
+    return p.parse_args()
+
+
+def main() -> int:
+    args = parse_args()
+    return asyncio.run(main_async(args))
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

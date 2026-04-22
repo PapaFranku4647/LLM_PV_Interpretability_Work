@@ -5,29 +5,69 @@ from dataclasses import dataclass, field
 from typing import Any, Dict, List, Tuple, Optional
 import logging
 import numpy as np
+from itertools import product
 
 current_dir = os.path.dirname(os.path.abspath(__file__))
 parent_dir = os.path.dirname(current_dir)
 sys.path.insert(0, parent_dir)
 
 from sklearn.svm import SVC
-from sklearn.ensemble import RandomForestClassifier
+from sklearn.ensemble import (
+    AdaBoostClassifier,
+    ExtraTreesClassifier,
+    GradientBoostingClassifier,
+    HistGradientBoostingClassifier,
+    RandomForestClassifier,
+)
+from sklearn.linear_model import LogisticRegression
+from sklearn.neural_network import MLPClassifier
 from sklearn.tree import DecisionTreeClassifier
-from sklearn.model_selection import GridSearchCV
 from sklearn.metrics import accuracy_score
-from xgboost import XGBClassifier
-from tabpfn import TabPFNClassifier
+
+try:
+    from xgboost import XGBClassifier
+except Exception:  # pragma: no cover - optional dependency
+    XGBClassifier = None
+
+try:
+    from tabpfn import TabPFNClassifier
+except Exception:  # pragma: no cover - optional dependency
+    TabPFNClassifier = None
 
 from src.data_handler import get_data_generator, create_stratified_splits
 from src.target_functions import EXPERIMENT_FUNCTION_MAPPING, EXPERIMENT_FUNCTION_METADATA
+import runner as synthesis_runner
 
 FUNCTION_NAME_MAPPING = EXPERIMENT_FUNCTION_MAPPING
-TABULAR_FNS = {"adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+TABULAR_FNS = {
+    "adult_income",
+    "mushroom",
+    "cdc_diabetes",
+    "htru2",
+    "chess",
+    "pima_diabetes",
+    "heart_disease",
+    "breast_wisconsin",
+    "wdbc_diagnostic",
+    "mammographic_mass",
+    "blood_transfusion",
+    "heart_disease_comprehensive",
+    "chronic_kidney_disease",
+    "indian_liver_patient",
+    "cardiovascular_disease",
+    "credit_g",
+    "loan_prediction",
+    "telco_customer_churn",
+}
 BOOLEAN_FNS = {"parity_all", "parity_first_half", "parity_rand_3", "parity_rand_10", 
                "automata_parity", "palindrome", "dyck2", "patternmatch1", "patternmatch2",
                "prime_decimal", "prime_decimal_tf_check", "sha256_parity", "prime_plus_47", "collatz_steps_parity",
                "graph_has_cycle", "graph_connected",
-               "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess"}
+               "adult_income", "mushroom", "cdc_diabetes", "htru2", "chess",
+               "pima_diabetes", "heart_disease", "breast_wisconsin", "wdbc_diagnostic",
+               "mammographic_mass", "blood_transfusion", "heart_disease_comprehensive",
+               "chronic_kidney_disease", "indian_liver_patient", "cardiovascular_disease",
+               "credit_g", "loan_prediction", "telco_customer_churn"}
 
 logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger("baseline_runner")
@@ -293,9 +333,7 @@ class GeneticAlgorithmClassifier:
 @dataclass
 class Config:
     functions: List[str] = field(default_factory=lambda: [
-        "fn_a", "fn_b", "fn_c", "fn_d", "fn_e", "fn_f",
-        "fn_g", "fn_h", "fn_i", "fn_j", "fn_k", "fn_l", "fn_v", "fn_t",
-        "fn_m", "fn_n", "fn_o", "fn_p", "fn_q", "fn_aa",
+        "fn_m", "fn_n", "fn_o", "fn_p", "fn_q",
     ])
     lengths: List[int] = field(default_factory=lambda: [100, 50, 30, 25, 20])
     train_size: int = int(os.getenv("TRAIN_SIZE", "100"))
@@ -304,8 +342,26 @@ class Config:
     seed: int = int(os.getenv("GLOBAL_SEED", "42"))
     num_trials: int = int(os.getenv("NUM_TRIALS", "10"))
     dataset_dir: str = os.getenv("DATASET_DIR", "program_synthesis/datasets")
+    tabular_representation: str = os.getenv("TABULAR_REPRESENTATION", "obfuscated")
+    tabular_numeric_transform: str = os.getenv("TABULAR_NUMERIC_TRANSFORM", "none")
     out_jsonl: str = "program_synthesis/baseline_results.jsonl"
     out_csv: str = "program_synthesis/baseline_results.csv"
+    models: List[str] = field(default_factory=lambda: [
+        "decision_tree",
+        "random_forest",
+        "extra_trees",
+        "adaboost",
+        "gradient_boosting",
+        "hist_gradient_boosting",
+        "logistic_regression",
+        "mlp",
+        "xgboost",
+    ])
+    include_ga: bool = False
+    include_tabpfn: bool = False
+    max_train_rows: Optional[int] = None
+    max_test_rows: Optional[int] = None
+    save_model_artifacts: bool = False
 
 
 class DatasetStore:
@@ -342,6 +398,20 @@ class DatasetStore:
 
     def get(self, fn: str, L: int) -> Tuple[List[str], List[str], List[str]]:
         target_name = FUNCTION_NAME_MAPPING[fn]
+        if self.cfg.tabular_representation in {"semantic", "named_numeric", "anonymous_numeric", "obfuscated_bins"}:
+            cdc_representation = self.cfg.tabular_representation
+        elif self.cfg.tabular_representation == "hybrid":
+            cdc_representation = "semantic"
+        else:
+            cdc_representation = "obfuscated"
+        os.environ["TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["CDC_DIABETES_REPRESENTATION"] = cdc_representation
+        os.environ["MUSHROOM_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["HTRU2_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["CHESS_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["ADULT_INCOME_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["OPENML_TABULAR_REPRESENTATION"] = self.cfg.tabular_representation
+        os.environ["TABULAR_NUMERIC_TRANSFORM"] = self.cfg.tabular_numeric_transform
         derived_seed = self._stable_derived_seed(fn, L)
         paths = self._paths(target_name, L, derived_seed)
 
@@ -352,6 +422,13 @@ class DatasetStore:
         total_samples = self.cfg.train_size + self.cfg.val_size + self.cfg.test_size
         generator = get_data_generator(target_name, L, total_samples)
         all_samples = generator.generate_data()
+        if target_name in TABULAR_FNS and self.cfg.tabular_numeric_transform != "none":
+            all_samples = synthesis_runner.apply_tabular_numeric_transform(
+                all_samples,
+                generator=generator,
+                seed=derived_seed,
+                mode=self.cfg.tabular_numeric_transform,
+            )
 
         train_split, val_split, test_split = create_stratified_splits(
             all_samples, self.cfg.train_size, self.cfg.val_size, self.cfg.test_size, device='cpu'
@@ -391,178 +468,238 @@ def parse_data(lines: List[str]) -> Tuple[np.ndarray, np.ndarray]:
 
 
 class TabularDataParser:
-    ADULT_INCOME_NUMERIC = {'x0', 'x2', 'x4', 'x10', 'x11', 'x12'}
-    MUSHROOM_NUMERIC = {'x0', 'x8', 'x9'}
-    CDC_DIABETES_NUMERIC = {'x3', 'x13', 'x14', 'x15', 'x18', 'x19', 'x20'}
-    BREAST_CANCER_NUMERIC = {f'x{i}' for i in range(30)}
-    HTRU2_NUMERIC = {f'x{i}' for i in range(8)}
-    CHESS_NUMERIC = set()
-    
+    """Dense tabular encoder for generated `key:value,... -> y` rows.
+
+    Numeric columns are inferred from train values. Every other column is one-hot
+    encoded from train categories. This supports both obfuscated rows (`x3:1.2`)
+    and semantic rows (`HighBP:yes,BMI:high`) without imposing ordinal structure
+    on categorical values.
+    """
+
     def __init__(self, dataset_name: str = 'adult_income'):
+        self.dataset_name = dataset_name
         self.feature_names: List[str] = []
         self._fitted = False
+        self.numeric_features: List[str] = []
+        self.categorical_features: List[str] = []
         self.numeric_indices: List[int] = []
         self.categorical_indices: List[int] = []
-        if dataset_name == 'mushroom':
-            self.numeric_features = self.MUSHROOM_NUMERIC
-        elif dataset_name == 'cdc_diabetes':
-            self.numeric_features = self.CDC_DIABETES_NUMERIC
-        elif dataset_name == 'htru2':
-            self.numeric_features = self.HTRU2_NUMERIC
-        elif dataset_name == 'chess':
-            self.numeric_features = self.CHESS_NUMERIC
-        else:
-            self.numeric_features = self.ADULT_INCOME_NUMERIC
-    
+        self.category_values: Dict[str, List[str]] = {}
+        self.output_feature_names: List[str] = []
+
     def _parse_line(self, line: str) -> Tuple[Dict[str, str], int]:
         features_str, label = line.split("->")
-        label = int(label.strip())
-        features = {}
+        features: Dict[str, str] = {}
         for pair in features_str.strip().split(","):
-            if ":" in pair:
-                k, v = pair.split(":", 1)
-                features[k.strip()] = v.strip()
-        return features, label
-    
+            if ":" not in pair:
+                continue
+            key, value = pair.split(":", 1)
+            features[key.strip()] = value.strip()
+        return features, int(label.strip())
+
+    @staticmethod
+    def _as_float(value: str) -> Optional[float]:
+        try:
+            result = float(value)
+        except (TypeError, ValueError):
+            return None
+        if not np.isfinite(result):
+            return None
+        return result
+
+    def _infer_columns(self, parsed: List[Tuple[Dict[str, str], int]]) -> None:
+        seen: List[str] = []
+        for features, _label in parsed:
+            for name in features:
+                if name not in seen:
+                    seen.append(name)
+        self.feature_names = seen
+
+        self.numeric_features = []
+        self.categorical_features = []
+        for name in self.feature_names:
+            values = [features.get(name, "") for features, _label in parsed]
+            non_missing = [value for value in values if value not in {"", "?", "nan", "None"}]
+            if non_missing and all(self._as_float(value) is not None for value in non_missing):
+                self.numeric_features.append(name)
+            else:
+                self.categorical_features.append(name)
+
+        self.numeric_indices = [self.feature_names.index(name) for name in self.numeric_features]
+        self.categorical_indices = [self.feature_names.index(name) for name in self.categorical_features]
+        self.category_values = {
+            name: sorted({features.get(name, "?") for features, _label in parsed})
+            for name in self.categorical_features
+        }
+        self.output_feature_names = list(self.numeric_features)
+        for name in self.categorical_features:
+            self.output_feature_names.extend(f"{name}={value}" for value in self.category_values[name])
+
     def fit_transform(self, lines: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         parsed = [self._parse_line(line) for line in lines]
         if not parsed:
-            return np.array([]), np.array([])
-        
-        self.feature_names = list(parsed[0][0].keys())
-        self.numeric_indices = [i for i, f in enumerate(self.feature_names) if f in self.numeric_features]
-        self.categorical_indices = [i for i, f in enumerate(self.feature_names) if f not in self.numeric_features]
+            return np.zeros((0, 0), dtype=float), np.array([], dtype=int)
+        self._infer_columns(parsed)
         self._fitted = True
         return self._transform(parsed)
-    
+
     def transform(self, lines: List[str]) -> Tuple[np.ndarray, np.ndarray]:
         if not self._fitted:
             raise RuntimeError("Parser must be fitted before transform")
         parsed = [self._parse_line(line) for line in lines]
         return self._transform(parsed)
-    
+
     def _transform(self, parsed: List[Tuple[Dict[str, str], int]]) -> Tuple[np.ndarray, np.ndarray]:
-        X, y = [], []
+        rows: List[List[float]] = []
+        labels: List[int] = []
         for features, label in parsed:
-            row = []
-            for feat in self.feature_names:
-                val = features.get(feat, '?')
-                if feat in self.numeric_features:
-                    try:
-                        row.append(float(val))
-                    except ValueError:
-                        row.append(0.0)
-                else:
-                    if val.startswith('c') and val[1:].isdigit():
-                        row.append(float(val[1:]))
-                    else:
-                        row.append(-1.0)
-            X.append(row)
-            y.append(label)
-        return np.array(X), np.array(y)
+            row: List[float] = []
+            for name in self.numeric_features:
+                row.append(self._as_float(features.get(name, "")) or 0.0)
+            for name in self.categorical_features:
+                value = features.get(name, "?")
+                row.extend(1.0 if value == known else 0.0 for known in self.category_values[name])
+            rows.append(row)
+            labels.append(label)
+        return np.asarray(rows, dtype=float), np.asarray(labels, dtype=int)
 
 
 class GABinarizer:
     def __init__(self):
-        self.numeric_thresholds = None
-        self.category_values = {}
+        self.thresholds = None
     
-    def fit_transform(self, X: np.ndarray, numeric_indices: List[int], categorical_indices: List[int]) -> np.ndarray:
-        parts = []
-        
-        if numeric_indices:
-            X_num = X[:, numeric_indices]
-            self.numeric_thresholds = np.median(X_num, axis=0)
-            parts.append((X_num > self.numeric_thresholds).astype(int))
-        
-        for idx in categorical_indices:
-            col = X[:, idx].astype(int)
-            unique_vals = np.unique(col)
-            self.category_values[idx] = unique_vals
-            one_hot = (col[:, None] == unique_vals[None, :]).astype(int)
-            parts.append(one_hot)
-        
-        return np.hstack(parts) if parts else np.zeros((X.shape[0], 0), dtype=int)
+    def fit_transform(
+        self,
+        X: np.ndarray,
+        numeric_indices: Optional[List[int]] = None,
+        categorical_indices: Optional[List[int]] = None,
+    ) -> np.ndarray:
+        del numeric_indices, categorical_indices
+        if X.size == 0:
+            self.thresholds = np.array([])
+            return np.zeros((X.shape[0], 0), dtype=int)
+        self.thresholds = np.median(X, axis=0)
+        return (X > self.thresholds).astype(int)
     
-    def transform(self, X: np.ndarray, numeric_indices: List[int], categorical_indices: List[int]) -> np.ndarray:
-        parts = []
-        
-        if numeric_indices:
-            X_num = X[:, numeric_indices]
-            parts.append((X_num > self.numeric_thresholds).astype(int))
-        
-        for idx in categorical_indices:
-            col = X[:, idx].astype(int)
-            unique_vals = self.category_values[idx]
-            one_hot = (col[:, None] == unique_vals[None, :]).astype(int)
-            parts.append(one_hot)
-        
-        return np.hstack(parts) if parts else np.zeros((X.shape[0], 0), dtype=int)
+    def transform(
+        self,
+        X: np.ndarray,
+        numeric_indices: Optional[List[int]] = None,
+        categorical_indices: Optional[List[int]] = None,
+    ) -> np.ndarray:
+        del numeric_indices, categorical_indices
+        if self.thresholds is None:
+            raise RuntimeError("Binarizer must be fitted before transform")
+        if X.size == 0:
+            return np.zeros((X.shape[0], 0), dtype=int)
+        return (X > self.thresholds).astype(int)
 
 
-def get_param_grids(tabular: bool = False, boolean: bool = False) -> Dict[str, Dict[str, List[Any]]]:
-    grids = {
-        "svm": {
-            "C": [0.1, 1, 10, 100],
-            "gamma": ["scale", "auto", 0.001, 0.01, 0.1],
-            "kernel": ["rbf", "sigmoid"]
+def get_param_grids(boolean: bool = False) -> Dict[str, Dict[str, List[Any]]]:
+    """Small validation-selection grids for reproducible benchmark runs."""
+    grids: Dict[str, Dict[str, List[Any]]] = {
+        "decision_tree": {
+            "max_depth": [3, 5, 8, 12, None],
+            "min_samples_leaf": [1, 5, 20],
+            "criterion": ["gini", "entropy"],
         },
         "random_forest": {
-            "n_estimators": [64, 128, 256],
-            "max_depth": [5, 10, 15, None],
-            "min_samples_split": [2, 5, 10]
+            "n_estimators": [128, 256],
+            "max_depth": [8, 16, None],
+            "min_samples_leaf": [1, 5],
         },
-        "decision_tree": {
-            "max_depth": [5, 10, 15, None],
-            "min_samples_split": [2, 5, 10],
-            "min_samples_leaf": [1, 2, 4],
-            "criterion": ["gini", "entropy"]
+        "extra_trees": {
+            "n_estimators": [128, 256],
+            "max_depth": [8, 16, None],
+            "min_samples_leaf": [1, 5],
+        },
+        "adaboost": {
+            "n_estimators": [50, 100, 200],
+            "learning_rate": [0.05, 0.1, 0.5, 1.0],
+        },
+        "gradient_boosting": {
+            "n_estimators": [100, 200],
+            "learning_rate": [0.03, 0.1],
+            "max_depth": [2, 3],
+        },
+        "hist_gradient_boosting": {
+            "max_iter": [100, 200],
+            "learning_rate": [0.03, 0.1],
+            "max_leaf_nodes": [15, 31],
+        },
+        "logistic_regression": {
+            "C": [0.1, 1.0, 10.0],
+        },
+        "mlp": {
+            "hidden_layer_sizes": [(64,), (128,), (64, 32)],
+            "alpha": [1e-4, 1e-3],
+        },
+        "svm": {
+            "C": [0.5, 1.0, 5.0],
+            "gamma": ["scale"],
+            "kernel": ["rbf"],
         },
         "xgboost": {
-            "n_estimators": [100, 128, 256],
-            "max_depth": [5, 6, 7],
-            "learning_rate": [0.1, 0.3],
+            "n_estimators": [100, 200],
+            "max_depth": [3, 5],
+            "learning_rate": [0.05, 0.1],
             "subsample": [0.8, 1.0],
-            "colsample_bytree": [0.8, 1.0]
-        }
+            "colsample_bytree": [0.8, 1.0],
+        },
+        "tabpfn": {},
     }
-    
+
     if boolean:
         grids["genetic_algorithm"] = {
-            "pop_size": [300, 500],     
-            "generations": [80],         
-            "max_depth_init": [6, 10],    
-            "max_depth_mut": [4, 6],      
-            "cx_prob": [0.7],             
-            "mut_prob": [0.25]            
+            "pop_size": [300],
+            "generations": [80],
+            "max_depth_init": [6, 10],
+            "max_depth_mut": [4],
+            "cx_prob": [0.7],
+            "mut_prob": [0.25],
         }
-    
-    grids["tabpfn"] = {}
-    
     return grids
 
+
 def get_base_models(seed: int, include_ga: bool = False, include_tabpfn: bool = False) -> Dict[str, Any]:
-    models = {
-        "svm": SVC(random_state=seed),
-        "random_forest": RandomForestClassifier(random_state=seed),
+    models: Dict[str, Any] = {
         "decision_tree": DecisionTreeClassifier(random_state=seed),
-        "xgboost": XGBClassifier(
-           booster='gbtree', 
-           random_state=seed, 
-           objective='binary:logistic', 
-           verbosity=0,
-           tree_method='hist',
-           device='cpu'
-        ),
+        "random_forest": RandomForestClassifier(random_state=seed, n_jobs=-1),
+        "extra_trees": ExtraTreesClassifier(random_state=seed, n_jobs=-1),
+        "adaboost": AdaBoostClassifier(random_state=seed),
+        "gradient_boosting": GradientBoostingClassifier(random_state=seed),
+        "hist_gradient_boosting": HistGradientBoostingClassifier(random_state=seed),
+        "logistic_regression": LogisticRegression(max_iter=2000, random_state=seed),
+        "mlp": MLPClassifier(max_iter=500, early_stopping=True, random_state=seed),
+        "svm": SVC(random_state=seed),
     }
-    
+
+    if XGBClassifier is not None:
+        models["xgboost"] = XGBClassifier(
+            booster="gbtree",
+            random_state=seed,
+            objective="binary:logistic",
+            eval_metric="logloss",
+            verbosity=0,
+            tree_method="hist",
+            device="cpu",
+            n_jobs=1,
+        )
+
     if include_ga:
         models["genetic_algorithm"] = GeneticAlgorithmClassifier(random_state=seed)
-    
-    if include_tabpfn:
+
+    if include_tabpfn and TabPFNClassifier is not None:
         models["tabpfn"] = TabPFNClassifier()
-    
+
     return models
+
+
+def iter_param_grid(param_grid: Dict[str, List[Any]]) -> List[Dict[str, Any]]:
+    if not param_grid:
+        return [{}]
+    keys = list(param_grid.keys())
+    return [dict(zip(keys, values)) for values in product(*(param_grid[key] for key in keys))]
 
 
 class BaselineRunner:
@@ -621,7 +758,9 @@ class BaselineRunner:
                             
                             test_accuracies = []
                             val_accuracies = []
-                            durations = []
+                            adaptation_durations = []
+                            test_durations = []
+                            total_durations = []
                             all_best_params = []
                             
                             for trial in range(self.cfg.num_trials):
@@ -631,24 +770,27 @@ class BaselineRunner:
                                 base_model = get_base_models(trial_seed, include_ga=is_boolean, include_tabpfn=True)[model_name]
                                 param_grid = param_grids[model_name]
                                 
-                                t0 = time.perf_counter()
+                                trial_t0 = time.perf_counter()
+                                adaptation_t0 = time.perf_counter()
                                 
                                 if model_name == "tabpfn":
                                     base_model.fit(X_train, y_train)
                                     val_pred = base_model.predict(X_val)
-                                    test_pred = base_model.predict(X_test)
                                     best_val_acc = accuracy_score(y_val, val_pred)
-                                    test_acc = accuracy_score(y_test, test_pred)
                                     best_params = {}
                                     best_model = base_model
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+                                    test_t0 = time.perf_counter()
+                                    test_pred = best_model.predict(X_test)
+                                    test_acc = accuracy_score(y_test, test_pred)
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                 elif model_name == "genetic_algorithm":
                                     if is_tabular:
                                         binarizer = GABinarizer()
                                         X_train_ga = binarizer.fit_transform(X_train, parser.numeric_indices, parser.categorical_indices)
                                         X_val_ga = binarizer.transform(X_val, parser.numeric_indices, parser.categorical_indices)
-                                        X_test_ga = binarizer.transform(X_test, parser.numeric_indices, parser.categorical_indices)
                                     else:
-                                        X_train_ga, X_val_ga, X_test_ga = X_train, X_val, X_test
+                                        X_train_ga, X_val_ga = X_train, X_val
                                     
                                     best_val_acc = -1
                                     best_params = None
@@ -673,7 +815,14 @@ class BaselineRunner:
                                             best_params = params
                                             best_model = model
                                     
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+                                    test_t0 = time.perf_counter()
+                                    if is_tabular:
+                                        X_test_ga = binarizer.transform(X_test, parser.numeric_indices, parser.categorical_indices)
+                                    else:
+                                        X_test_ga = X_test
                                     test_acc = accuracy_score(y_test, best_model.predict(X_test_ga))
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
                                     
                                     # Track best GA model across trials (by test accuracy)
                                     task_key = (fn, L)
@@ -704,16 +853,18 @@ class BaselineRunner:
                                     grid_search.fit(X_train, y_train)
                                     best_model = grid_search.best_estimator_
                                     val_acc = accuracy_score(y_val, best_model.predict(X_val))
-                                    
+                                    best_params = grid_search.best_params_
+                                    best_val_acc = val_acc
+                                    adaptation_duration_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+
+                                    test_t0 = time.perf_counter()
                                     if is_tabular and model_name == "svm":
                                         test_subset_size = min(1000, len(X_test))
                                         test_indices = np.random.RandomState(trial_seed).choice(len(X_test), test_subset_size, replace=False)
                                         test_acc = accuracy_score(y_test[test_indices], best_model.predict(X_test[test_indices]))
                                     else:
                                         test_acc = accuracy_score(y_test, best_model.predict(X_test))
-                                    
-                                    best_params = grid_search.best_params_
-                                    best_val_acc = val_acc
+                                    test_duration_ms = int((time.perf_counter() - test_t0) * 1000)
 
                                     if model_name == "decision_tree":
                                         task_key = (fn, L)
@@ -730,20 +881,28 @@ class BaselineRunner:
                                                 "best_params": best_params,
                                             }
                                 
-                                duration_ms = int((time.perf_counter() - t0) * 1000)
+                                total_duration_ms = int((time.perf_counter() - trial_t0) * 1000)
                                 test_accuracies.append(test_acc)
                                 val_accuracies.append(best_val_acc)
-                                durations.append(duration_ms)
+                                adaptation_durations.append(adaptation_duration_ms)
+                                test_durations.append(test_duration_ms)
+                                total_durations.append(total_duration_ms)
                                 all_best_params.append(best_params)
                                 
-                                print(f"      Trial {trial+1}: test_acc={test_acc:.4f}, val_acc={best_val_acc:.4f}", flush=True)
+                                print(
+                                    f"      Trial {trial+1}: test_acc={test_acc:.4f}, val_acc={best_val_acc:.4f}, "
+                                    f"adapt_ms={adaptation_duration_ms}, test_ms={test_duration_ms}, total_ms={total_duration_ms}",
+                                    flush=True
+                                )
                             
                             # Compute statistics
                             test_acc_mean = float(np.mean(test_accuracies))
                             test_acc_std = float(np.std(test_accuracies))
                             val_acc_mean = float(np.mean(val_accuracies))
                             val_acc_std = float(np.std(val_accuracies))
-                            total_duration_ms = int(np.sum(durations))
+                            total_adaptation_duration_ms = int(np.sum(adaptation_durations))
+                            total_test_duration_ms = int(np.sum(test_durations))
+                            total_wall_clock_duration_ms = int(np.sum(total_durations))
                             
                             # Use first best_params (could use mode if needed)
                             best_params = all_best_params[0]
@@ -754,7 +913,10 @@ class BaselineRunner:
                                 "fn": fn,
                                 "length": L,
                                 "model": model_name,
-                                "duration_ms": total_duration_ms,
+                                "duration_ms": total_wall_clock_duration_ms,
+                                "adaptation_duration_ms": total_adaptation_duration_ms,
+                                "test_duration_ms": total_test_duration_ms,
+                                "total_wall_clock_duration_ms": total_wall_clock_duration_ms,
                                 "val_acc": val_acc_mean,
                                 "val_acc_std": val_acc_std,
                                 "test_acc": test_acc_mean,
@@ -802,6 +964,394 @@ class BaselineRunner:
         return all_rows
 
 
+class BenchmarkRunner:
+    """Validation-selected baseline benchmark runner.
+
+    This is the runner used by `main()`. The older `BaselineRunner` above is left
+    in place for backward reference, but this runner has the benchmark behavior we
+    want for the tabular comparison table.
+    """
+
+    SCALED_MODELS = {"svm", "logistic_regression", "mlp"}
+
+    def __init__(self, cfg: Config):
+        self.cfg = cfg
+        self.ds = DatasetStore(cfg)
+        self.best_decision_trees: Dict[Tuple[str, int], Any] = {}
+        self.best_decision_tree_infos: Dict[Tuple[str, int], Dict[str, Any]] = {}
+
+    @staticmethod
+    def _subset_arrays(
+        X: np.ndarray,
+        y: np.ndarray,
+        max_rows: Optional[int],
+        seed: int,
+    ) -> Tuple[np.ndarray, np.ndarray]:
+        if max_rows is None or len(y) <= max_rows:
+            return X, y
+        rng = np.random.RandomState(seed)
+        idx = rng.choice(len(y), max_rows, replace=False)
+        return X[idx], y[idx]
+
+    @staticmethod
+    def _scaled_arrays(
+        X_train: np.ndarray,
+        X_val: np.ndarray,
+        X_test: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray]:
+        if X_train.size == 0:
+            return X_train, X_val, X_test
+        mean = X_train.mean(axis=0)
+        std = X_train.std(axis=0)
+        std[std < 1e-8] = 1.0
+        return (X_train - mean) / std, (X_val - mean) / std, (X_test - mean) / std
+
+    @staticmethod
+    def _selection_split(
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_val: np.ndarray,
+        y_val: np.ndarray,
+    ) -> Tuple[np.ndarray, np.ndarray, str]:
+        if len(y_val) > 0:
+            return X_val, y_val, "val"
+        return X_train, y_train, "train"
+
+    def _write_row(self, jsonl_file, rows: List[Dict[str, Any]], row: Dict[str, Any]) -> None:
+        rows.append(row)
+        jsonl_file.write(json.dumps(row, ensure_ascii=False) + "\n")
+        jsonl_file.flush()
+
+    def _error_row(
+        self,
+        fn: str,
+        target_name: str,
+        length: int,
+        model_name: str,
+        error: str,
+    ) -> Dict[str, Any]:
+        return {
+            "fn": fn,
+            "target_name": target_name,
+            "length": length,
+            "model": model_name,
+            "status": "error",
+            "error": error,
+            "duration_ms": 0,
+            "adaptation_duration_ms": 0,
+            "test_duration_ms": 0,
+            "total_wall_clock_duration_ms": 0,
+            "val_acc": None,
+            "val_acc_std": None,
+            "test_acc": None,
+            "test_acc_std": None,
+            "best_params": "{}",
+            "best_cv_score": None,
+            "num_trials": self.cfg.num_trials,
+            "tabular_representation": self.cfg.tabular_representation,
+            "tabular_numeric_transform": self.cfg.tabular_numeric_transform,
+            "train_size": self.cfg.train_size,
+            "val_size": self.cfg.val_size,
+            "test_size": self.cfg.test_size,
+            "seed": self.cfg.seed,
+            "selection_split": "",
+            "mean_fit_count": 0,
+        }
+
+    def _fit_select_model(
+        self,
+        model_name: str,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_select: np.ndarray,
+        y_select: np.ndarray,
+        trial_seed: int,
+        param_grid: Dict[str, List[Any]],
+    ) -> Tuple[Any, Dict[str, Any], float, int]:
+        best_model = None
+        best_params: Dict[str, Any] = {}
+        best_score = -1.0
+        fit_count = 0
+
+        for params in iter_param_grid(param_grid):
+            model = get_base_models(
+                trial_seed,
+                include_ga=self.cfg.include_ga,
+                include_tabpfn=self.cfg.include_tabpfn,
+            ).get(model_name)
+            if model is None:
+                raise RuntimeError(f"Model '{model_name}' is unavailable in this environment.")
+            if params:
+                model.set_params(**params)
+            model.fit(X_train, y_train)
+            score = accuracy_score(y_select, model.predict(X_select))
+            fit_count += 1
+            if score > best_score:
+                best_score = float(score)
+                best_params = dict(params)
+                best_model = model
+
+        if best_model is None:
+            raise RuntimeError(f"No successful fit for model '{model_name}'.")
+        return best_model, best_params, best_score, fit_count
+
+    def _fit_select_ga(
+        self,
+        X_train: np.ndarray,
+        y_train: np.ndarray,
+        X_select: np.ndarray,
+        y_select: np.ndarray,
+        trial_seed: int,
+        param_grid: Dict[str, List[Any]],
+    ) -> Tuple[Any, Dict[str, Any], float, int]:
+        best_model = None
+        best_params: Dict[str, Any] = {}
+        best_score = -1.0
+        fit_count = 0
+
+        for params in iter_param_grid(param_grid):
+            params = dict(params)
+            params["random_state"] = trial_seed
+            model = GeneticAlgorithmClassifier(**params)
+            model.fit(X_train, y_train, X_select, y_select)
+            score = accuracy_score(y_select, model.predict(X_select))
+            fit_count += 1
+            if score > best_score:
+                best_score = float(score)
+                best_params = dict(params)
+                best_model = model
+
+        if best_model is None:
+            raise RuntimeError("No successful fit for genetic_algorithm.")
+        return best_model, best_params, best_score, fit_count
+
+    def _requested_models(self) -> List[str]:
+        models = list(self.cfg.models)
+        if self.cfg.include_ga and "genetic_algorithm" not in models:
+            models.append("genetic_algorithm")
+        if self.cfg.include_tabpfn and "tabpfn" not in models:
+            models.append("tabpfn")
+        return models
+
+    def _prepare_data(
+        self,
+        fn: str,
+        length: int,
+        target_name: str,
+    ) -> Tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+        train_lines, val_lines, test_lines = self.ds.get(fn, length)
+        if target_name in TABULAR_FNS:
+            parser = TabularDataParser(dataset_name=target_name)
+            X_train, y_train = parser.fit_transform(train_lines)
+            X_val, y_val = parser.transform(val_lines)
+            X_test, y_test = parser.transform(test_lines)
+        else:
+            X_train, y_train = parse_data(train_lines)
+            X_val, y_val = parse_data(val_lines)
+            X_test, y_test = parse_data(test_lines)
+
+        X_train, y_train = self._subset_arrays(X_train, y_train, self.cfg.max_train_rows, self.cfg.seed)
+        X_test, y_test = self._subset_arrays(X_test, y_test, self.cfg.max_test_rows, self.cfg.seed + 100_000)
+        return X_train, y_train, X_val, y_val, X_test, y_test
+
+    def run(self) -> List[Dict[str, Any]]:
+        all_rows: List[Dict[str, Any]] = []
+        os.makedirs(os.path.dirname(self.cfg.out_jsonl) if os.path.dirname(self.cfg.out_jsonl) else ".", exist_ok=True)
+
+        with open(self.cfg.out_jsonl, "w", encoding="utf-8") as jsonl_file:
+            for fn in self.cfg.functions:
+                if fn not in FUNCTION_NAME_MAPPING:
+                    logger.warning("Unknown function id %s; skipping", fn)
+                    continue
+
+                target_name = FUNCTION_NAME_MAPPING[fn]
+                task_meta = EXPERIMENT_FUNCTION_METADATA.get(fn, {})
+                current_lengths = task_meta.get("lengths", self.cfg.lengths)
+                is_boolean = target_name in BOOLEAN_FNS
+                param_grids = get_param_grids(boolean=is_boolean)
+
+                for length in current_lengths:
+                    try:
+                        X_train, y_train, X_val, y_val, X_test, y_test = self._prepare_data(fn, length, target_name)
+                    except Exception as exc:
+                        for model_name in self._requested_models():
+                            self._write_row(
+                                jsonl_file,
+                                all_rows,
+                                self._error_row(fn, target_name, length, model_name, f"data error: {exc}"),
+                            )
+                        continue
+
+                    X_train_scaled, X_val_scaled, X_test_scaled = self._scaled_arrays(X_train, X_val, X_test)
+                    print(
+                        f"{fn} ({target_name}) L={length}: train={len(y_train)}, "
+                        f"val={len(y_val)}, test={len(y_test)}",
+                        flush=True,
+                    )
+
+                    for model_name in self._requested_models():
+                        if model_name not in param_grids:
+                            self._write_row(
+                                jsonl_file,
+                                all_rows,
+                                self._error_row(fn, target_name, length, model_name, "unknown model"),
+                            )
+                            continue
+                        if model_name == "xgboost" and XGBClassifier is None:
+                            self._write_row(
+                                jsonl_file,
+                                all_rows,
+                                self._error_row(fn, target_name, length, model_name, "xgboost is not installed"),
+                            )
+                            continue
+                        if model_name == "tabpfn" and TabPFNClassifier is None:
+                            self._write_row(
+                                jsonl_file,
+                                all_rows,
+                                self._error_row(fn, target_name, length, model_name, "tabpfn is not installed"),
+                            )
+                            continue
+
+                        print(f"  Starting {model_name} ({self.cfg.num_trials} trials)...", flush=True)
+                        test_accuracies: List[float] = []
+                        val_accuracies: List[float] = []
+                        adaptation_durations: List[int] = []
+                        test_durations: List[int] = []
+                        total_durations: List[int] = []
+                        fit_counts: List[int] = []
+                        best_params_by_trial: List[Dict[str, Any]] = []
+                        selection_split = "val" if len(y_val) > 0 else "train"
+
+                        try:
+                            for trial in range(self.cfg.num_trials):
+                                trial_seed = self.cfg.seed + trial
+                                use_scaled = model_name in self.SCALED_MODELS
+                                Xtr = X_train_scaled if use_scaled else X_train
+                                Xv = X_val_scaled if use_scaled else X_val
+                                Xte = X_test_scaled if use_scaled else X_test
+                                X_select, y_select, selection_split = self._selection_split(Xtr, y_train, Xv, y_val)
+
+                                trial_t0 = time.perf_counter()
+                                adaptation_t0 = time.perf_counter()
+
+                                if model_name == "genetic_algorithm":
+                                    binarizer = GABinarizer()
+                                    X_train_ga = binarizer.fit_transform(X_train)
+                                    X_val_ga = binarizer.transform(X_val)
+                                    X_select_ga, y_select_ga, selection_split = self._selection_split(
+                                        X_train_ga, y_train, X_val_ga, y_val
+                                    )
+                                    best_model, best_params, best_val_acc, fit_count = self._fit_select_ga(
+                                        X_train_ga,
+                                        y_train,
+                                        X_select_ga,
+                                        y_select_ga,
+                                        trial_seed,
+                                        param_grids[model_name],
+                                    )
+                                    Xte = binarizer.transform(X_test)
+                                else:
+                                    best_model, best_params, best_val_acc, fit_count = self._fit_select_model(
+                                        model_name,
+                                        Xtr,
+                                        y_train,
+                                        X_select,
+                                        y_select,
+                                        trial_seed,
+                                        param_grids[model_name],
+                                    )
+
+                                adaptation_ms = int((time.perf_counter() - adaptation_t0) * 1000)
+                                test_t0 = time.perf_counter()
+                                test_acc = float(accuracy_score(y_test, best_model.predict(Xte)))
+                                test_ms = int((time.perf_counter() - test_t0) * 1000)
+                                total_ms = int((time.perf_counter() - trial_t0) * 1000)
+
+                                if model_name == "decision_tree":
+                                    key = (fn, length)
+                                    previous = self.best_decision_tree_infos.get(key, {}).get("test_acc", -1.0)
+                                    if test_acc > previous:
+                                        self.best_decision_trees[key] = best_model
+                                        self.best_decision_tree_infos[key] = {
+                                            "fn": fn,
+                                            "target_name": target_name,
+                                            "length": length,
+                                            "trial": trial,
+                                            "val_acc": float(best_val_acc),
+                                            "test_acc": test_acc,
+                                            "best_params": best_params,
+                                        }
+
+                                test_accuracies.append(test_acc)
+                                val_accuracies.append(float(best_val_acc))
+                                adaptation_durations.append(adaptation_ms)
+                                test_durations.append(test_ms)
+                                total_durations.append(total_ms)
+                                fit_counts.append(fit_count)
+                                best_params_by_trial.append(best_params)
+                                print(
+                                    f"    Trial {trial + 1}: test={test_acc:.4f}, "
+                                    f"{selection_split}={best_val_acc:.4f}, fits={fit_count}, "
+                                    f"adapt_ms={adaptation_ms}, test_ms={test_ms}",
+                                    flush=True,
+                                )
+
+                            row = {
+                                "fn": fn,
+                                "target_name": target_name,
+                                "length": length,
+                                "model": model_name,
+                                "status": "ok",
+                                "error": "",
+                                "duration_ms": int(np.sum(total_durations)),
+                                "adaptation_duration_ms": int(np.sum(adaptation_durations)),
+                                "test_duration_ms": int(np.sum(test_durations)),
+                                "total_wall_clock_duration_ms": int(np.sum(total_durations)),
+                                "val_acc": float(np.mean(val_accuracies)),
+                                "val_acc_std": float(np.std(val_accuracies)),
+                                "test_acc": float(np.mean(test_accuracies)),
+                                "test_acc_std": float(np.std(test_accuracies)),
+                                "best_params": json.dumps(best_params_by_trial[0] if best_params_by_trial else {}),
+                                "best_cv_score": float(np.mean(val_accuracies)),
+                                "num_trials": self.cfg.num_trials,
+                                "tabular_representation": self.cfg.tabular_representation,
+                                "tabular_numeric_transform": self.cfg.tabular_numeric_transform,
+                                "train_size": len(y_train),
+                                "val_size": len(y_val),
+                                "test_size": len(y_test),
+                                "seed": self.cfg.seed,
+                                "selection_split": selection_split,
+                                "mean_fit_count": float(np.mean(fit_counts)),
+                            }
+                            self._write_row(jsonl_file, all_rows, row)
+                            logger.info(
+                                "%s L=%s %s: test_acc=%.4f+/-%.4f",
+                                fn,
+                                length,
+                                model_name,
+                                row["test_acc"],
+                                row["test_acc_std"],
+                            )
+                        except Exception as exc:
+                            logger.error("%s L=%s %s failed", fn, length, model_name, exc_info=True)
+                            self._write_row(
+                                jsonl_file,
+                                all_rows,
+                                self._error_row(fn, target_name, length, model_name, str(exc)),
+                            )
+
+        if self.cfg.save_model_artifacts:
+            for (fn, length), tree in self.best_decision_trees.items():
+                tree_path = os.path.join(current_dir, f"best_decision_tree_{fn}_L{length}.pkl")
+                meta_path = os.path.join(current_dir, f"best_decision_tree_{fn}_L{length}_meta.json")
+                with open(tree_path, "wb") as f:
+                    pickle.dump(tree, f)
+                with open(meta_path, "w", encoding="utf-8") as f:
+                    json.dump(self.best_decision_tree_infos[(fn, length)], f, ensure_ascii=False)
+
+        return all_rows
+
+
 def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
     with open(path, "w", encoding="utf-8") as f:
         for r in rows:
@@ -809,7 +1359,20 @@ def write_jsonl(path: str, rows: List[Dict[str, Any]]) -> None:
 
 
 def write_csv(path: str, rows: List[Dict[str, Any]]) -> None:
-    fieldnames = ["fn", "length", "model", "duration_ms", "val_acc", "val_acc_std", "test_acc", "test_acc_std", "best_params", "best_cv_score", "num_trials"]
+    if not rows:
+        with open(path, "w", newline="", encoding="utf-8") as f:
+            f.write("")
+        return
+    preferred = [
+        "fn", "target_name", "length", "model", "status", "error",
+        "tabular_representation", "tabular_numeric_transform", "train_size", "val_size", "test_size", "seed",
+        "duration_ms", "adaptation_duration_ms", "test_duration_ms", "total_wall_clock_duration_ms",
+        "val_acc", "val_acc_std", "test_acc", "test_acc_std",
+        "best_params", "best_cv_score", "num_trials", "selection_split", "mean_fit_count",
+        "tree_depth", "tree_size", "tree_expr",
+    ]
+    extras = sorted({key for row in rows for key in row.keys()} - set(preferred))
+    fieldnames = [key for key in preferred if any(key in row for row in rows)] + extras
     with open(path, "w", newline="", encoding="utf-8") as f:
         w = csv.DictWriter(f, fieldnames=fieldnames)
         w.writeheader()
@@ -821,33 +1384,64 @@ def parse_args() -> Config:
     p = argparse.ArgumentParser(description="Baseline ML models runner")
     p.add_argument("--functions", nargs="*", help="Function IDs (e.g., fn_a fn_b ...)")
     p.add_argument("--lengths", nargs="*", type=int, help="Sequence lengths")
+    p.add_argument("--models", nargs="*", help="Model names to run. Defaults to the core tabular baseline set.")
     p.add_argument("--train-size", type=int, help="Train size (default: 100)")
     p.add_argument("--val-size", type=int, help="Validation size (default: 100)")
     p.add_argument("--test-size", type=int, help="Test size (default: 10000)")
     p.add_argument("--seed", type=int, help="Global seed (default: 42)")
     p.add_argument("--num-trials", type=int, help="Number of trials for averaging (default: 10)")
+    p.add_argument("--dataset-dir", help="Dataset split/cache directory")
+    p.add_argument(
+        "--tabular-representation",
+        choices=["obfuscated", "anonymous_numeric", "obfuscated_bins", "semantic", "hybrid", "named_numeric"],
+        help="Use obfuscated legacy, anonymous_numeric, obfuscated_bins, semantic/named binned, hybrid, or named_numeric tabular rows.",
+    )
+    p.add_argument(
+        "--tabular-numeric-transform",
+        choices=["none", "positive_affine"],
+        help="Optional monotone affine anonymization applied to numeric tabular fields when they are surfaced explicitly.",
+    )
     p.add_argument("--out-jsonl", help="Output JSONL path")
     p.add_argument("--out-csv", help="Output CSV path")
+    p.add_argument("--include-ga", action="store_true", help="Include the symbolic genetic-programming baseline.")
+    p.add_argument("--include-tabpfn", action="store_true", help="Include TabPFN if installed.")
+    p.add_argument("--max-train-rows", type=int, help="Optional cap for fitting rows per split.")
+    p.add_argument("--max-test-rows", type=int, help="Optional cap for test evaluation rows.")
+    p.add_argument("--save-model-artifacts", action="store_true", help="Persist selected tree artifacts.")
 
     args = p.parse_args()
     cfg = Config()
 
     if args.functions: cfg.functions = args.functions
     if args.lengths: cfg.lengths = args.lengths
+    if args.models: cfg.models = args.models
     if args.train_size: cfg.train_size = args.train_size
-    if args.val_size: cfg.val_size = args.val_size
+    if args.val_size is not None: cfg.val_size = args.val_size
     if args.test_size: cfg.test_size = args.test_size
     if args.seed is not None: cfg.seed = args.seed
     if args.num_trials is not None: cfg.num_trials = args.num_trials
+    if args.dataset_dir: cfg.dataset_dir = args.dataset_dir
+    if args.tabular_representation: cfg.tabular_representation = args.tabular_representation
+    if args.tabular_numeric_transform: cfg.tabular_numeric_transform = args.tabular_numeric_transform
+    if cfg.tabular_representation != "obfuscated":
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, f"tabular_representation_{cfg.tabular_representation}")
+    numeric_transform_suffix = synthesis_runner.tabular_numeric_transform_suffix(cfg.tabular_numeric_transform)
+    if numeric_transform_suffix:
+        cfg.dataset_dir = os.path.join(cfg.dataset_dir, numeric_transform_suffix)
     if args.out_jsonl: cfg.out_jsonl = args.out_jsonl
     if args.out_csv: cfg.out_csv = args.out_csv
+    if args.include_ga: cfg.include_ga = True
+    if args.include_tabpfn: cfg.include_tabpfn = True
+    if args.max_train_rows is not None: cfg.max_train_rows = args.max_train_rows
+    if args.max_test_rows is not None: cfg.max_test_rows = args.max_test_rows
+    if args.save_model_artifacts: cfg.save_model_artifacts = True
 
     return cfg
 
 
 def main():
     cfg = parse_args()
-    runner = BaselineRunner(cfg)
+    runner = BenchmarkRunner(cfg)
     rows = runner.run()
     write_csv(cfg.out_csv, rows)
     logger.info(f"Results written to {cfg.out_jsonl} and {cfg.out_csv}")

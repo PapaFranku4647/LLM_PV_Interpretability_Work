@@ -8,11 +8,18 @@ __pycache__/
 *.pyd
 .pytest_cache/
 pytest-cache-files-*/
+.ipynb_checkpoints/
 
-# Local logs and temporary outputs
+# Generic local logs and temporary outputs
 *.log
 _precheck_*
 temp_results*
+.claude
+
+/2201/
+/2203/
+/data_cache/
+/tmp*/
 
 # Program synthesis run artifacts (keep local, do not commit)
 program_synthesis/datasets/
@@ -36,14 +43,40 @@ program_synthesis/CDC_EXTERNAL_ARTIFACT_PILOT_*.md
 program_synthesis/PAPER_*_TABLE_*.md
 program_synthesis/*sample_indices*.json
 program_synthesis/*comparison_indices*.json
-
-# Local planning notes
 program_synthesis/*TODO*.md
-
-# Prompt verification artifacts
 program_synthesis/prompt_verify/
+program_synthesis/outputs*/
+program_synthesis/outputs_*/
+program_synthesis/meeting_*/
+program_synthesis/runner.log
+program_synthesis/baseline_results.*
+program_synthesis/agent_baseline_results.*
+program_synthesis/best_decision_tree_*.pkl
+program_synthesis/best_decision_tree_*_meta.json
+program_synthesis/tests/_tmp*/
+program_synthesis/baseline_results_*.csv
+program_synthesis/baseline_results_*.jsonl
+program_synthesis/codeboost_*.csv
+program_synthesis/meeting_sprint_*.csv
+program_synthesis/meeting_sprint_*.jsonl
+program_synthesis/clean_protocol_headline_table_*.csv
+program_synthesis/htru2_full_balanced_threshold_vs_baselines.csv
+program_synthesis/*_pilot*.md
+program_synthesis/*_pilot*.csv
+program_synthesis/*_RESULTS_*.md
+program_synthesis/*_TABLE_*.md
+program_synthesis/*_TABLE_*.csv
+program_synthesis/*UNTRACKED*.md
+program_synthesis/MEETING_*.md
+program_synthesis/OPENML_*.md
+program_synthesis/interpretability_artifacts/
+program_synthesis/clean_results_artifacts/
+program_synthesis/datasets_*/
+program_synthesis/program_synthesis/
 
-# Local raw data cache
-data_cache/
-
-.claude
+# Boosted / CodeBoost artifacts
+program_synthesis/boosted/datasets/
+program_synthesis/boosted/datasets_*/
+program_synthesis/boosted/outputs*/
+program_synthesis/boosted/runs/
+program_synthesis/boosted/*.log

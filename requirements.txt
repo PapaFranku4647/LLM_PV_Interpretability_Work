@@ -12,6 +12,10 @@ safetensors
 
 # --- API Clients for LLM Services ---
 openai
+litellm
+google-genai
+anthropic
+httpx
 
 # --- Other useful utilities ---
 numpy
@@ -23,5 +27,7 @@ sympy>=1.12
 ucimlrepo
 
 # --- Baseline ML models ---
+pandas
 scikit-learn
 xgboost
+ucimlrepo
